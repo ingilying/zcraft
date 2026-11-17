@@ -15,6 +15,8 @@ pub const DEFAULT_CONFIG_PATH: &str = "zcraft.toml";
 pub struct Config {
     pub bind: String,
     pub motd: String,
+    /// Relative paths are resolved from the working directory.
+    pub server_icon: String,
     pub max_players: u32,
     pub max_connections: usize,
     /// Deadline for a complete frame or response, not per-byte activity.
@@ -27,6 +29,7 @@ impl Default for Config {
         Self {
             bind: "0.0.0.0:25565".into(),
             motd: "ZCraft — Rust Minecraft Server".into(),
+            server_icon: "server-icon.png".into(),
             max_players: 20,
             max_connections: 1024,
             io_timeout: Duration::from_secs(10),

@@ -177,6 +177,7 @@ async fn start(
         listener,
         Config {
             io_timeout: deadline,
+            server_icon: concat!(env!("CARGO_MANIFEST_DIR"), "/server-icon.png").into(),
             ..Config::default()
         },
         async {
@@ -203,6 +204,11 @@ async fn tcp_status_ping_and_shutdown() {
         reader.finish().unwrap();
         assert_eq!(json["version"]["protocol"], 767);
         assert_eq!(json["players"]["online"], 0);
+        let expected_icon = zcraft::handler::status::icon::ServerIcon::from_png(include_bytes!(
+            "../server-icon.png"
+        ))
+        .unwrap();
+        assert_eq!(json["favicon"], expected_icon.data_uri());
         assert_eq!(read_frame(&mut stream).await.unwrap().unwrap(), ping);
         assert!(read_frame(&mut stream).await.unwrap().is_none());
         stop.send(()).unwrap();

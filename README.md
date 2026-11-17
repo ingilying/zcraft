@@ -1,123 +1,197 @@
-# ZCraft
+<p align="center">
+  <img src="assets/zcraft-icon.svg" alt="ZCraft 图标" width="128" height="128">
+</p>
 
-Rust + Tokio 的 Minecraft Java 1.21.1（协议 767）服务端基础架构。
+<h1 align="center">ZCraft</h1>
 
-## 运行
+<p align="center">
+  使用 Rust 构建的 Minecraft Java 服务端，始于清晰、可扩展的协议与网络架构。
+</p>
+
+<p align="center">
+  <strong>Rust + Tokio</strong> · Java 1.21.1 · 协议 767 · 早期开发中 ·
+  <a href="LICENSE">GPL-3.0-only</a>
+</p>
+
+<p align="center">
+  <a href="#功能状态">功能状态</a> ·
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#配置">配置</a> ·
+  <a href="#开发">开发</a> ·
+  <a href="#参与贡献">参与贡献</a>
+</p>
+
+---
+
+ZCraft 探索以 Rust 实现 Minecraft 服务端，将网络传输、协议编解码和业务处理分离，
+通过强类型数据包与声明式注册表扩展协议功能。
+
+> [!IMPORTANT]
+> 项目处于基础架构阶段，**目前不能进入游戏**。可以通过 Minecraft 服务器列表查询
+> MOTD、版本、图标与延迟；登录和转移请求会收到明确的断开提示。暂不适合生产部署。
+
+## 功能状态
+
+- [x] 异步 TCP 接入、连接上限、读写超时与退出清理
+- [x] VarInt 编解码、完整帧读写、拆包与粘包处理
+- [x] 按协议状态和包 ID 解析，强类型处理器分发
+- [x] 握手、服务器状态查询与 Ping/Pong
+- [x] 服务器图标校验、Base64 编码与响应缓存
+- [x] TOML 配置加载、默认文件生成与 EULA 启动检查
+- [ ] 登录与身份认证
+- [ ] 加密与压缩
+- [ ] Configuration / Play 协议阶段
+- [ ] 世界、实体与玩家逻辑
+
+状态响应的在线人数目前固定为 `0`，尚未实现多版本协议映射。
+
+## 快速开始
+
+### 环境要求
+
+- 支持 Rust 2024 edition 的近期稳定版 Rust 与 Cargo。
+- Minecraft Java 1.21.1 客户端，用于验证服务器列表功能。
+
+在项目根目录运行：
 
 ```sh
-cargo run
-# 自定义监听地址、MOTD 和日志
-ZCRAFT_BIND=127.0.0.1:25565 ZCRAFT_MOTD="Hello ZCraft" RUST_LOG=debug cargo run
+cargo run --release
 ```
 
-首次运行会生成配置及 `eula.txt`，然后因尚未同意 EULA 而退出。阅读并同意后，
-手动将 `eula.txt` 中的 `eula=false` 改为 `eula=true`，再次运行。
+首次运行会自动生成 `zcraft.toml` 和 `eula.txt`，然后因未同意 EULA 而退出。
 
-同意 EULA 后默认监听 `0.0.0.0:25565`（所有网卡）。客户端添加 `localhost:25565`，
-可查询服务器描述、版本、人数和延迟。Ctrl-C 停止接收并取消所有连接任务。
+1. 阅读 [Minecraft EULA](https://www.minecraft.net/eula)。
+2. **仅在同意后**，手动将 `eula.txt` 中的 `eula=false` 改为 `eula=true`。
+3. 再次运行 `cargo run --release`。
+4. 在客户端的服务器列表中添加 `localhost:25565`。
 
-**目前不能进入游戏。** 登录/转移请求返回 Login Disconnect；尚未实现认证、
-加密、压缩、Configuration、Play、世界或玩家逻辑。在线人数固定为 0。
-状态查询允许其他协议版本，以便客户端展示版本不兼容信息。
+按 `Ctrl-C` 停止服务并清理连接。单独部署二进制时，请同时复制 `server-icon.png`，
+或在配置中指定自己的图标。
 
-## EULA 启动检查
+> [!NOTE]
+> 默认监听 `0.0.0.0:25565`，即所有 IPv4 网卡。仅本机测试时建议改为 `127.0.0.1:25565`。
+> 连接上限和超时保护并不等同于完整的公网抗攻击方案。
 
-`src/eula.rs` 负责检查当前工作目录的 `eula.txt`。程序先加载配置，
-再检查 EULA，只有通过检查才会绑定 TCP 端口。
+## 配置
 
-- 文件不存在时安全生成 `eula=false`，返回错误并退出，不自动同意。
-- 请阅读 [Minecraft EULA](https://www.minecraft.net/eula)，仅在同意后设置 `eula=true`。
-- 每次启动重新检查；空文件、缺少同意项或 `eula=false` 均不能启动。
-- 支持空行、`#` / `!` 注释行、两侧空白、CRLF 和 UTF-8 BOM。
-- 值必须为小写 `true` 或 `false`；重复项、未知项、格式错误及读取失败均阻止启动。
-- 不重写已有文件，不提供环境变量绕过；`eula.txt` 已加入 Git 忽略规则。
-- `ZCRAFT_CONFIG` 只改变配置文件路径，EULA 文件仍位于当前工作目录。
-
-## 配置文件
-
-启动时读取当前工作目录的 `zcraft.toml`；文件不存在则自动生成默认配置：
+默认读取**当前工作目录**的 `zcraft.toml`，不存在时安全生成：
 
 ```toml
 bind = "0.0.0.0:25565"
 motd = "ZCraft — Rust Minecraft Server"
+server_icon = "server-icon.png"
 max_players = 20
 max_connections = 1024
 io_timeout_seconds = 10
 ```
 
-- `bind` 使用 IP 和端口，IPv6 示例：`[::]:25565`。
-- `max_players` 是服务器列表展示的容量，目前不是实际玩家接入限制。
-- `max_connections` 必须大于 0，且不能超过 Tokio 信号量支持的上限。
-- `io_timeout_seconds` 使用整数秒，范围 1–86400。
-- 缺少字段使用默认值；未知字段、类型错误、无效值或读取失败均报错退出。
-- 已有文件（包括注释）不会被重写。默认配置通过临时文件完整写入后，
-  以不覆盖目标的方式发布，避免并发首次启动读取到半个文件。
-- 修改配置后需要重启，暂不支持热加载。默认生成文件已加入 Git 忽略规则。
+| 配置项 | 说明 |
+| --- | --- |
+| `bind` | 监听 IP 和端口；IPv6 示例：`[::]:25565` |
+| `motd` | 服务器列表描述 |
+| `server_icon` | PNG 图标路径；空字符串表示禁用 |
+| `max_players` | 服务器列表展示的容量，尚不是实际玩家接入限制 |
+| `max_connections` | 最大并发连接数，必须大于 0 且不超过 Tokio 信号量上限 |
+| `io_timeout_seconds` | 每次完整帧读取或响应写入的时限，整数秒，范围 1–86400 |
 
-可指定其他文件（父目录需已存在）：
+缺少字段使用默认值；未知字段、错误类型和无效值会阻止启动。
+已有配置及注释不会被重写。修改后需重启，暂不支持热加载。
+
+### 环境变量
+
+| 变量 | 用途 |
+| --- | --- |
+| `ZCRAFT_CONFIG` | 指定配置文件路径，父目录需已存在 |
+| `ZCRAFT_BIND` | 覆盖监听地址 |
+| `ZCRAFT_MOTD` | 覆盖服务器描述 |
+| `RUST_LOG` | 日志过滤级别，例如 `info` 或 `debug` |
 
 ```sh
-ZCRAFT_CONFIG=./config/server.toml cargo run
+ZCRAFT_CONFIG=./zcraft.toml \
+ZCRAFT_BIND=127.0.0.1:25565 \
+RUST_LOG=debug \
+cargo run --release
 ```
 
-优先级：`ZCRAFT_BIND` / `ZCRAFT_MOTD` 环境变量 > 文件值 > 缺失字段默认值。
-文件本身先通过校验，再应用环境变量；覆盖值不写回文件。
-`RUST_LOG` 继续控制日志级别。
+优先级为 **环境变量覆盖 > 文件值 > 默认值**。文件本身先通过校验，再应用覆盖；
+环境变量不会写回文件。日志输出至标准错误，启动失败记录为 `ERROR` 并以非零状态退出。
 
-## 分层
+### EULA
 
-- `src/config.rs`：配置文件加载、默认生成、环境覆盖及参数校验。
-- `src/eula.rs`：EULA 文件默认生成及启动前同意检查。
-- `src/network.rs`：TCP 接入、连接生命周期、并发限制、完整读写超时。
-- `src/protocol/codec.rs`：基础字段编解码、`Decode` / `Encode` trait。
-- `src/protocol/frame.rs`：TCP 帧长度前缀与完整帧读写。
-- `src/protocol/packets/`：按阶段组织的独立包结构，只包含字段和编解码。
-- `src/protocol/registry.rs`：协议 767 的收发包注册表；宏生成枚举、解析、分发、编码和 `From` 转换。
-- `src/context.rs`：调用方提供的会话与服务上下文。
-- `src/handler/mod.rs`：会话与无状态 Dispatcher，仅负责路由和协议状态校验。
-- `src/handler/status.rs`：StatusService 管理状态响应构建及缓存，状态处理器通过上下文访问。
-- `src/handler/`：按阶段组织的类型化处理器，不直接操作 socket。
-- `src/main.rs`：配置、日志及退出信号。
-- `tests/network.rs`：编解码、异常输入、TCP 拆包/粘包、状态/Ping、登录拒绝和超时测试。
+每次启动都会在绑定网络端口前检查当前工作目录的 `eula.txt`。
+只有明确的 `eula=true` 才允许启动；未同意、重复项、格式错误或读取失败均阻止启动。
+程序不会自动同意，也不提供环境变量绕过。
 
-接收流程：
-`TCP → 长度前缀/完整帧 → 状态与 ID 解析 → Dispatcher → Clientbound → TCP`。
+`ZCRAFT_CONFIG` 不改变 EULA 文件的位置。生成的配置和 EULA 文件已加入 Git 忽略规则。
 
-## 新增数据包
+### 服务器图标
 
-1. 在 `src/protocol/packets/` 对应阶段定义结构体，入站包实现 `Decode`，
-   出站包实现 `Encode`。只编解码字段，不包含包 ID 或帧长度。
-2. 入站包在 `src/handler/` 定义函数：
-   `fn handle_x(ctx: &mut Context<'_>, packet: X) -> io::Result<Outcome>`。
-3. 在 `src/protocol/registry.rs` 引入类型，并在对应状态下注册一行：
+默认图标使用深绿底和薄荷绿像素字母 **Z**，提供以下资源：
 
-```rust,ignore
-// serverbound_packets! 的 Status 块内
+| 文件 | 用途 |
+| --- | --- |
+| [`server-icon.png`](server-icon.png) | 64×64 PNG，可直接用于服务器列表 |
+| [`assets/zcraft-icon.svg`](assets/zcraft-icon.svg) | README 展示及可编辑矢量源文件 |
+| [`tools/generate_icon.py`](tools/generate_icon.py) | 使用 Python 标准库重绘 PNG |
+
+```sh
+python3 tools/generate_icon.py
+```
+
+自定义图标必须是 **64×64 的静态 PNG，大小不超过 20 KiB**。路径相对于工作目录，
+而非配置文件目录。文件缺失时省略图标；错误尺寸、损坏图片或读取错误会阻止服务启动。
+图标在启动时加载并缓存，通过状态响应的 `favicon` 字段返回，替换后需重启。
+服务器列表需要 PNG，不能直接使用 SVG。
+
+## 开发
+
+### 架构
+
+```text
+TCP → 完整帧 → 状态与包 ID 解析 → Dispatcher → 类型化处理器
+                                                   ↓
+TCP ← 帧编码 ← Clientbound ←─────────────────────── 回复
+```
+
+```text
+src/
+├── main.rs               # 启动流程、日志与退出信号
+├── config.rs             # 配置加载、默认生成及校验
+├── eula.rs               # EULA 启动检查
+├── network.rs            # TCP 与连接生命周期
+├── context.rs            # 会话及共享服务上下文
+├── protocol/
+│   ├── codec.rs          # 基础类型编解码
+│   ├── frame.rs          # 帧长度与完整帧读写
+│   ├── registry.rs       # 声明式收发包注册表
+│   └── packets/          # 按协议阶段组织的数据包
+└── handler/              # 无状态分发器与类型化业务处理器
+```
+
+`Dispatcher` 只负责路由和协议状态校验，不构建具体业务响应。
+状态响应及图标缓存由 status 模块负责，处理器通过上下文访问服务，不直接操作 socket。
+
+### 扩展数据包
+
+1. 在 `src/protocol/packets/` 定义包结构，入站实现 `Decode`，出站实现 `Encode`。
+2. 在 `src/handler/` 编写类型化处理器。
+3. 在 `src/protocol/registry.rs` 对应阶段注册类型与处理器。
+
+以下为已有 Ping/Pong 的注册方式：
+
+```rust
+// serverbound_packets! 的 Status 块
 0x01 => Ping(Ping) => crate::handler::status::handle_ping,
 
-// clientbound_packets! 的 Status 块内
+// clientbound_packets! 的 Status 块
 0x01 => Pong(Pong),
 ```
 
-以上是现有 Ping/Pong 的注册示例，不需要再手写枚举或修改分发 match。
-处理器通过 `Some(Pong { payload }.into())` 构造回复。
-新建阶段文件时还需要在父模块声明 `mod`。
+注册宏生成枚举、解析、分发、编码及 `From` 转换，无需重复维护多个 `match`。
+同一状态和方向内的重复 ID 会在编译期报错；包 ID 不进入业务处理器。
+字段编解码不包含帧长度和包 ID，新建模块需在父模块声明。
 
-宏生成静态匹配，不使用 `Any`、运行时向下转型或每包 trait object 分配。
-同一状态、同一方向内的重复 ID 在编译期报错；不同状态/方向可复用 ID。
-统一解析入口校验尾随字节后才分发；分发入口验证入站状态，返回后校验出站状态。
-业务顺序约束（如重复 Status Request）仍由处理器负责。
-
-包 ID 仅定义在当前版本注册表，不写入业务处理器。尚未实现多版本映射。
-原有根模块编解码函数继续重导出，但 `Serverbound` / `Clientbound` 的变体
-改为持有独立结构体，例如 `Ping { payload: 42 }.into()`。
-
-默认最多 1024 个连接，每次完整帧读取/回复写入限时 10 秒；
-帧长前缀最多 3 字节，帧体最多 2,097,151 字节，分配前校验长度。
-`zcraft.toml` 可调整连接限制和超时。每个连接串行处理并直接写回，
-不使用无界消息队列。此限制不是完整的公网抗攻击方案。
-
-## 验证
+### 检查与测试
 
 ```sh
 cargo fmt --check
@@ -125,4 +199,24 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-协议参考：[Minecraft Wiki Server List Ping](https://minecraft.wiki/w/Java_Edition_protocol/Server_List_Ping)。
+测试覆盖字段与帧编解码、协议分发、TCP 生命周期、配置生成、EULA 启动门禁和图标响应。
+
+## 参与贡献
+
+欢迎通过 Issue 反馈问题或讨论设计，通过 Pull Request 提交改进。
+
+- 问题报告请附上复现步骤、客户端版本和相关日志，避免包含账号或凭证。
+- 较大功能或架构改动建议先讨论范围。
+- 为行为变更补充测试，并在提交前运行上述检查。
+- 保持传输、协议和业务处理的职责边界，避免将具体包逻辑放入分发器。
+
+## 许可与声明
+
+ZCraft 采用 **GNU General Public License v3.0（仅第 3 版）**，
+SPDX 标识为 `GPL-3.0-only`。完整条款见 [LICENSE](LICENSE)。
+第三方依赖及资源仍适用各自的许可证；本项目许可证不替代 Minecraft EULA。
+
+ZCraft 是独立的社区项目，与 Mojang 或 Microsoft 无隶属关系，亦未获其认可。
+Minecraft 相关名称及商标归各自权利人所有。
+
+协议参考：[Minecraft Wiki · Server List Ping](https://minecraft.wiki/w/Java_Edition_protocol/Server_List_Ping)。

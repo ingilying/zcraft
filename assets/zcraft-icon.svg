@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <title>ZCraft</title>
+  <desc>A mint-green pixel Z on a dark forest-green tile.</desc>
+  <rect x="2" y="2" width="60" height="60" rx="12" fill="#274537"/>
+  <rect x="4" y="4" width="56" height="56" rx="10" fill="#13251e"/>
+  <path transform="translate(0 2)" fill="#247a4c"
+        d="M16 16H48V24H40V32H32V40H48V48H16V40H24V32H32V24H16Z"/>
+  <path fill="#79e28b"
+        d="M16 16H48V24H40V32H32V40H48V48H16V40H24V32H32V24H16Z"/>
+</svg>

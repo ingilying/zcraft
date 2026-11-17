@@ -21,7 +21,7 @@ pub async fn serve(
 ) -> io::Result<()> {
     config.validate()?;
     let server = Arc::new(ServerContext {
-        status: StatusService::new(&config.motd, config.max_players),
+        status: StatusService::from_config(&config)?,
     });
     let slots = Arc::new(Semaphore::new(config.max_connections));
     let mut tasks = JoinSet::new();
