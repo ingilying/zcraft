@@ -1,5 +1,6 @@
 use zcraft::{
-    handler::{Dispatcher, Session},
+    context::{Context, ServerContext},
+    handler::{Dispatcher, Session, status::StatusService},
     protocol::{
         Clientbound, Reader, Serverbound, State, decode,
         packets::{
@@ -12,7 +13,10 @@ use zcraft::{
 
 #[test]
 fn typed_inbound_conversion_and_generated_routing() {
-    let dispatcher = Dispatcher::new("test", 20);
+    let dispatcher = Dispatcher;
+    let server = ServerContext {
+        status: StatusService::new("test", 20),
+    };
     let mut session = Session::default();
     let handshake: Serverbound = Handshake {
         protocol: 767,
@@ -22,13 +26,37 @@ fn typed_inbound_conversion_and_generated_routing() {
     }
     .into();
     assert_eq!(handshake.state(), State::Handshake);
-    dispatcher.dispatch(&mut session, handshake).unwrap();
+    dispatcher
+        .dispatch(
+            &mut Context {
+                session: &mut session,
+                server: &server,
+            },
+            handshake,
+        )
+        .unwrap();
     let request: Serverbound = StatusRequest.into();
     assert_eq!(request.state(), State::Status);
-    let status = dispatcher.dispatch(&mut session, request).unwrap();
+    let status = dispatcher
+        .dispatch(
+            &mut Context {
+                session: &mut session,
+                server: &server,
+            },
+            request,
+        )
+        .unwrap();
     assert!(matches!(status.reply, Some(Clientbound::Status(_))));
     let ping: Serverbound = Ping { payload: i64::MIN }.into();
-    let pong = dispatcher.dispatch(&mut session, ping).unwrap();
+    let pong = dispatcher
+        .dispatch(
+            &mut Context {
+                session: &mut session,
+                server: &server,
+            },
+            ping,
+        )
+        .unwrap();
     assert_eq!(pong.reply, Some(Pong { payload: i64::MIN }.into()));
     assert!(pong.close);
 }
@@ -36,10 +64,19 @@ fn typed_inbound_conversion_and_generated_routing() {
 #[test]
 fn direct_packet_construction_cannot_bypass_state_guard() {
     let mut session = Session::default();
-    let dispatcher = Dispatcher::new("test", 20);
+    let dispatcher = Dispatcher;
+    let server = ServerContext {
+        status: StatusService::new("test", 20),
+    };
     assert!(
         dispatcher
-            .dispatch(&mut session, Ping { payload: 1 }.into())
+            .dispatch(
+                &mut Context {
+                    session: &mut session,
+                    server: &server
+                },
+                Ping { payload: 1 }.into()
+            )
             .is_err()
     );
     assert_eq!(session.state, State::Handshake);

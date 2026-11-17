@@ -1,8 +1,9 @@
 //! Business handlers operate on typed packets, never on sockets or packet IDs.
 pub(crate) mod handshake;
-pub(crate) mod status;
+pub mod status;
 
-use crate::protocol::{Clientbound, PROTOCOL_VERSION, Serverbound, State, invalid};
+pub use crate::context::Context;
+use crate::protocol::{Clientbound, Serverbound, State, invalid};
 use std::io;
 
 #[derive(Debug)]
@@ -31,37 +32,15 @@ pub struct Outcome {
     pub close: bool,
 }
 
-/// Only the services required by packet handlers; no transport access.
-pub struct Context<'a> {
-    pub session: &'a mut Session,
-    pub status_json: &'a str,
-}
-
-pub struct Dispatcher {
-    status_json: String,
-}
+/// Stateless routing and protocol-state validation; owns no business services.
+pub struct Dispatcher;
 
 impl Dispatcher {
-    pub fn new(motd: &str, max_players: u32) -> Self {
-        Self {
-            status_json: serde_json::json!({
-                "version": { "name": "1.21.1", "protocol": PROTOCOL_VERSION },
-                "players": { "max": max_players, "online": 0, "sample": [] },
-                "description": { "text": motd },
-                "enforcesSecureChat": false
-            })
-            .to_string(),
-        }
-    }
-
-    pub fn dispatch(&self, session: &mut Session, packet: Serverbound) -> io::Result<Outcome> {
-        let outcome = packet.dispatch(&mut Context {
-            session,
-            status_json: &self.status_json,
-        })?;
+    pub fn dispatch(&self, ctx: &mut Context<'_>, packet: Serverbound) -> io::Result<Outcome> {
+        let outcome = packet.dispatch(ctx)?;
         // Handlers may transition state before replying (e.g. handshake -> login).
         if let Some(reply) = &outcome.reply
-            && reply.state() != session.state
+            && reply.state() != ctx.session.state
         {
             return Err(invalid("outbound packet not allowed in current session"));
         }

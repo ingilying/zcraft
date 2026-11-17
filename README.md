@@ -24,7 +24,10 @@ ZCRAFT_BIND=127.0.0.1:25565 ZCRAFT_MOTD="Hello ZCraft" RUST_LOG=debug cargo run
 - `src/protocol/frame.rs`：TCP 帧长度前缀与完整帧读写。
 - `src/protocol/packets/`：按阶段组织的独立包结构，只包含字段和编解码。
 - `src/protocol/registry.rs`：协议 767 的收发包注册表；宏生成枚举、解析、分发、编码和 `From` 转换。
-- `src/handler/`：会话、上下文和按阶段组织的类型化处理器，不直接操作 socket。
+- `src/context.rs`：调用方提供的会话与服务上下文。
+- `src/handler/mod.rs`：会话与无状态 Dispatcher，仅负责路由和协议状态校验。
+- `src/handler/status.rs`：StatusService 管理状态响应构建及缓存，状态处理器通过上下文访问。
+- `src/handler/`：按阶段组织的类型化处理器，不直接操作 socket。
 - `src/main.rs`：配置、日志及退出信号。
 - `tests/network.rs`：编解码、异常输入、TCP 拆包/粘包、状态/Ping、登录拒绝和超时测试。
 

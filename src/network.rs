@@ -1,5 +1,6 @@
 use crate::{
-    handler::{Dispatcher, Session},
+    context::{Context, ServerContext},
+    handler::{Dispatcher, Session, status::StatusService},
     protocol::{decode, read_frame, write_frame},
 };
 use std::{future::Future, io, sync::Arc, time::Duration};
@@ -43,7 +44,9 @@ pub async fn serve(
             "connection limit and timeout must be positive",
         ));
     }
-    let dispatcher = Arc::new(Dispatcher::new(&config.motd, config.max_players));
+    let server = Arc::new(ServerContext {
+        status: StatusService::new(&config.motd, config.max_players),
+    });
     let slots = Arc::new(Semaphore::new(config.max_connections));
     let mut tasks = JoinSet::new();
     tokio::pin!(shutdown);
@@ -62,11 +65,11 @@ pub async fn serve(
                     drop(stream);
                     continue;
                 };
-                let dispatcher = dispatcher.clone();
+                let server = server.clone();
                 let deadline = config.io_timeout;
                 tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = connection(stream, dispatcher, deadline).await {
+                    if let Err(error) = connection(stream, server, deadline).await {
                         tracing::debug!(%peer, %error, "connection closed");
                     }
                 });
@@ -80,7 +83,7 @@ pub async fn serve(
 
 async fn connection(
     mut stream: TcpStream,
-    dispatcher: Arc<Dispatcher>,
+    server: Arc<ServerContext>,
     deadline: Duration,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
@@ -93,7 +96,13 @@ async fn connection(
             return Ok(());
         };
         let packet = decode(session.state, &frame)?;
-        let outcome = dispatcher.dispatch(&mut session, packet)?;
+        let outcome = Dispatcher.dispatch(
+            &mut Context {
+                session: &mut session,
+                server: &server,
+            },
+            packet,
+        )?;
         if let Some(reply) = outcome.reply {
             let body = reply.encode()?;
             timeout(deadline, write_frame(&mut stream, &body))

@@ -6,7 +6,8 @@ use tokio::{
     time::timeout,
 };
 use zcraft::{
-    handler::{Dispatcher, Session},
+    context::{Context, ServerContext},
+    handler::{Dispatcher, Session, status::StatusService},
     network::{Config, serve},
     protocol::{
         packets::status::{Ping, StatusRequest},
@@ -66,16 +67,28 @@ fn state_packet_validation_and_dispatch() {
     assert!(decode(State::Status, &[1, 0]).is_err());
     assert!(decode(State::Handshake, &handshake(4)).is_err());
     assert!(decode(State::Login, &[0]).is_err());
-    let dispatcher = Dispatcher::new("test", 20);
+    let dispatcher = Dispatcher;
+    let server = ServerContext {
+        status: StatusService::new("test", 20),
+    };
     let mut session = Session::default();
     assert!(
         dispatcher
-            .dispatch(&mut session, StatusRequest.into())
+            .dispatch(
+                &mut Context {
+                    session: &mut session,
+                    server: &server
+                },
+                StatusRequest.into()
+            )
             .is_err()
     );
     dispatcher
         .dispatch(
-            &mut session,
+            &mut Context {
+                session: &mut session,
+                server: &server,
+            },
             decode(State::Handshake, &handshake(1)).unwrap(),
         )
         .unwrap();
@@ -83,18 +96,36 @@ fn state_packet_validation_and_dispatch() {
     assert_eq!(session.protocol, Some(767));
     assert!(
         !dispatcher
-            .dispatch(&mut session, StatusRequest.into())
+            .dispatch(
+                &mut Context {
+                    session: &mut session,
+                    server: &server
+                },
+                StatusRequest.into()
+            )
             .unwrap()
             .close
     );
     assert!(
         dispatcher
-            .dispatch(&mut session, StatusRequest.into())
+            .dispatch(
+                &mut Context {
+                    session: &mut session,
+                    server: &server
+                },
+                StatusRequest.into()
+            )
             .is_err()
     );
     assert!(
         dispatcher
-            .dispatch(&mut session, Ping { payload: -42 }.into())
+            .dispatch(
+                &mut Context {
+                    session: &mut session,
+                    server: &server
+                },
+                Ping { payload: -42 }.into()
+            )
             .unwrap()
             .close
     );
