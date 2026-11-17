@@ -11,39 +11,15 @@ use tokio::{
     time::timeout,
 };
 
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub bind: String,
-    pub motd: String,
-    pub max_players: u32,
-    pub max_connections: usize,
-    /// Deadline for a complete frame or response, not per-byte activity.
-    pub io_timeout: Duration,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            bind: "0.0.0.0:25565".into(),
-            motd: "ZCraft — Rust Minecraft Server".into(),
-            max_players: 20,
-            max_connections: 1024,
-            io_timeout: Duration::from_secs(10),
-        }
-    }
-}
+// Preserve the original import path for library users.
+pub use crate::config::Config;
 
 pub async fn serve(
     listener: TcpListener,
     config: Config,
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
-    if config.max_connections == 0 || config.io_timeout.is_zero() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "connection limit and timeout must be positive",
-        ));
-    }
+    config.validate()?;
     let server = Arc::new(ServerContext {
         status: StatusService::new(&config.motd, config.max_players),
     });

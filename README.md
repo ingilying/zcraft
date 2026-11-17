@@ -17,8 +17,40 @@ ZCRAFT_BIND=127.0.0.1:25565 ZCRAFT_MOTD="Hello ZCraft" RUST_LOG=debug cargo run
 加密、压缩、Configuration、Play、世界或玩家逻辑。在线人数固定为 0。
 状态查询允许其他协议版本，以便客户端展示版本不兼容信息。
 
+## 配置文件
+
+启动时读取当前工作目录的 `zcraft.toml`；文件不存在则自动生成默认配置：
+
+```toml
+bind = "0.0.0.0:25565"
+motd = "ZCraft — Rust Minecraft Server"
+max_players = 20
+max_connections = 1024
+io_timeout_seconds = 10
+```
+
+- `bind` 使用 IP 和端口，IPv6 示例：`[::]:25565`。
+- `max_players` 是服务器列表展示的容量，目前不是实际玩家接入限制。
+- `max_connections` 必须大于 0，且不能超过 Tokio 信号量支持的上限。
+- `io_timeout_seconds` 使用整数秒，范围 1–86400。
+- 缺少字段使用默认值；未知字段、类型错误、无效值或读取失败均报错退出。
+- 已有文件（包括注释）不会被重写。默认配置通过临时文件完整写入后，
+  以不覆盖目标的方式发布，避免并发首次启动读取到半个文件。
+- 修改配置后需要重启，暂不支持热加载。默认生成文件已加入 Git 忽略规则。
+
+可指定其他文件（父目录需已存在）：
+
+```sh
+ZCRAFT_CONFIG=./config/server.toml cargo run
+```
+
+优先级：`ZCRAFT_BIND` / `ZCRAFT_MOTD` 环境变量 > 文件值 > 缺失字段默认值。
+文件本身先通过校验，再应用环境变量；覆盖值不写回文件。
+`RUST_LOG` 继续控制日志级别。
+
 ## 分层
 
+- `src/config.rs`：配置文件加载、默认生成、环境覆盖及参数校验。
 - `src/network.rs`：TCP 接入、连接生命周期、并发限制、完整读写超时。
 - `src/protocol/codec.rs`：基础字段编解码、`Decode` / `Encode` trait。
 - `src/protocol/frame.rs`：TCP 帧长度前缀与完整帧读写。
@@ -65,7 +97,7 @@ ZCRAFT_BIND=127.0.0.1:25565 ZCRAFT_MOTD="Hello ZCraft" RUST_LOG=debug cargo run
 
 默认最多 1024 个连接，每次完整帧读取/回复写入限时 10 秒；
 帧长前缀最多 3 字节，帧体最多 2,097,151 字节，分配前校验长度。
-`Config` 可在代码中调整连接限制和超时。每个连接串行处理并直接写回，
+`zcraft.toml` 可调整连接限制和超时。每个连接串行处理并直接写回，
 不使用无界消息队列。此限制不是完整的公网抗攻击方案。
 
 ## 验证
