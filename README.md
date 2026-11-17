@@ -10,12 +10,28 @@ cargo run
 ZCRAFT_BIND=127.0.0.1:25565 ZCRAFT_MOTD="Hello ZCraft" RUST_LOG=debug cargo run
 ```
 
-默认监听 `0.0.0.0:25565`（所有网卡）。客户端添加 `localhost:25565`，
+首次运行会生成配置及 `eula.txt`，然后因尚未同意 EULA 而退出。阅读并同意后，
+手动将 `eula.txt` 中的 `eula=false` 改为 `eula=true`，再次运行。
+
+同意 EULA 后默认监听 `0.0.0.0:25565`（所有网卡）。客户端添加 `localhost:25565`，
 可查询服务器描述、版本、人数和延迟。Ctrl-C 停止接收并取消所有连接任务。
 
 **目前不能进入游戏。** 登录/转移请求返回 Login Disconnect；尚未实现认证、
 加密、压缩、Configuration、Play、世界或玩家逻辑。在线人数固定为 0。
 状态查询允许其他协议版本，以便客户端展示版本不兼容信息。
+
+## EULA 启动检查
+
+`src/eula.rs` 负责检查当前工作目录的 `eula.txt`。程序先加载配置，
+再检查 EULA，只有通过检查才会绑定 TCP 端口。
+
+- 文件不存在时安全生成 `eula=false`，返回错误并退出，不自动同意。
+- 请阅读 [Minecraft EULA](https://www.minecraft.net/eula)，仅在同意后设置 `eula=true`。
+- 每次启动重新检查；空文件、缺少同意项或 `eula=false` 均不能启动。
+- 支持空行、`#` / `!` 注释行、两侧空白、CRLF 和 UTF-8 BOM。
+- 值必须为小写 `true` 或 `false`；重复项、未知项、格式错误及读取失败均阻止启动。
+- 不重写已有文件，不提供环境变量绕过；`eula.txt` 已加入 Git 忽略规则。
+- `ZCRAFT_CONFIG` 只改变配置文件路径，EULA 文件仍位于当前工作目录。
 
 ## 配置文件
 
@@ -51,6 +67,7 @@ ZCRAFT_CONFIG=./config/server.toml cargo run
 ## 分层
 
 - `src/config.rs`：配置文件加载、默认生成、环境覆盖及参数校验。
+- `src/eula.rs`：EULA 文件默认生成及启动前同意检查。
 - `src/network.rs`：TCP 接入、连接生命周期、并发限制、完整读写超时。
 - `src/protocol/codec.rs`：基础字段编解码、`Decode` / `Encode` trait。
 - `src/protocol/frame.rs`：TCP 帧长度前缀与完整帧读写。

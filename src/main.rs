@@ -1,7 +1,8 @@
-use std::io;
+use std::{io, process::ExitCode};
 use tokio::net::TcpListener;
 use zcraft::{
     config::{Config, DEFAULT_CONFIG_PATH},
+    eula::{DEFAULT_EULA_PATH, require_acceptance},
     network::serve,
 };
 
@@ -17,8 +18,19 @@ fn env_override(name: &str) -> io::Result<Option<String>> {
 }
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> io::Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
@@ -29,6 +41,7 @@ async fn main() -> io::Result<()> {
     let mut config = Config::load_or_create(&path)?;
     config.apply_overrides(env_override("ZCRAFT_BIND")?, env_override("ZCRAFT_MOTD")?)?;
     tracing::info!(path = %path.display(), "configuration loaded");
+    require_acceptance(DEFAULT_EULA_PATH)?;
     let listener = TcpListener::bind(&config.bind).await?;
     tracing::info!(address = %listener.local_addr()?, "ZCraft listening (Java 1.21.1 / 767)");
     serve(listener, config, async {
