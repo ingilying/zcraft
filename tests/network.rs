@@ -60,8 +60,8 @@ fn strings_validate_lengths_utf8_and_utf16() {
     assert_eq!(Reader::new(&bytes).string(2).unwrap(), "😀");
 }
 
-#[test]
-fn state_packet_validation_and_dispatch() {
+#[tokio::test]
+async fn state_packet_validation_and_dispatch() {
     assert!(decode(State::Handshake, &[1]).is_err());
     assert!(decode(State::Status, &[0, 1]).is_err());
     assert!(decode(State::Status, &[1, 0]).is_err());
@@ -70,6 +70,7 @@ fn state_packet_validation_and_dispatch() {
     let dispatcher = Dispatcher;
     let server = ServerContext {
         status: StatusService::new("test", 20),
+        login: zcraft::handler::login::LoginService::offline(),
     };
     let mut session = Session::default();
     assert!(
@@ -81,6 +82,7 @@ fn state_packet_validation_and_dispatch() {
                 },
                 StatusRequest.into()
             )
+            .await
             .is_err()
     );
     dispatcher
@@ -91,6 +93,7 @@ fn state_packet_validation_and_dispatch() {
             },
             decode(State::Handshake, &handshake(1)).unwrap(),
         )
+        .await
         .unwrap();
     assert_eq!(session.state, State::Status);
     assert_eq!(session.protocol, Some(767));
@@ -103,6 +106,7 @@ fn state_packet_validation_and_dispatch() {
                 },
                 StatusRequest.into()
             )
+            .await
             .unwrap()
             .close
     );
@@ -115,6 +119,7 @@ fn state_packet_validation_and_dispatch() {
                 },
                 StatusRequest.into()
             )
+            .await
             .is_err()
     );
     assert!(
@@ -126,6 +131,7 @@ fn state_packet_validation_and_dispatch() {
                 },
                 Ping { payload: -42 }.into()
             )
+            .await
             .unwrap()
             .close
     );
@@ -177,6 +183,7 @@ async fn start(
         listener,
         Config {
             io_timeout: deadline,
+            offline_mode: true,
             server_icon: concat!(env!("CARGO_MANIFEST_DIR"), "/server-icon.png").into(),
             ..Config::default()
         },
@@ -222,12 +229,15 @@ async fn tcp_status_ping_and_shutdown() {
 async fn tcp_login_disconnect() {
     timeout(Duration::from_secs(5), async {
         let (mut stream, stop, server) = start(Duration::from_secs(1)).await;
-        write_frame(&mut stream, &handshake(2)).await.unwrap();
+        let mut wrong_version = handshake(2);
+        // Replace the protocol VarInt (767 = ff 05) with 766 = fe 05.
+        wrong_version[1] = 0xfe;
+        write_frame(&mut stream, &wrong_version).await.unwrap();
         let body = read_frame(&mut stream).await.unwrap().unwrap();
         let mut reader = Reader::new(&body);
         assert_eq!(reader.varint().unwrap(), 0);
         let json: serde_json::Value = serde_json::from_str(&reader.string(32767).unwrap()).unwrap();
-        assert!(json["text"].as_str().unwrap().contains("not implemented"));
+        assert!(json["text"].as_str().unwrap().contains("1.21.1"));
         assert!(read_frame(&mut stream).await.unwrap().is_none());
         stop.send(()).unwrap();
         server.await.unwrap().unwrap();

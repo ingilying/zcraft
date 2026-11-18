@@ -42,6 +42,11 @@ async fn run() -> io::Result<()> {
     config.apply_overrides(env_override("ZCRAFT_BIND")?, env_override("ZCRAFT_MOTD")?)?;
     tracing::info!(path = %path.display(), "configuration loaded");
     require_acceptance(DEFAULT_EULA_PATH)?;
+    if config.offline_mode {
+        tracing::warn!(
+            "Offline mode enabled: usernames are NOT authenticated. Do not expose this server to untrusted networks."
+        );
+    }
     let listener = TcpListener::bind(&config.bind).await?;
     tracing::info!(address = %listener.local_addr()?, "ZCraft listening (Java 1.21.1 / 767)");
     serve(listener, config, async {

@@ -28,7 +28,8 @@ ZCraft 探索以 Rust 实现 Minecraft 服务端，将网络传输、协议编�
 
 > [!IMPORTANT]
 > 项目处于基础架构阶段，**目前不能进入游戏**。可以通过 Minecraft 服务器列表查询
-> MOTD、版本、图标与延迟；登录和转移请求会收到明确的断开提示。暂不适合生产部署。
+> MOTD、版本、图标与延迟。已支持离线登录和正版会话认证；登录成功并收到客户端确认后，
+> 进入 Configuration 阶段，随后提示世界尚未实现并断开。暂不适合生产部署。
 
 ## 功能状态
 
@@ -38,9 +39,10 @@ ZCraft 探索以 Rust 实现 Minecraft 服务端，将网络传输、协议编�
 - [x] 握手、服务器状态查询与 Ping/Pong
 - [x] 服务器图标校验、Base64 编码与响应缓存
 - [x] TOML 配置加载、默认文件生成与 EULA 启动检查
-- [ ] 登录与身份认证
-- [ ] 加密与压缩
-- [ ] Configuration / Play 协议阶段
+- [x] 离线登录与 Mojang 正版会话认证
+- [x] RSA 密钥交换与 AES-128-CFB8 加密传输
+- [ ] 数据包压缩
+- [ ] 完整 Configuration / Play 协议阶段
 - [ ] 世界、实体与玩家逻辑
 
 状态响应的在线人数目前固定为 `0`，尚未实现多版本协议映射。
@@ -50,7 +52,9 @@ ZCraft 探索以 Rust 实现 Minecraft 服务端，将网络传输、协议编�
 ### 环境要求
 
 - 支持 Rust 2024 edition 的近期稳定版 Rust 与 Cargo。
-- Minecraft Java 1.21.1 客户端，用于验证服务器列表功能。
+- Minecraft Java 1.21.1 客户端，用于验证服务器列表及登录流程。
+- C 编译器、Perl 和 Make 等原生构建工具，用于编译随依赖提供的 OpenSSL；首次构建较慢。
+- 正版模式需能直接通过 HTTPS 访问 `sessionserver.mojang.com`。
 
 在项目根目录运行：
 
@@ -81,6 +85,7 @@ bind = "0.0.0.0:25565"
 motd = "ZCraft — Rust Minecraft Server"
 server_icon = "server-icon.png"
 max_players = 20
+offline_mode = false
 max_connections = 1024
 io_timeout_seconds = 10
 ```
@@ -91,11 +96,45 @@ io_timeout_seconds = 10
 | `motd` | 服务器列表描述 |
 | `server_icon` | PNG 图标路径；空字符串表示禁用 |
 | `max_players` | 服务器列表展示的容量，尚不是实际玩家接入限制 |
+| `offline_mode` | 是否启用离线登录，默认 `false`，即要求正版会话认证 |
 | `max_connections` | 最大并发连接数，必须大于 0 且不超过 Tokio 信号量上限 |
 | `io_timeout_seconds` | 每次完整帧读取或响应写入的时限，整数秒，范围 1–86400 |
 
 缺少字段使用默认值；未知字段、错误类型和无效值会阻止启动。
 已有配置及注释不会被重写。修改后需重启，暂不支持热加载。
+
+### 登录模式
+
+默认启用正版认证：
+
+```toml
+offline_mode = false
+```
+
+客户端收到 RSA 公钥与随机验证令牌后完成密钥交换，后续整个 TCP 协议流（含长度前缀）
+采用 AES-128-CFB8 加密。服务器向 Mojang `hasJoined` 接口验证会话，使用验证返回的
+UUID、用户名和属性，不信任客户端自报 UUID。认证失败、超时或接口异常时拒绝登录，
+**不会回退到离线模式**。认证请求固定使用官方 HTTPS 地址，不跟随重定向，也不使用代理环境变量。
+
+仅在本地测试或可信网络中，可手动开启离线登录：
+
+```toml
+offline_mode = true
+```
+
+旧配置不会自动重写，需要自行添加此字段；省略时仍为 `false`。修改后重启生效。
+离线模式不访问 Mojang，也不进行登录加密，使用 Java 兼容的
+`OfflinePlayer:<用户名>` 算法生成离线 UUID。
+
+> [!WARNING]
+> 离线模式下任何人都可以冒用其他用户名。建议同时设置 `bind = "127.0.0.1:25565"`，
+> 不要直接暴露到不可信网络。切换登录模式会改变同一用户名对应的 UUID。
+
+当前支持 `Login Start → Encryption Request/Response（正版模式）→ Login Success → Login Acknowledged`。
+收到确认后发送 Configuration 阶段的 NBT 断开提示，**尚不能进入世界**，也不会计入在线人数。
+未实现压缩，不会发送 Set Compression。错误版本、重复或乱序登录包会被拒绝。
+登录/状态连接总时限为 30 秒，Mojang 认证上限为 10 秒，RSA 解密最多并发 16 个任务；
+底层读写仍受 `io_timeout_seconds` 限制。
 
 ### 环境变量
 
@@ -159,6 +198,8 @@ src/
 ├── config.rs             # 配置加载、默认生成及校验
 ├── eula.rs               # EULA 启动检查
 ├── network.rs            # TCP 与连接生命周期
+├── transport.rs          # 可切换的明文 / AES-CFB8 传输
+├── auth.rs               # RSA、离线 UUID 与 Mojang 会话认证
 ├── context.rs            # 会话及共享服务上下文
 ├── protocol/
 │   ├── codec.rs          # 基础类型编解码
@@ -174,7 +215,7 @@ src/
 ### 扩展数据包
 
 1. 在 `src/protocol/packets/` 定义包结构，入站实现 `Decode`，出站实现 `Encode`。
-2. 在 `src/handler/` 编写类型化处理器。
+2. 在 `src/handler/` 编写异步类型化处理器：`async fn handle_x(ctx: &mut Context<'_>, packet: X) -> io::Result<Outcome>`。
 3. 在 `src/protocol/registry.rs` 对应阶段注册类型与处理器。
 
 以下为已有 Ping/Pong 的注册方式：
@@ -199,7 +240,9 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-测试覆盖字段与帧编解码、协议分发、TCP 生命周期、配置生成、EULA 启动门禁和图标响应。
+测试覆盖字段与帧编解码、协议分发、TCP 生命周期、配置生成、EULA 启动门禁、图标响应，
+以及离线 UUID、RSA/SPKI、Minecraft 有符号 SHA-1、在线身份校验和双向加密登录流程。
+在线认证集成测试使用注入的会话验证器，不依赖真实账号；尚未完成真实 Microsoft/Mojang 账号联调。
 
 ## 参与贡献
 

@@ -15,4 +15,5 @@ pub enum State {
     Handshake,
     Status,
     Login,
+    Configuration,
 }

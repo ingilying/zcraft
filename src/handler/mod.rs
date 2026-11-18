@@ -1,5 +1,6 @@
 //! Business handlers operate on typed packets, never on sockets or packet IDs.
 pub(crate) mod handshake;
+pub mod login;
 pub mod status;
 
 pub use crate::context::Context;
@@ -13,6 +14,8 @@ pub struct Session {
     pub address: Option<String>,
     pub port: Option<u16>,
     status_sent: bool,
+    pub login: login::LoginPhase,
+    pub profile: Option<crate::auth::Profile>,
 }
 
 impl Default for Session {
@@ -23,6 +26,8 @@ impl Default for Session {
             address: None,
             port: None,
             status_sent: false,
+            login: login::LoginPhase::default(),
+            profile: None,
         }
     }
 }
@@ -30,14 +35,20 @@ impl Default for Session {
 pub struct Outcome {
     pub reply: Option<Clientbound>,
     pub close: bool,
+    /// Enable the transport cipher before writing this outcome's reply.
+    pub encryption: Option<[u8; 16]>,
 }
 
 /// Stateless routing and protocol-state validation; owns no business services.
 pub struct Dispatcher;
 
 impl Dispatcher {
-    pub fn dispatch(&self, ctx: &mut Context<'_>, packet: Serverbound) -> io::Result<Outcome> {
-        let outcome = packet.dispatch(ctx)?;
+    pub async fn dispatch(
+        &self,
+        ctx: &mut Context<'_>,
+        packet: Serverbound,
+    ) -> io::Result<Outcome> {
+        let outcome = packet.dispatch(ctx).await?;
         // Handlers may transition state before replying (e.g. handshake -> login).
         if let Some(reply) = &outcome.reply
             && reply.state() != ctx.session.state

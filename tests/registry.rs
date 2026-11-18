@@ -11,11 +11,12 @@ use zcraft::{
     },
 };
 
-#[test]
-fn typed_inbound_conversion_and_generated_routing() {
+#[tokio::test]
+async fn typed_inbound_conversion_and_generated_routing() {
     let dispatcher = Dispatcher;
     let server = ServerContext {
         status: StatusService::new("test", 20),
+        login: zcraft::handler::login::LoginService::offline(),
     };
     let mut session = Session::default();
     let handshake: Serverbound = Handshake {
@@ -34,6 +35,7 @@ fn typed_inbound_conversion_and_generated_routing() {
             },
             handshake,
         )
+        .await
         .unwrap();
     let request: Serverbound = StatusRequest.into();
     assert_eq!(request.state(), State::Status);
@@ -45,6 +47,7 @@ fn typed_inbound_conversion_and_generated_routing() {
             },
             request,
         )
+        .await
         .unwrap();
     assert!(matches!(status.reply, Some(Clientbound::Status(_))));
     let ping: Serverbound = Ping { payload: i64::MIN }.into();
@@ -56,17 +59,19 @@ fn typed_inbound_conversion_and_generated_routing() {
             },
             ping,
         )
+        .await
         .unwrap();
     assert_eq!(pong.reply, Some(Pong { payload: i64::MIN }.into()));
     assert!(pong.close);
 }
 
-#[test]
-fn direct_packet_construction_cannot_bypass_state_guard() {
+#[tokio::test]
+async fn direct_packet_construction_cannot_bypass_state_guard() {
     let mut session = Session::default();
     let dispatcher = Dispatcher;
     let server = ServerContext {
         status: StatusService::new("test", 20),
+        login: zcraft::handler::login::LoginService::offline(),
     };
     assert!(
         dispatcher
@@ -77,6 +82,7 @@ fn direct_packet_construction_cannot_bypass_state_guard() {
                 },
                 Ping { payload: 1 }.into()
             )
+            .await
             .is_err()
     );
     assert_eq!(session.state, State::Handshake);

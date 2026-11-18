@@ -71,6 +71,14 @@ impl<'a> Reader<'a> {
         Ok(value.to_owned())
     }
 
+    pub fn byte_array(&mut self, max_bytes: usize) -> io::Result<Vec<u8>> {
+        let len = self.varint()?;
+        if len < 0 || len as usize > max_bytes {
+            return Err(invalid("invalid byte array length"));
+        }
+        Ok(self.take(len as usize)?.to_vec())
+    }
+
     pub fn u16(&mut self) -> io::Result<u16> {
         Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
     }

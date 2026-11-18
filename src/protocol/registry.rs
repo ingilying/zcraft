@@ -3,8 +3,12 @@
 use super::{
     Decode, Encode, Reader, State, invalid,
     packets::{
+        configuration::ConfigurationDisconnect,
         handshake::Handshake,
-        login::LoginDisconnect,
+        login::{
+            EncryptionRequest, EncryptionResponse, LoginAcknowledged, LoginDisconnect, LoginStart,
+            LoginSuccess,
+        },
         status::{Ping, Pong, StatusRequest, StatusResponse},
     },
     put_varint,
@@ -64,13 +68,13 @@ macro_rules! serverbound_packets {
                 }
             }
 
-            pub(crate) fn dispatch(self, ctx: &mut Context<'_>) -> io::Result<Outcome> {
+            pub(crate) async fn dispatch(self, ctx: &mut Context<'_>) -> io::Result<Outcome> {
                 // Also guards packets constructed directly rather than decoded from TCP.
                 if ctx.session.state != self.state() {
                     return Err(invalid("packet not allowed in current session"));
                 }
                 match self {
-                    $($( Self::$variant(packet) => $handler(ctx, packet), )*)*
+                    $($( Self::$variant(packet) => $handler(ctx, packet).await, )*)*
                 }
             }
         }
@@ -122,6 +126,11 @@ serverbound_packets! {
         0x00 => StatusRequest(StatusRequest) => crate::handler::status::handle_status_request,
         0x01 => Ping(Ping) => crate::handler::status::handle_ping,
     }
+    Login {
+        0x00 => LoginStart(LoginStart) => crate::handler::login::handle_start,
+        0x01 => EncryptionResponse(EncryptionResponse) => crate::handler::login::handle_encryption_response,
+        0x03 => LoginAcknowledged(LoginAcknowledged) => crate::handler::login::handle_acknowledged,
+    }
 }
 
 clientbound_packets! {
@@ -131,6 +140,11 @@ clientbound_packets! {
     }
     Login {
         0x00 => LoginDisconnect(LoginDisconnect),
+        0x01 => EncryptionRequest(EncryptionRequest),
+        0x02 => LoginSuccess(LoginSuccess),
+    }
+    Configuration {
+        0x02 => ConfigurationDisconnect(ConfigurationDisconnect),
     }
 }
 

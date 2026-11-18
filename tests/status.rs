@@ -16,12 +16,13 @@ fn status_service_builds_response_without_dispatcher() {
     assert_eq!(service.response(), first);
 }
 
-#[test]
-fn dispatcher_uses_caller_services_without_retaining_status() {
+#[tokio::test]
+async fn dispatcher_uses_caller_services_without_retaining_status() {
     let dispatcher = Dispatcher;
     for motd in ["server A", "server B"] {
         let server = ServerContext {
             status: StatusService::new(motd, 20),
+            login: zcraft::handler::login::LoginService::offline(),
         };
         let mut session = Session::default();
         session.state = State::Status;
@@ -33,6 +34,7 @@ fn dispatcher_uses_caller_services_without_retaining_status() {
                 },
                 StatusRequest.into(),
             )
+            .await
             .unwrap();
         let Some(Clientbound::Status(response)) = result.reply else {
             panic!("expected status response")

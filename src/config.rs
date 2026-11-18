@@ -18,6 +18,8 @@ pub struct Config {
     /// Relative paths are resolved from the working directory.
     pub server_icon: String,
     pub max_players: u32,
+    /// Disables Mojang verification. Unsafe on untrusted networks.
+    pub offline_mode: bool,
     pub max_connections: usize,
     /// Deadline for a complete frame or response, not per-byte activity.
     #[serde(rename = "io_timeout_seconds", with = "seconds")]
@@ -31,6 +33,7 @@ impl Default for Config {
             motd: "ZCraft — Rust Minecraft Server".into(),
             server_icon: "server-icon.png".into(),
             max_players: 20,
+            offline_mode: false,
             max_connections: 1024,
             io_timeout: Duration::from_secs(10),
         }

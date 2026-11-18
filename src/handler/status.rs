@@ -53,7 +53,10 @@ impl StatusService {
     }
 }
 
-pub fn handle_status_request(ctx: &mut Context<'_>, _packet: StatusRequest) -> io::Result<Outcome> {
+pub async fn handle_status_request(
+    ctx: &mut Context<'_>,
+    _packet: StatusRequest,
+) -> io::Result<Outcome> {
     if ctx.session.status_sent {
         return Err(invalid("duplicate status request"));
     }
@@ -61,10 +64,11 @@ pub fn handle_status_request(ctx: &mut Context<'_>, _packet: StatusRequest) -> i
     Ok(Outcome {
         reply: Some(ctx.server.status.response().into()),
         close: false,
+        encryption: None,
     })
 }
 
-pub fn handle_ping(_ctx: &mut Context<'_>, packet: Ping) -> io::Result<Outcome> {
+pub async fn handle_ping(_ctx: &mut Context<'_>, packet: Ping) -> io::Result<Outcome> {
     Ok(Outcome {
         reply: Some(
             Pong {
@@ -73,5 +77,6 @@ pub fn handle_ping(_ctx: &mut Context<'_>, packet: Ping) -> io::Result<Outcome> 
             .into(),
         ),
         close: true,
+        encryption: None,
     })
 }

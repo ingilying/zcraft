@@ -1,7 +1,8 @@
 use crate::{
     context::{Context, ServerContext},
-    handler::{Dispatcher, Session, status::StatusService},
-    protocol::{decode, read_frame, write_frame},
+    handler::{Dispatcher, Session, login::LoginService, status::StatusService},
+    protocol::decode,
+    transport::Transport,
 };
 use std::{future::Future, io, sync::Arc, time::Duration};
 use tokio::{
@@ -22,7 +23,20 @@ pub async fn serve(
     config.validate()?;
     let server = Arc::new(ServerContext {
         status: StatusService::from_config(&config)?,
+        login: LoginService::from_config(&config).await?,
     });
+    serve_with_context(listener, config, server, shutdown).await
+}
+
+/// Entry point for embedders/tests supplying services. Application startup must
+/// perform its EULA check before creating the listener.
+pub async fn serve_with_context(
+    listener: TcpListener,
+    config: Config,
+    server: Arc<ServerContext>,
+    shutdown: impl Future<Output = ()>,
+) -> io::Result<()> {
+    config.validate()?;
     let slots = Arc::new(Semaphore::new(config.max_connections));
     let mut tasks = JoinSet::new();
     tokio::pin!(shutdown);
@@ -45,8 +59,10 @@ pub async fn serve(
                 let deadline = config.io_timeout;
                 tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = connection(stream, server, deadline).await {
-                        tracing::debug!(%peer, %error, "connection closed");
+                    match timeout(Duration::from_secs(30), connection(stream, server, deadline)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => tracing::debug!(%peer, %error, "connection closed"),
+                        Err(_) => tracing::debug!(%peer, "login/status session timed out"),
                     }
                 });
             }
@@ -58,30 +74,36 @@ pub async fn serve(
 }
 
 async fn connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     server: Arc<ServerContext>,
     deadline: Duration,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
+    let mut transport = Transport::new(stream);
     let mut session = Session::default();
     loop {
-        let frame = timeout(deadline, read_frame(&mut stream))
+        let frame = timeout(deadline, transport.read_frame())
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "frame read timed out"))??;
         let Some(frame) = frame else {
             return Ok(());
         };
         let packet = decode(session.state, &frame)?;
-        let outcome = Dispatcher.dispatch(
-            &mut Context {
-                session: &mut session,
-                server: &server,
-            },
-            packet,
-        )?;
+        let outcome = Dispatcher
+            .dispatch(
+                &mut Context {
+                    session: &mut session,
+                    server: &server,
+                },
+                packet,
+            )
+            .await?;
+        if let Some(secret) = outcome.encryption {
+            transport.enable_encryption(&secret)?;
+        }
         if let Some(reply) = outcome.reply {
             let body = reply.encode()?;
-            timeout(deadline, write_frame(&mut stream, &body))
+            timeout(deadline, transport.write_frame(&body))
                 .await
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::TimedOut, "response write timed out")
