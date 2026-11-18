@@ -1,5 +1,5 @@
 use crate::{
-    auth::Profile,
+    identity::Profile,
     protocol::{Decode, Encode, Reader, invalid, put_string, put_varint},
 };
 use std::io;

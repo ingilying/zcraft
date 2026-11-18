@@ -15,7 +15,7 @@ pub struct Session {
     pub port: Option<u16>,
     status_sent: bool,
     pub login: login::LoginPhase,
-    pub profile: Option<crate::auth::Profile>,
+    pub profile: Option<crate::identity::Profile>,
 }
 
 impl Default for Session {

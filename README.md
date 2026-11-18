@@ -199,7 +199,12 @@ src/
 ├── eula.rs               # EULA 启动检查
 ├── network.rs            # TCP 与连接生命周期
 ├── transport.rs          # 可切换的明文 / AES-CFB8 传输
-├── auth.rs               # RSA、离线 UUID 与 Mojang 会话认证
+├── identity.rs           # 跨模块共享的玩家身份与属性
+├── auth/
+│   ├── mod.rs            # AuthService 认证入口与服务编排
+│   ├── offline.rs        # 离线 UUID 与用户名校验
+│   ├── mojang.rs         # 会话验证接口、HTTP 查询与响应校验
+│   └── crypto.rs         # RSA、挑战值与 Minecraft 登录哈希
 ├── context.rs            # 会话及共享服务上下文
 ├── protocol/
 │   ├── codec.rs          # 基础类型编解码
@@ -211,6 +216,8 @@ src/
 
 `Dispatcher` 只负责路由和协议状态校验，不构建具体业务响应。
 状态响应及图标缓存由 status 模块负责，处理器通过上下文访问服务，不直接操作 socket。
+`identity` 只定义共享身份模型；认证由 `auth` 内部模块协作完成，登录状态机留在
+`handler/login.rs`。RSA 登录密钥交换与 `transport.rs` 的 AES 流加密分离。
 
 ### 扩展数据包
 

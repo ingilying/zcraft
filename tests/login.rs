@@ -18,10 +18,11 @@ use tokio::{
 };
 use uuid::Uuid;
 use zcraft::{
-    auth::{AuthService, Profile, ProfileProperty, SessionVerifier, offline_profile},
+    auth::{AuthService, SessionVerifier, offline_profile},
     config::Config,
     context::ServerContext,
     handler::{login::LoginService, status::StatusService},
+    identity::{Profile, ProfileProperty},
     network::serve_with_context,
     protocol::{Reader, State, decode, put_string, put_varint, read_frame, write_frame},
     transport::Transport,

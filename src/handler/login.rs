@@ -1,8 +1,9 @@
 //! Login state machine and identity policy, independent of sockets.
 use super::{Context, Outcome};
 use crate::{
-    auth::{AuthService, Profile, offline_profile, valid_username},
+    auth::{AuthService, offline_profile, valid_username},
     config::Config,
+    identity::Profile,
     protocol::{
         State, invalid,
         packets::{
