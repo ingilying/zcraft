@@ -15,6 +15,7 @@ fn missing_file_generates_roundtrippable_defaults() {
     assert_eq!(config, Config::default());
     let contents = fs::read_to_string(&path).unwrap();
     assert!(contents.contains("io_timeout_seconds = 10"));
+    assert!(contents.contains("compression_threshold = 256"));
     assert!(contents.contains("offline_mode = false"));
     assert_eq!(Config::load_or_create(&path).unwrap(), config);
     assert_eq!(fs::read_to_string(path).unwrap(), contents);
@@ -44,6 +45,8 @@ fn invalid_files_are_reported_and_never_overwritten() {
         "max_conections = 10",
         "max_connections = 0",
         "max_connections = -1",
+        "compression_threshold = -2",
+        "compression_threshold = 2097152",
         "io_timeout_seconds = 0",
         "io_timeout_seconds = 86401",
         "io_timeout_seconds = 1.5",

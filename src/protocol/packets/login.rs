@@ -74,6 +74,19 @@ impl Encode for EncryptionRequest {
     }
 }
 
+/// Login clientbound 0x03. This packet uses the previous framing mode.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SetCompression {
+    pub threshold: i32,
+}
+
+impl Encode for SetCompression {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        put_varint(self.threshold, out);
+        Ok(())
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct LoginSuccess {
     pub profile: Profile,

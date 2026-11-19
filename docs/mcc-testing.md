@@ -10,7 +10,8 @@ python3 tools/check-mcc.py --mcc ~/mcc/MinecraftClient
 The Python 3 script has no third-party dependencies. `--server PATH` selects a
 prebuilt server; `--hold-seconds N` extends the heartbeat observation period
 (default/minimum 35 seconds). MCC must support Java 1.21.1 / protocol 767 and
-accept an INI path as its first argument.
+accept an INI path as its first argument. The test uses compression threshold
+256 by default; pass `--compression-threshold -1` to verify legacy framing.
 
 ## Isolation
 
@@ -47,6 +48,6 @@ future wording changes may require adapting these assertions.
 
 This test does **not** validate graphical rendering, online Microsoft/Mojang
 login, resource-pack download/reload, reconfiguration, multiplayer entity
-synchronization, or bounded broadcast queue overflow. Those require separate
-manual or automated tests. Successful MCC terrain processing is not proof of
+synchronization, or bounded broadcast queue overflow. Entity packet decoding
+is covered by the separate opt-in `client_compat` test described in the README. Successful MCC terrain processing is not proof of
 complete vanilla client compatibility.

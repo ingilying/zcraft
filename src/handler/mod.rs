@@ -24,6 +24,7 @@ pub struct Session {
     pub(crate) loaded_resource_pack: Option<(uuid::Uuid, String)>,
     pub client_information: Option<crate::protocol::packets::common::ClientInformation>,
     pub play: Option<play::PlaySession>,
+    pub(crate) entity_id: Option<i32>,
 }
 
 impl Session {
@@ -56,6 +57,7 @@ impl Default for Session {
             loaded_resource_pack: None,
             client_information: None,
             play: None,
+            entity_id: None,
         }
     }
 }

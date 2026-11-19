@@ -1,5 +1,5 @@
 //! Authenticated connection reservations and bounded Play packet fanout.
-use crate::protocol::{Clientbound, invalid};
+use crate::protocol::{Clientbound, invalid, packets::play_entities::*};
 use std::{
     collections::{HashMap, VecDeque, hash_map::Entry},
     io,
@@ -28,7 +28,96 @@ struct Slot {
     online: bool,
     receiving: bool,
     lagged: bool,
-    queue: VecDeque<Arc<[u8]>>,
+    queue: VecDeque<Delivery>,
+    visible: Option<Peer>,
+    snapshot: VecDeque<Peer>,
+    // Entries handed to the single connection writer. Reconfiguration removes
+    // these before switching state, including peers with a queued departure.
+    known: HashMap<Uuid, i32>,
+}
+
+impl Slot {
+    fn enqueue(&mut self, delivery: Delivery) -> bool {
+        if self.queue.len() == BROADCAST_QUEUE_CAPACITY {
+            self.lagged = true;
+            self.queue.clear();
+            self.snapshot.clear();
+            self.signals.lagged.notify_one();
+            false
+        } else {
+            self.queue.push_back(delivery);
+            self.signals.ready.notify_one();
+            true
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Peer {
+    pub uuid: Uuid,
+    pub id: i32,
+    pub pose: EntityPose,
+    pub info: Arc<[u8]>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum Delivery {
+    Packet(Arc<[u8]>),
+    Spawn(Peer),
+    Remove {
+        uuid: Uuid,
+        id: i32,
+    },
+    Move {
+        id: i32,
+        from: EntityPose,
+        to: EntityPose,
+    },
+}
+
+impl Delivery {
+    pub(crate) fn bodies(self) -> io::Result<impl Iterator<Item = Arc<[u8]>> + Send> {
+        let mut bodies = [None, None];
+        let encode = |packet: Clientbound| packet.encode().map(Arc::<[u8]>::from);
+        match self {
+            Self::Packet(body) => bodies[0] = Some(body),
+            Self::Spawn(Peer {
+                uuid,
+                id,
+                pose,
+                info,
+            }) => {
+                bodies[0] = Some(info);
+                bodies[1] = Some(encode(SpawnPlayer { id, uuid, pose }.into())?);
+            }
+            Self::Remove { uuid, id } => {
+                bodies[0] = Some(encode(RemoveEntities(vec![id]).into())?);
+                bodies[1] = Some(encode(RemovePlayerInfo(vec![uuid]).into())?);
+            }
+            Self::Move { id, from, to } => {
+                let packet = if from.position == to.position {
+                    EntityLook { id, pose: to }.into()
+                } else {
+                    EntityTeleport { id, pose: to }.into()
+                };
+                bodies[0] = Some(encode(packet)?);
+                if from.yaw != to.yaw {
+                    bodies[1] = Some(encode(EntityHeadRotation { id, yaw: to.yaw }.into())?);
+                }
+            }
+        }
+        Ok(bodies.into_iter().flatten())
+    }
+}
+
+impl Registry {
+    fn fanout_entity(&mut self, source: Uuid, delivery: Delivery) {
+        for (&uuid, slot) in &mut self.players {
+            if uuid != source && slot.visible.is_some() && !slot.lagged {
+                slot.enqueue(delivery.clone());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -92,6 +181,9 @@ impl Players {
                     receiving: false,
                     lagged: false,
                     queue: VecDeque::new(),
+                    visible: None,
+                    snapshot: VecDeque::new(),
+                    known: HashMap::new(),
                 });
                 Ok(Reservation(Inbox {
                     uuid,
@@ -122,15 +214,10 @@ impl Players {
             if !slot.receiving || slot.lagged {
                 continue;
             }
-            if slot.queue.len() == BROADCAST_QUEUE_CAPACITY {
-                slot.lagged = true;
-                slot.queue.clear();
-                slot.signals.lagged.notify_one();
-                report.lagged += 1;
-            } else {
-                slot.queue.push_back(body.clone());
-                slot.signals.ready.notify_one();
+            if slot.enqueue(Delivery::Packet(body.clone())) {
                 report.queued += 1;
+            } else {
+                report.lagged += 1;
             }
         }
         Ok(report)
@@ -162,11 +249,81 @@ impl Reservation {
         }
     }
 
-    pub(crate) fn pause(&self) {
-        if let Some(slot) = self.0.slot(&mut lock(&self.0.registry)) {
-            slot.receiving = false;
-            slot.queue.clear();
+    pub(crate) fn show(&self, peer: Peer) {
+        let mut registry = lock(&self.0.registry);
+        let uuid = self.0.uuid;
+        let Some(slot) = self.0.slot(&mut registry) else {
+            return;
+        };
+        if slot.lagged || slot.visible.is_some() {
+            return;
         }
+        // A capacity-bounded initial snapshot is separate from the 32-event
+        // live FIFO. Mutations after this lock append behind it atomically.
+        let snapshot = registry
+            .players
+            .iter()
+            .filter_map(|(&other, slot)| {
+                (other != uuid && !slot.lagged)
+                    .then(|| slot.visible.clone())
+                    .flatten()
+            })
+            .collect();
+        let slot = &mut registry.players.get_mut(&uuid).expect("owned slot");
+        slot.snapshot = snapshot;
+        slot.visible = Some(peer.clone());
+        slot.signals.ready.notify_one();
+        registry.fanout_entity(uuid, Delivery::Spawn(peer));
+    }
+
+    pub(crate) fn update_pose(&self, to: EntityPose) {
+        let mut registry = lock(&self.0.registry);
+        let Some(peer) = self
+            .0
+            .slot(&mut registry)
+            .filter(|slot| !slot.lagged)
+            .and_then(|slot| slot.visible.as_mut())
+        else {
+            return;
+        };
+        if peer.pose != to {
+            let from = std::mem::replace(&mut peer.pose, to);
+            let id = peer.id;
+            registry.fanout_entity(self.0.uuid, Delivery::Move { id, from, to });
+        }
+    }
+
+    pub(crate) fn pause(&self) -> Vec<Clientbound> {
+        let mut registry = lock(&self.0.registry);
+        let Some(slot) = self.0.slot(&mut registry) else {
+            return Vec::new();
+        };
+        slot.receiving = false;
+        slot.queue.clear();
+        slot.snapshot.clear();
+        let known = std::mem::take(&mut slot.known);
+        if let Some(peer) = slot.visible.take() {
+            registry.fanout_entity(
+                peer.uuid,
+                Delivery::Remove {
+                    uuid: peer.uuid,
+                    id: peer.id,
+                },
+            );
+        }
+        drop(registry);
+        // Fixed-size chunks bound the wire size even with a large max_players.
+        let mut known = known.into_iter().peekable();
+        let mut replies = Vec::new();
+        while known.peek().is_some() {
+            let (ids, uuids): (Vec<_>, Vec<_>) = known
+                .by_ref()
+                .take(256)
+                .map(|(uuid, id)| (id, uuid))
+                .unzip();
+            replies.extend([RemoveEntities(ids).into(), RemovePlayerInfo(uuids).into()]);
+        }
+        replies
     }
 }
 
@@ -174,10 +331,21 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         let mut registry = lock(&self.0.registry);
         if let Some(slot) = self.0.slot(&mut registry) {
-            if slot.online {
+            let online = slot.online;
+            let visible = slot.visible.take();
+            registry.players.remove(&self.0.uuid);
+            if online {
                 registry.online -= 1;
             }
-            registry.players.remove(&self.0.uuid);
+            if let Some(peer) = visible {
+                registry.fanout_entity(
+                    peer.uuid,
+                    Delivery::Remove {
+                        uuid: peer.uuid,
+                        id: peer.id,
+                    },
+                );
+            }
         }
     }
 }
@@ -198,11 +366,29 @@ impl Inbox {
             .filter(|slot| Arc::ptr_eq(&self.signals, &slot.signals))
     }
 
-    fn pop(&self) -> Option<Arc<[u8]>> {
-        self.slot(&mut lock(&self.registry))?.queue.pop_front()
+    fn pop(&self) -> Option<Delivery> {
+        let mut registry = lock(&self.registry);
+        let slot = self.slot(&mut registry)?;
+        loop {
+            let delivery = slot
+                .snapshot
+                .pop_front()
+                .map(Delivery::Spawn)
+                .or_else(|| slot.queue.pop_front())?;
+            match &delivery {
+                Delivery::Spawn(peer) => {
+                    slot.known.insert(peer.uuid, peer.id);
+                }
+                // A lagged peer excluded from the initial snapshot can still
+                // depart while the recipient is active. It was never known.
+                Delivery::Remove { uuid, .. } if slot.known.remove(uuid).is_none() => continue,
+                _ => {}
+            }
+            return Some(delivery);
+        }
     }
 
-    pub(crate) async fn next(&self) -> Arc<[u8]> {
+    pub(crate) async fn next(&self) -> Delivery {
         loop {
             if let Some(body) = self.pop() {
                 return body;
@@ -288,6 +474,120 @@ mod tests {
         }
     }
 
+    fn peer(i: u128) -> Peer {
+        Peer {
+            uuid: Uuid::from_u128(i),
+            id: i as i32,
+            pose: EntityPose::new([0.0; 3], 0.0, 0.0, false),
+            info: Arc::from([0x3e]),
+        }
+    }
+
+    #[test]
+    fn reconfiguration_clears_known_players_and_rebuilds_from_latest_pose() {
+        let players = Players::new(2);
+        let alice = players.reserve(peer(1).uuid).unwrap();
+        let bob = players.reserve(peer(2).uuid).unwrap();
+        alice.enter_play();
+        bob.enter_play();
+        alice.show(peer(1));
+        bob.show(peer(2));
+        assert!(matches!(alice.inbox().pop(), Some(Delivery::Spawn(p)) if p.id == 2));
+        assert!(matches!(bob.inbox().pop(), Some(Delivery::Spawn(p)) if p.id == 1));
+        let pose = EntityPose::new([7.0; 3], 90.0, 0.0, false);
+        alice.update_pose(pose);
+        let replies = alice.pause();
+        assert_eq!(
+            replies,
+            [
+                RemoveEntities(vec![2]).into(),
+                RemovePlayerInfo(vec![peer(2).uuid]).into()
+            ]
+        );
+        assert_eq!(players.online_count(), 2);
+        let inbox = bob.inbox();
+        assert!(matches!(inbox.pop(), Some(Delivery::Move { id: 1, to, .. }) if to == pose));
+        assert!(matches!(inbox.pop(), Some(Delivery::Remove { id: 1, .. })));
+        bob.update_pose(pose);
+        alice.enter_play();
+        assert!(alice.inbox().pop().is_none());
+        alice.show(peer(1));
+        assert!(matches!(inbox.pop(), Some(Delivery::Spawn(p)) if p.id == 1));
+        assert!(
+            matches!(alice.inbox().pop(), Some(Delivery::Spawn(p)) if p.id == 2 && p.pose == pose)
+        );
+        drop(bob);
+        // Pausing before flushing a departure still removes the known entry.
+        assert_eq!(
+            alice.pause(),
+            [
+                RemoveEntities(vec![2]).into(),
+                RemovePlayerInfo(vec![peer(2).uuid]).into()
+            ]
+        );
+        assert_eq!(players.online_count(), 1);
+    }
+
+    #[test]
+    fn simultaneous_entry_delivers_each_peer_once() {
+        let players = Players::new(8);
+        let reservations: Vec<_> = (1..=8)
+            .map(|i| players.reserve(peer(i).uuid).unwrap())
+            .collect();
+        let barrier = Barrier::new(reservations.len());
+        std::thread::scope(|scope| {
+            for (index, reservation) in reservations.iter().enumerate() {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    reservation.show(peer(index as u128 + 1));
+                });
+            }
+        });
+        for (index, reservation) in reservations.iter().enumerate() {
+            let mut actual = Vec::new();
+            while let Some(Delivery::Spawn(p)) = reservation.inbox().pop() {
+                actual.push(p.id);
+            }
+            actual.sort_unstable();
+            assert_eq!(
+                actual,
+                (1..=8)
+                    .filter(|&id| id != index as i32 + 1)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn initial_snapshot_exceeds_live_queue_and_precedes_concurrent_deltas() {
+        let players = Players::new(50);
+        let mut peers: Vec<Reservation> = Vec::new();
+        for i in 1..45 {
+            let reservation = players.reserve(peer(i).uuid).unwrap();
+            reservation.show(peer(i));
+            peers.push(reservation);
+            for peer in &peers {
+                while peer.inbox().pop().is_some() {}
+            }
+        }
+        let newcomer = players.reserve(peer(50).uuid).unwrap();
+        newcomer.show(peer(50));
+        drop(peers.pop().unwrap());
+        let inbox = newcomer.inbox();
+        let mut seen = Vec::new();
+        for _ in 0..44 {
+            let Some(Delivery::Spawn(p)) = inbox.pop() else {
+                panic!("incomplete snapshot")
+            };
+            seen.push(p.id);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (1..45).collect::<Vec<_>>());
+        assert!(matches!(inbox.pop(), Some(Delivery::Remove { id: 44, .. })));
+        assert!(inbox.pop().is_none());
+    }
+
     #[tokio::test]
     async fn overflow_isolates_the_slow_recipient_and_preserves_healthy_order() {
         let players = Players::new(3);
@@ -310,7 +610,10 @@ mod tests {
                     lagged: 0
                 }
             );
-            assert_eq!(&*healthy_inbox.next().await, packet.encode().unwrap());
+            assert_eq!(
+                &*healthy_inbox.next().await.bodies().unwrap().next().unwrap(),
+                packet.encode().unwrap()
+            );
         }
         let packet = TimeUpdate.into();
         assert_eq!(
@@ -329,8 +632,12 @@ mod tests {
                 lagged: 0
             }
         );
-        assert_eq!(healthy_inbox.next().await[0], 0x64);
-        assert_eq!(healthy_inbox.next().await[0], 0x25);
+        for id in [0x64, 0x25] {
+            assert_eq!(
+                healthy_inbox.next().await.bodies().unwrap().next().unwrap()[0],
+                id
+            );
+        }
         assert!(players.broadcast(&KeepAlive { id: 0 }.into()).is_err());
         drop(slow);
         assert_eq!(players.online_ids(), vec![Uuid::from_u128(1)]);

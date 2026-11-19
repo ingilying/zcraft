@@ -2,7 +2,7 @@ use crate::{
     context::{Context, ServerContext},
     handler::{Dispatcher, Session, login::LoginService, status::StatusService},
     players::Inbox,
-    protocol::{State, decode},
+    protocol::{Clientbound, State, decode, packets::login::SetCompression},
     transport::Transport,
 };
 use std::{
@@ -69,6 +69,7 @@ async fn serve_validated(
     server: Arc<ServerContext>,
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
+    let compression_threshold = usize::try_from(config.compression_threshold).ok();
     let slots = Arc::new(Semaphore::new(config.max_connections));
     let mut tasks = JoinSet::new();
     tokio::pin!(shutdown);
@@ -91,7 +92,7 @@ async fn serve_validated(
                 let deadline = config.io_timeout;
                 tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = connection(stream, server, deadline).await {
+                    if let Err(error) = connection(stream, server, deadline, compression_threshold).await {
                         tracing::debug!(%peer, %error, "connection closed");
                     }
                 });
@@ -176,14 +177,21 @@ async fn connection(
     stream: TcpStream,
     server: Arc<ServerContext>,
     deadline: Duration,
+    compression_threshold: Option<usize>,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
-    run_connection(Transport::new(stream), &server, deadline).await
+    run_connection(
+        Transport::new(stream),
+        &server,
+        deadline,
+        compression_threshold,
+    )
+    .await
 }
 
 enum ConnectionEvent {
     Frame(Vec<u8>),
-    Broadcast(Arc<[u8]>),
+    Broadcast(crate::players::Delivery),
     Tick,
     Eof,
 }
@@ -192,6 +200,7 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
     mut transport: Transport<S>,
     server: &ServerContext,
     deadline: Duration,
+    compression_threshold: Option<usize>,
 ) -> io::Result<()> {
     let mut session = Session::default();
     let login_deadline = Instant::now() + Duration::from_secs(30);
@@ -275,14 +284,11 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 crate::handler::configuration::tick(&mut session, Instant::now())
             }
             Ok(ConnectionEvent::Tick) => crate::handler::play::tick(&mut session, Instant::now()),
-            Ok(ConnectionEvent::Broadcast(body)) => {
-                write_until(
-                    &mut transport,
-                    &body,
-                    Instant::now() + deadline,
-                    inbox.as_ref(),
-                )
-                .await?;
+            Ok(ConnectionEvent::Broadcast(delivery)) => {
+                let writing_until = Instant::now() + deadline;
+                for body in delivery.bodies()? {
+                    write_until(&mut transport, &body, writing_until, inbox.as_ref()).await?;
+                }
                 continue;
             }
             Ok(ConnectionEvent::Eof) => return Ok(()),
@@ -320,6 +326,22 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
         // registry/chunk. Response windows are armed only after writes finish.
         let writing_until = Instant::now() + deadline;
         for reply in outcome.replies {
+            if let (Clientbound::LoginSuccess(_), Some(threshold)) = (&reply, compression_threshold)
+            {
+                // Encryption, if negotiated, is already active. Only the
+                // framing changes after this packet is completely sent.
+                let packet = Clientbound::from(SetCompression {
+                    threshold: threshold as i32,
+                });
+                write_until(
+                    &mut transport,
+                    &packet.encode()?,
+                    writing_until,
+                    inbox.as_ref(),
+                )
+                .await?;
+                transport.enable_compression(threshold)?;
+            }
             let body = reply.encode()?;
             write_until(&mut transport, &body, writing_until, inbox.as_ref()).await?;
             let sent = Instant::now();

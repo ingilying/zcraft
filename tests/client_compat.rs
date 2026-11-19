@@ -15,6 +15,16 @@ use zcraft::{
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Node.js, minecraft-protocol and prismarine-chunk via NODE_PATH; takes 34 seconds"]
 async fn independent_protocol_client_decodes_world_and_survives_login_deadline() {
+    check_client("check-world.cjs").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Node.js and minecraft-protocol via NODE_PATH"]
+async fn independent_protocol_clients_decode_multiplayer() {
+    check_client("check-multiplayer.cjs").await;
+}
+
+async fn check_client(script: &'static str) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = Arc::new(ServerContext {
@@ -34,10 +44,7 @@ async fn independent_protocol_client_decodes_world_and_survives_login_deadline()
     ));
     let output = tokio::task::spawn_blocking(move || {
         Command::new("node")
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tools/check-world.cjs"
-            ))
+            .arg(format!("{}/tools/{script}", env!("CARGO_MANIFEST_DIR")))
             .env("ZCRAFT_TEST_PORT", port.to_string())
             .output()
     })

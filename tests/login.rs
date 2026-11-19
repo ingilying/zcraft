@@ -1,3 +1,6 @@
+mod common;
+
+use common::negotiate_compression;
 use openssl::{encrypt::Encrypter, pkey::PKey, rsa::Padding};
 use std::{
     future::Future,
@@ -64,6 +67,13 @@ fn online_profile() -> Profile {
 async fn start(
     login: LoginService,
 ) -> (TcpStream, oneshot::Sender<()>, JoinHandle<io::Result<()>>) {
+    start_with_threshold(login, zcraft::config::DEFAULT_COMPRESSION_THRESHOLD).await
+}
+
+async fn start_with_threshold(
+    login: LoginService,
+    compression_threshold: i32,
+) -> (TcpStream, oneshot::Sender<()>, JoinHandle<io::Result<()>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = Arc::new(ServerContext {
@@ -75,7 +85,10 @@ async fn start(
     let (stop, stopped) = oneshot::channel();
     let task = tokio::spawn(serve_with_context(
         listener,
-        Config::default(),
+        Config {
+            compression_threshold,
+            ..Config::default()
+        },
         server,
         async {
             let _ = stopped.await;
@@ -208,6 +221,7 @@ async fn offline_login_ignores_claimed_uuid_then_enters_configuration() {
         let mut client = Transport::new(stream);
         client.write_frame(&handshake()).await.unwrap();
         client.write_frame(&login_start("Steve")).await.unwrap();
+        negotiate_compression(&mut client).await;
         assert_success(
             &client.read_frame().await.unwrap().unwrap(),
             &offline_profile("Steve"),
@@ -274,6 +288,7 @@ async fn online_login_verifies_identity_and_encrypts_both_directions() {
         let auth = Arc::new(AuthService::with_verifier(verifier.clone()).unwrap());
         let (stream, stop, task) = start(LoginService::online(auth)).await;
         let mut client = exchange(stream, false).await;
+        negotiate_compression(&mut client).await;
         assert_success(
             &client.read_frame().await.unwrap().unwrap(),
             &online_profile(),
@@ -362,6 +377,7 @@ async fn duplicate_login_start_is_rejected() {
         let mut client = Transport::new(stream);
         client.write_frame(&handshake()).await.unwrap();
         client.write_frame(&login_start("Steve")).await.unwrap();
+        negotiate_compression(&mut client).await;
         assert_success(
             &client.read_frame().await.unwrap().unwrap(),
             &offline_profile("Steve"),
@@ -369,6 +385,54 @@ async fn duplicate_login_start_is_rejected() {
         client.write_frame(&login_start("Alex")).await.unwrap();
         assert!(client.read_frame().await.unwrap().is_none());
         stop_server(stop, task).await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn compression_switch_uses_old_framing_and_zero_compresses_login_success() {
+    timeout(Duration::from_secs(10), async {
+        for threshold in [-1, 0, 256] {
+            let (mut stream, stop, task) =
+                start_with_threshold(LoginService::offline(), threshold).await;
+            write_frame(&mut stream, &handshake()).await.unwrap();
+            write_frame(&mut stream, &login_start("Steve"))
+                .await
+                .unwrap();
+            let first = read_frame(&mut stream).await.unwrap().unwrap();
+            if threshold < 0 {
+                assert_success(&first, &offline_profile("Steve"));
+                configuration_end(&mut Transport::new(stream)).await;
+            } else {
+                let mut offer = vec![3];
+                put_varint(threshold, &mut offer);
+                assert_eq!(first, offer);
+                // Inspect the frame before interpreting it in the new mode.
+                let frame = read_frame(&mut stream).await.unwrap().unwrap();
+                let mut reader = Reader::new(&frame);
+                let declared = reader.varint().unwrap();
+                let body = reader.remaining(1024).unwrap();
+                if threshold == 0 {
+                    use std::io::Read;
+                    assert!(declared > 0);
+                    let mut decoded = Vec::new();
+                    flate2::read::ZlibDecoder::new(body.as_slice())
+                        .take(1024)
+                        .read_to_end(&mut decoded)
+                        .unwrap();
+                    assert_eq!(decoded.len(), declared as usize);
+                    assert_success(&decoded, &offline_profile("Steve"));
+                } else {
+                    assert_eq!(declared, 0);
+                    assert_success(&body, &offline_profile("Steve"));
+                }
+                let mut client = Transport::new(stream);
+                client.enable_compression(threshold as usize).unwrap();
+                configuration_end(&mut client).await;
+            }
+            stop_server(stop, task).await;
+        }
     })
     .await
     .unwrap();

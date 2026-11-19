@@ -109,13 +109,16 @@ pub fn request_reconfiguration(ctx: &mut Context<'_>) -> io::Result<Outcome> {
     {
         return Err(invalid("cannot request reconfiguration in current state"));
     }
-    if let Some(reservation) = &ctx.session.reservation {
-        reservation.pause();
-    }
+    let mut replies = ctx
+        .session
+        .reservation
+        .as_ref()
+        .map_or_else(Vec::new, |reservation| reservation.pause());
+    replies.push(StartConfiguration.into());
     ctx.session.configuration = ConfigurationPhase::AwaitReconfigurationAck;
     ctx.session.configuration_runtime = Some(ConfigurationSession::new(Instant::now()));
     Ok(Outcome {
-        replies: vec![StartConfiguration.into()],
+        replies,
         close: false,
         encryption: None,
     })

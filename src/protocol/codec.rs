@@ -71,6 +71,10 @@ impl<'a> Reader<'a> {
         Ok(value.to_owned())
     }
 
+    pub(crate) fn remainder(&self) -> &'a [u8] {
+        self.bytes
+    }
+
     pub fn remaining(&mut self, max_bytes: usize) -> io::Result<Vec<u8>> {
         if self.bytes.len() > max_bytes {
             return Err(invalid("payload too large"));

@@ -520,6 +520,7 @@ async fn public_reconfiguration_api_requires_ack_then_repeats_configuration_and_
     assert_eq!(server.players().online_count(), 1);
     assert_eq!(server.players().broadcast(&packet).unwrap().queued, 1);
     let profile = session.profile.clone().unwrap();
+    let entity_id = session.play.as_ref().unwrap().entity_id;
     let outcome = request_reconfiguration(&mut Context {
         session: &mut session,
         server: &server,
@@ -592,7 +593,7 @@ async fn public_reconfiguration_api_requires_ack_then_repeats_configuration_and_
         .await
         .unwrap();
     assert_eq!(session.state, State::Play);
-    assert!(session.play.is_some());
+    assert_eq!(session.play.as_ref().unwrap().entity_id, entity_id);
     assert!(configuration::deadline(&session).is_none());
     assert_eq!(server.players().online_count(), 1);
     assert_eq!(server.players().broadcast(&packet).unwrap().queued, 0);

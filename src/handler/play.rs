@@ -1,9 +1,10 @@
 //! Minimal, read-only spectator world. No authoritative gameplay or persistence yet.
 use super::{Context, Outcome, Session};
 use crate::{
+    players::Peer,
     protocol::{
-        invalid,
-        packets::{play::*, play_common::*},
+        Clientbound, invalid,
+        packets::{play::*, play_common::*, play_entities::EntityPose},
     },
     world,
 };
@@ -46,6 +47,7 @@ pub struct PlaySession {
     pub position: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
+    on_ground: bool,
     pending_teleport: Option<(i32, Instant)>,
     next_teleport: i32,
     pending_keep_alive: Option<(i64, Instant)>,
@@ -59,16 +61,25 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         .profile
         .clone()
         .ok_or_else(|| invalid("missing authenticated identity"))?;
-    let entity_id = ctx.server.play.next_entity.fetch_add(1, Ordering::Relaxed);
-    if entity_id <= 0 {
-        return Err(io::Error::other("entity ID space exhausted"));
-    }
+    let entity_id = if let Some(id) = ctx.session.entity_id {
+        id
+    } else {
+        let id = ctx
+            .server
+            .play
+            .next_entity
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| io::Error::other("entity ID space exhausted"))?;
+        ctx.session.entity_id = Some(id);
+        id
+    };
     let now = Instant::now();
     ctx.session.play = Some(PlaySession {
         entity_id,
         position: [world::SPAWN_X, world::SPAWN_Y, world::SPAWN_Z],
         yaw: 0.0,
         pitch: 0.0,
+        on_ground: false,
         pending_teleport: Some((0, now)),
         next_teleport: 1,
         pending_keep_alive: None,
@@ -189,6 +200,7 @@ pub async fn handle_teleport(
     }
     state.pending_teleport = None;
     let entity_id = state.entity_id;
+    let pose = state.pose();
     // ID 0 is reserved for initial world entry; subsequent teleports start at 1.
     if packet.id == 0 {
         let profile = ctx
@@ -202,6 +214,22 @@ pub async fn handle_teleport(
             entity_id,
             "Player joined the server"
         );
+        if ctx.session.configuration == super::configuration::ConfigurationPhase::Finished
+            && let Some(slot) = &ctx.session.reservation
+        {
+            slot.show(Peer {
+                uuid: profile.uuid,
+                id: entity_id,
+                pose,
+                info: Clientbound::from(PlayerInfo {
+                    profile: profile.clone(),
+                })
+                .encode()?
+                .into(),
+            });
+        }
+    } else if let Some(slot) = &ctx.session.reservation {
+        slot.update_pose(pose);
     }
     Ok(Outcome::empty())
 }
@@ -217,10 +245,17 @@ pub async fn handle_keep_alive(
     state.next_keep_alive = Instant::now() + KEEP_ALIVE_INTERVAL;
     Ok(Outcome::empty())
 }
+impl PlaySession {
+    fn pose(&self) -> EntityPose {
+        EntityPose::new(self.position, self.yaw, self.pitch, self.on_ground)
+    }
+}
+
 fn movement(
     ctx: &mut Context<'_>,
     position: Option<[f64; 3]>,
     rotation: Option<[f32; 2]>,
+    on_ground: bool,
 ) -> io::Result<Outcome> {
     let state = play(ctx.session)?;
     if state.pending_teleport.is_some() {
@@ -239,6 +274,9 @@ fn movement(
                 .ok_or_else(|| invalid("teleport ID exhausted"))?;
             state.pending_teleport = Some((id, Instant::now()));
             state.position = [world::SPAWN_X, world::SPAWN_Y, world::SPAWN_Z];
+            state.yaw = 0.0;
+            state.pitch = 0.0;
+            state.on_ground = false;
             return Ok(Outcome {
                 replies: vec![PlayerPosition { teleport_id: id }.into()],
                 close: false,
@@ -251,20 +289,29 @@ fn movement(
         state.yaw = yaw;
         state.pitch = pitch;
     }
+    state.on_ground = on_ground;
+    let pose = state.pose();
+    if let Some(slot) = &ctx.session.reservation {
+        slot.update_pose(pose);
+    }
     Ok(Outcome::empty())
 }
 pub async fn handle_position(ctx: &mut Context<'_>, p: Position) -> io::Result<Outcome> {
-    movement(ctx, Some([p.x, p.y, p.z]), None)
+    movement(ctx, Some([p.x, p.y, p.z]), None, p.on_ground)
 }
 pub async fn handle_position_look(ctx: &mut Context<'_>, p: PositionLook) -> io::Result<Outcome> {
-    movement(ctx, Some([p.x, p.y, p.z]), Some([p.yaw, p.pitch]))
+    movement(
+        ctx,
+        Some([p.x, p.y, p.z]),
+        Some([p.yaw, p.pitch]),
+        p.on_ground,
+    )
 }
 pub async fn handle_look(ctx: &mut Context<'_>, p: Look) -> io::Result<Outcome> {
-    movement(ctx, None, Some([p.yaw, p.pitch]))
+    movement(ctx, None, Some([p.yaw, p.pitch]), p.on_ground)
 }
-pub async fn handle_flying(ctx: &mut Context<'_>, _p: Flying) -> io::Result<Outcome> {
-    play(ctx.session)?;
-    Ok(Outcome::empty())
+pub async fn handle_flying(ctx: &mut Context<'_>, p: Flying) -> io::Result<Outcome> {
+    movement(ctx, None, None, p.on_ground)
 }
 pub async fn handle_batch(ctx: &mut Context<'_>, _p: ChunkBatchReceived) -> io::Result<Outcome> {
     let state = play(ctx.session)?;
@@ -306,6 +353,7 @@ mod tests {
                 position: [0.0; 3],
                 yaw: 0.0,
                 pitch: 0.0,
+                on_ground: false,
                 pending_teleport: None,
                 next_teleport: 1,
                 pending_keep_alive: None,

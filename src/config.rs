@@ -9,6 +9,7 @@ use std::{
 };
 
 pub const DEFAULT_CONFIG_PATH: &str = "zcraft.toml";
+pub const DEFAULT_COMPRESSION_THRESHOLD: i32 = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -21,6 +22,8 @@ pub struct Config {
     /// Disables Mojang verification. Unsafe on untrusted networks.
     pub offline_mode: bool,
     pub max_connections: usize,
+    /// Packet body size at which zlib compression starts; -1 disables it.
+    pub compression_threshold: i32,
     /// Deadline for a complete frame or response, not per-byte activity.
     #[serde(rename = "io_timeout_seconds", with = "seconds")]
     pub io_timeout: Duration,
@@ -89,6 +92,7 @@ impl Default for Config {
             max_players: 20,
             offline_mode: false,
             max_connections: 1024,
+            compression_threshold: DEFAULT_COMPRESSION_THRESHOLD,
             io_timeout: Duration::from_secs(10),
             resource_pack: None,
         }
@@ -111,7 +115,8 @@ impl Config {
                         toml::to_string_pretty(&Self::default()).map_err(io::Error::other)?;
                     let contents = format!(
                         "# ZCraft server configuration. Restart after editing.\n\
-                         # io_timeout_seconds is a complete read/write deadline (1..=86400).\n\n{defaults}"
+                         # io_timeout_seconds is a complete read/write deadline (1..=86400).\n\
+                         # compression_threshold is in bytes; -1 disables compression.\n\n{defaults}"
                     );
                     let parent = path
                         .parent()
@@ -176,6 +181,9 @@ impl Config {
             return Err(invalid(
                 "io_timeout_seconds must be positive and at most 86400",
             ));
+        }
+        if !(-1..=crate::protocol::MAX_FRAME_SIZE as i32).contains(&self.compression_threshold) {
+            return Err(invalid("compression_threshold must be -1..=2097151"));
         }
         if let Some(pack) = &self.resource_pack {
             pack.validate()?;

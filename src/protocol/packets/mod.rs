@@ -4,4 +4,5 @@ pub mod handshake;
 pub mod login;
 pub mod play;
 pub mod play_common;
+pub mod play_entities;
 pub mod status;

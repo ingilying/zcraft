@@ -7,10 +7,11 @@ use super::{
         handshake::Handshake,
         login::{
             EncryptionRequest, EncryptionResponse, LoginAcknowledged, LoginDisconnect, LoginStart,
-            LoginSuccess,
+            LoginSuccess, SetCompression,
         },
         play::*,
         play_common::*,
+        play_entities::*,
         status::{Ping, Pong, StatusRequest, StatusResponse},
     },
     put_varint,
@@ -180,6 +181,7 @@ clientbound_packets! {
         0x00 => LoginDisconnect(LoginDisconnect),
         0x01 => EncryptionRequest(EncryptionRequest),
         0x02 => LoginSuccess(LoginSuccess),
+        0x03 => SetCompression(SetCompression),
     }
     Configuration {
         0x02 => ConfigurationDisconnect(ConfigurationDisconnect),
@@ -192,6 +194,7 @@ clientbound_packets! {
         0x0e => SelectKnownPacks(SelectKnownPacks),
     }
     Play {
+        0x01 => SpawnPlayer(SpawnPlayer),
         0x0c => ChunkBatchFinished(ChunkBatchFinished),
         0x0d => ChunkBatchStart(ChunkBatchStart),
         0x1d => PlayDisconnect(PlayDisconnect),
@@ -200,13 +203,18 @@ clientbound_packets! {
         0x26 => KeepAlive(KeepAlive),
         0x27 => ChunkData(ChunkData),
         0x2b => JoinGame(JoinGame),
+        0x30 => EntityLook(EntityLook),
         0x38 => PlayerAbilities(PlayerAbilities),
+        0x3d => RemovePlayerInfo(RemovePlayerInfo),
         0x3e => PlayerInfo(PlayerInfo),
         0x40 => PlayerPosition(PlayerPosition),
+        0x42 => RemoveEntities(RemoveEntities),
+        0x48 => EntityHeadRotation(EntityHeadRotation),
         0x54 => CenterChunk(CenterChunk),
         0x56 => DefaultSpawnPosition(DefaultSpawnPosition),
         0x64 => TimeUpdate(TimeUpdate),
         0x69 => StartConfiguration(StartConfiguration),
+        0x70 => EntityTeleport(EntityTeleport),
     }
 }
 

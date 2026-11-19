@@ -62,9 +62,12 @@ def main():
     parser.add_argument("--mcc", required=True, type=Path)
     parser.add_argument("--server", type=Path, default=Path(__file__).resolve().parents[1] / "target/debug/zcraft")
     parser.add_argument("--hold-seconds", type=float, default=35)
+    parser.add_argument("--compression-threshold", type=int, default=256)
     args = parser.parse_args()
     if args.hold_seconds < 35:
         parser.error("--hold-seconds must be at least 35 (exercise heartbeats)")
+    if not -1 <= args.compression_threshold <= 2097151:
+        parser.error("--compression-threshold must be -1..=2097151")
     mcc, server_bin = args.mcc.expanduser().resolve(), args.server.expanduser().resolve()
     for executable in (mcc, server_bin):
         if not executable.is_file() or not os.access(executable, os.X_OK):
@@ -115,7 +118,8 @@ def main():
             port = sock.getsockname()[1]
         (root / "eula.txt").write_text("eula=true\n")
         (root / "zcraft.toml").write_text(
-            f'bind="127.0.0.1:{port}"\noffline_mode=true\nmax_players=2\nserver_icon=""\n')
+            f'bind="127.0.0.1:{port}"\noffline_mode=true\nmax_players=2\nserver_icon=""\n'
+            f'compression_threshold={args.compression_threshold}\n')
         server = launch([str(server_bin)], root, "server")
 
         def online():

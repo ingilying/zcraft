@@ -1,3 +1,6 @@
+mod common;
+
+use common::negotiate_compression;
 use std::{io::ErrorKind, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -5,6 +8,7 @@ use tokio::{
     sync::oneshot,
     time::timeout,
 };
+use zcraft::transport::Transport;
 use zcraft::{
     context::{Context, ServerContext},
     handler::{Dispatcher, Session, status::StatusService},
@@ -255,16 +259,17 @@ async fn tcp_login_disconnect() {
     .unwrap();
 }
 
-async fn enter_configuration(stream: &mut TcpStream) {
-    write_frame(stream, &handshake(2)).await.unwrap();
+async fn enter_configuration(stream: &mut Transport<&mut TcpStream>) {
+    stream.write_frame(&handshake(2)).await.unwrap();
     let mut login = vec![0];
     put_string("Steve", &mut login).unwrap();
     login.extend_from_slice(&[0; 16]);
-    write_frame(stream, &login).await.unwrap();
-    assert_eq!(read_frame(stream).await.unwrap().unwrap()[0], 2);
-    write_frame(stream, &[3]).await.unwrap();
-    assert_eq!(read_frame(stream).await.unwrap().unwrap()[0], 0x0c);
-    assert_eq!(read_frame(stream).await.unwrap().unwrap(), [0x0e, 0]);
+    stream.write_frame(&login).await.unwrap();
+    negotiate_compression(stream).await;
+    assert_eq!(stream.read_frame().await.unwrap().unwrap()[0], 2);
+    stream.write_frame(&[3]).await.unwrap();
+    assert_eq!(stream.read_frame().await.unwrap().unwrap()[0], 0x0c);
+    assert_eq!(stream.read_frame().await.unwrap().unwrap(), [0x0e, 0]);
 }
 
 fn assert_configuration_disconnect(body: &[u8], message: &str) {
@@ -285,11 +290,12 @@ async fn tcp_configuration_decode_and_dispatch_errors_send_disconnect() {
             vec![4, 0, 0, 0, 0, 0, 0, 0, 0],
         ] {
             let (mut stream, stop, server) = start(Duration::from_secs(1)).await;
-            enter_configuration(&mut stream).await;
-            write_frame(&mut stream, &bad_packet).await.unwrap();
-            let body = read_frame(&mut stream).await.unwrap().unwrap();
+            let mut client = Transport::new(&mut stream);
+            enter_configuration(&mut client).await;
+            client.write_frame(&bad_packet).await.unwrap();
+            let body = client.read_frame().await.unwrap().unwrap();
             assert_configuration_disconnect(&body, "invalid configuration packet");
-            assert!(read_frame(&mut stream).await.unwrap().is_none());
+            assert!(client.read_frame().await.unwrap().is_none());
             stop.send(()).unwrap();
             server.await.unwrap().unwrap();
         }
@@ -302,17 +308,23 @@ async fn tcp_configuration_decode_and_dispatch_errors_send_disconnect() {
 async fn configuration_idle_uses_phase_deadline_but_partial_frames_still_time_out() {
     timeout(Duration::from_secs(5), async {
         let (mut stream, stop, server) = start(Duration::from_millis(150)).await;
-        enter_configuration(&mut stream).await;
+        let mut client = Transport::new(&mut stream);
+        enter_configuration(&mut client).await;
         // An idle configuration prompt is allowed to outlive the frame timeout.
         assert!(
-            timeout(Duration::from_millis(300), read_frame(&mut stream))
+            timeout(Duration::from_millis(300), client.read_frame())
                 .await
                 .is_err()
         );
+        drop(client); // No partial inbound packet at this point.
         stream.write_all(&[0x80]).await.unwrap();
-        let body = read_frame(&mut stream).await.unwrap().unwrap();
+        let mut client = Transport::new(&mut stream);
+        client
+            .enable_compression(zcraft::config::DEFAULT_COMPRESSION_THRESHOLD as usize)
+            .unwrap();
+        let body = client.read_frame().await.unwrap().unwrap();
         assert_configuration_disconnect(&body, "configuration timed out");
-        assert!(read_frame(&mut stream).await.unwrap().is_none());
+        assert!(client.read_frame().await.unwrap().is_none());
         stop.send(()).unwrap();
         server.await.unwrap().unwrap();
     })
@@ -339,13 +351,14 @@ async fn configured_resource_pack_is_negotiated_on_the_wire() {
                 ..Default::default()
             })
             .await;
-            enter_configuration(&mut stream).await;
-            write_frame(&mut stream, &[7, 0]).await.unwrap();
+            let mut client = Transport::new(&mut stream);
+            enter_configuration(&mut client).await;
+            client.write_frame(&[7, 0]).await.unwrap();
             for _ in 0..11 {
-                assert_eq!(read_frame(&mut stream).await.unwrap().unwrap()[0], 7);
+                assert_eq!(client.read_frame().await.unwrap().unwrap()[0], 7);
             }
-            assert_eq!(read_frame(&mut stream).await.unwrap().unwrap()[0], 0x0d);
-            let offer = read_frame(&mut stream).await.unwrap().unwrap();
+            assert_eq!(client.read_frame().await.unwrap().unwrap()[0], 0x0d);
+            let offer = client.read_frame().await.unwrap().unwrap();
             let mut reader = Reader::new(&offer);
             assert_eq!(reader.varint().unwrap(), 9);
             assert_eq!(reader.take(16).unwrap(), id.as_bytes());
@@ -359,11 +372,11 @@ async fn configured_resource_pack_is_negotiated_on_the_wire() {
             let mut reply = vec![6];
             reply.extend_from_slice(id.as_bytes());
             reply.push(1); // decline
-            write_frame(&mut stream, &reply).await.unwrap();
-            let body = read_frame(&mut stream).await.unwrap().unwrap();
+            client.write_frame(&reply).await.unwrap();
+            let body = client.read_frame().await.unwrap().unwrap();
             if required {
                 assert_configuration_disconnect(&body, "required resource pack");
-                assert!(read_frame(&mut stream).await.unwrap().is_none());
+                assert!(client.read_frame().await.unwrap().is_none());
             } else {
                 assert_eq!(body, [3]);
             }
