@@ -5,6 +5,7 @@ pub mod eula;
 pub mod handler;
 pub mod identity;
 pub mod network;
+pub mod players;
 pub mod protocol;
 pub mod registry_data;
 pub mod transport;

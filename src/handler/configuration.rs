@@ -109,6 +109,9 @@ pub fn request_reconfiguration(ctx: &mut Context<'_>) -> io::Result<Outcome> {
     {
         return Err(invalid("cannot request reconfiguration in current state"));
     }
+    if let Some(reservation) = &ctx.session.reservation {
+        reservation.pause();
+    }
     ctx.session.configuration = ConfigurationPhase::AwaitReconfigurationAck;
     ctx.session.configuration_runtime = Some(ConfigurationSession::new(Instant::now()));
     Ok(Outcome {

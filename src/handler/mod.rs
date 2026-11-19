@@ -18,11 +18,26 @@ pub struct Session {
     status_sent: bool,
     pub login: login::LoginPhase,
     pub profile: Option<crate::identity::Profile>,
+    pub(crate) reservation: Option<crate::players::Reservation>,
     pub configuration: configuration::ConfigurationPhase,
     pub(crate) configuration_runtime: Option<configuration::ConfigurationSession>,
     pub(crate) loaded_resource_pack: Option<(uuid::Uuid, String)>,
     pub client_information: Option<crate::protocol::packets::common::ClientInformation>,
     pub play: Option<play::PlaySession>,
+}
+
+impl Session {
+    /// Call after successfully writing the entire Play initialization batch.
+    /// Idempotent, including when the client returns from reconfiguration.
+    pub fn play_initialized(&self) {
+        if self.state == State::Play
+            && self.configuration == configuration::ConfigurationPhase::Finished
+            && self.play.is_some()
+            && let Some(reservation) = &self.reservation
+        {
+            reservation.enter_play();
+        }
+    }
 }
 
 impl Default for Session {
@@ -35,6 +50,7 @@ impl Default for Session {
             status_sent: false,
             login: login::LoginPhase::default(),
             profile: None,
+            reservation: None,
             configuration: configuration::ConfigurationPhase::NotStarted,
             configuration_runtime: None,
             loaded_resource_pack: None,

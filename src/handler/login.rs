@@ -72,6 +72,16 @@ pub fn disconnect(reason: &str) -> Outcome {
 }
 
 fn success(ctx: &mut Context<'_>, profile: Profile) -> Outcome {
+    use crate::players::AdmissionError;
+
+    let reservation = match ctx.server.players().reserve(profile.uuid) {
+        Ok(reservation) => reservation,
+        Err(AdmissionError::Duplicate) => {
+            return disconnect("ZCraft: this player is already connected.");
+        }
+        Err(AdmissionError::Full) => return disconnect("ZCraft: the server is full."),
+    };
+    ctx.session.reservation = Some(reservation);
     ctx.session.profile = Some(profile.clone());
     ctx.session.login = LoginPhase::AwaitAcknowledged;
     Outcome {

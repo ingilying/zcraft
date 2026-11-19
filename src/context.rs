@@ -8,6 +8,13 @@ pub struct ServerContext {
     pub play: crate::handler::play::PlayService,
 }
 
+impl ServerContext {
+    /// Shared admission, presence, and broadcast service.
+    pub fn players(&self) -> &crate::players::Players {
+        self.status.players()
+    }
+}
+
 /// Per-dispatch borrows. Handlers have no access to the transport.
 pub struct Context<'a> {
     pub session: &'a mut Session,

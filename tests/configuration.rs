@@ -458,7 +458,21 @@ async fn slow_registry_batch_preserves_the_finish_acknowledgement_window() {
 #[tokio::test]
 async fn public_reconfiguration_api_requires_ack_then_repeats_configuration_and_play() {
     let server = services();
-    let mut session = logged_in();
+    let mut session = Session::default();
+    session.state = State::Login;
+    let mut login = vec![0];
+    zcraft::protocol::put_string("Alice", &mut login).unwrap();
+    login.extend_from_slice(uuid::Uuid::nil().as_bytes());
+    Dispatcher
+        .dispatch(
+            &mut Context {
+                session: &mut session,
+                server: &server,
+            },
+            decode(State::Login, &login).unwrap(),
+        )
+        .await
+        .unwrap();
     assert!(
         request_reconfiguration(&mut Context {
             session: &mut session,
@@ -499,6 +513,12 @@ async fn public_reconfiguration_api_requires_ack_then_repeats_configuration_and_
             .await
             .is_err()
     );
+    let packet = zcraft::protocol::packets::play::TimeUpdate.into();
+    assert_eq!(server.players().online_count(), 0);
+    assert_eq!(server.players().broadcast(&packet).unwrap().queued, 0);
+    session.play_initialized();
+    assert_eq!(server.players().online_count(), 1);
+    assert_eq!(server.players().broadcast(&packet).unwrap().queued, 1);
     let profile = session.profile.clone().unwrap();
     let outcome = request_reconfiguration(&mut Context {
         session: &mut session,
@@ -511,6 +531,9 @@ async fn public_reconfiguration_api_requires_ack_then_repeats_configuration_and_
     ));
     assert_eq!(outcome.replies[0].encode().unwrap(), [0x69]);
     assert_eq!(session.state, State::Play);
+    session.play_initialized(); // Cannot unpause during the acknowledgement window.
+    assert_eq!(server.players().online_count(), 1);
+    assert_eq!(server.players().broadcast(&packet).unwrap().queued, 0);
     assert!(
         request_reconfiguration(&mut Context {
             session: &mut session,
@@ -571,6 +594,13 @@ async fn public_reconfiguration_api_requires_ack_then_repeats_configuration_and_
     assert_eq!(session.state, State::Play);
     assert!(session.play.is_some());
     assert!(configuration::deadline(&session).is_none());
+    assert_eq!(server.players().online_count(), 1);
+    assert_eq!(server.players().broadcast(&packet).unwrap().queued, 0);
+    session.play_initialized();
+    assert_eq!(server.players().online_count(), 1);
+    assert_eq!(server.players().broadcast(&packet).unwrap().queued, 1);
+    drop(session);
+    assert_eq!(server.players().online_count(), 0);
 }
 
 #[tokio::test]

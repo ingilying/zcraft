@@ -1,17 +1,18 @@
 pub mod icon;
 
 use super::{Context, Outcome};
-use crate::config::Config;
 use crate::protocol::{
     Encode, PROTOCOL_VERSION, invalid,
     packets::status::{Ping, Pong, StatusRequest, StatusResponse},
 };
+use crate::{config::Config, players::Players};
 use icon::ServerIcon;
 use std::io;
 
-/// Owns status response construction and caching. Currently all fields are static.
+/// Owns the status template and its authoritative player registry.
 pub struct StatusService {
-    response_json: String,
+    template: serde_json::Value,
+    players: Players,
 }
 
 impl StatusService {
@@ -22,8 +23,7 @@ impl StatusService {
             ServerIcon::load_optional(&config.server_icon)?
         };
         let service = Self::with_icon(&config.motd, config.max_players, icon.as_ref());
-        // Reject an oversized combined response at startup, not on the first query.
-        service.response().encode(&mut Vec::new())?;
+        service.validate()?;
         Ok(service)
     }
 
@@ -42,13 +42,30 @@ impl StatusService {
             response["favicon"] = icon.data_uri().into();
         }
         Self {
-            response_json: response.to_string(),
+            template: response,
+            players: Players::new(max_players),
         }
     }
 
+    pub fn players(&self) -> &Players {
+        &self.players
+    }
+
     pub fn response(&self) -> StatusResponse {
+        self.response_with_count(self.players.online_count())
+    }
+
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        // Reject oversized responses even when the maximum is reached.
+        self.response_with_count(self.players.max_players())
+            .encode(&mut Vec::new())
+    }
+
+    fn response_with_count(&self, online: u32) -> StatusResponse {
+        let mut response = self.template.clone();
+        response["players"]["online"] = online.into();
         StatusResponse {
-            json: self.response_json.clone(),
+            json: response.to_string(),
         }
     }
 }
