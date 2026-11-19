@@ -4,6 +4,8 @@ use crate::handler::{Session, login::LoginService, status::StatusService};
 pub struct ServerContext {
     pub status: StatusService,
     pub login: LoginService,
+    pub configuration: crate::handler::configuration::ConfigurationService,
+    pub play: crate::handler::play::PlayService,
 }
 
 /// Per-dispatch borrows. Handlers have no access to the transport.

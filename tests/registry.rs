@@ -17,6 +17,8 @@ async fn typed_inbound_conversion_and_generated_routing() {
     let server = ServerContext {
         status: StatusService::new("test", 20),
         login: zcraft::handler::login::LoginService::offline(),
+        configuration: zcraft::handler::configuration::ConfigurationService::new().unwrap(),
+        play: zcraft::handler::play::PlayService::new().unwrap(),
     };
     let mut session = Session::default();
     let handshake: Serverbound = Handshake {
@@ -49,7 +51,10 @@ async fn typed_inbound_conversion_and_generated_routing() {
         )
         .await
         .unwrap();
-    assert!(matches!(status.reply, Some(Clientbound::Status(_))));
+    assert!(matches!(
+        status.replies.as_slice(),
+        [Clientbound::Status(_)]
+    ));
     let ping: Serverbound = Ping { payload: i64::MIN }.into();
     let pong = dispatcher
         .dispatch(
@@ -61,7 +66,7 @@ async fn typed_inbound_conversion_and_generated_routing() {
         )
         .await
         .unwrap();
-    assert_eq!(pong.reply, Some(Pong { payload: i64::MIN }.into()));
+    assert_eq!(pong.replies, vec![Pong { payload: i64::MIN }.into()]);
     assert!(pong.close);
 }
 
@@ -72,6 +77,8 @@ async fn direct_packet_construction_cannot_bypass_state_guard() {
     let server = ServerContext {
         status: StatusService::new("test", 20),
         login: zcraft::handler::login::LoginService::offline(),
+        configuration: zcraft::handler::configuration::ConfigurationService::new().unwrap(),
+        play: zcraft::handler::play::PlayService::new().unwrap(),
     };
     assert!(
         dispatcher

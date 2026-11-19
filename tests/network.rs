@@ -71,6 +71,8 @@ async fn state_packet_validation_and_dispatch() {
     let server = ServerContext {
         status: StatusService::new("test", 20),
         login: zcraft::handler::login::LoginService::offline(),
+        configuration: zcraft::handler::configuration::ConfigurationService::new().unwrap(),
+        play: zcraft::handler::play::PlayService::new().unwrap(),
     };
     let mut session = Session::default();
     assert!(
@@ -176,21 +178,28 @@ async fn start(
     oneshot::Sender<()>,
     tokio::task::JoinHandle<std::io::Result<()>>,
 ) {
+    start_config(Config {
+        io_timeout: deadline,
+        offline_mode: true,
+        server_icon: concat!(env!("CARGO_MANIFEST_DIR"), "/server-icon.png").into(),
+        ..Config::default()
+    })
+    .await
+}
+
+async fn start_config(
+    config: Config,
+) -> (
+    TcpStream,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (tx, rx) = oneshot::channel();
-    let task = tokio::spawn(serve(
-        listener,
-        Config {
-            io_timeout: deadline,
-            offline_mode: true,
-            server_icon: concat!(env!("CARGO_MANIFEST_DIR"), "/server-icon.png").into(),
-            ..Config::default()
-        },
-        async {
-            let _ = rx.await;
-        },
-    ));
+    let task = tokio::spawn(serve(listener, config, async {
+        let _ = rx.await;
+    }));
     (TcpStream::connect(address).await.unwrap(), tx, task)
 }
 
@@ -241,6 +250,126 @@ async fn tcp_login_disconnect() {
         assert!(read_frame(&mut stream).await.unwrap().is_none());
         stop.send(()).unwrap();
         server.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+async fn enter_configuration(stream: &mut TcpStream) {
+    write_frame(stream, &handshake(2)).await.unwrap();
+    let mut login = vec![0];
+    put_string("Steve", &mut login).unwrap();
+    login.extend_from_slice(&[0; 16]);
+    write_frame(stream, &login).await.unwrap();
+    assert_eq!(read_frame(stream).await.unwrap().unwrap()[0], 2);
+    write_frame(stream, &[3]).await.unwrap();
+    assert_eq!(read_frame(stream).await.unwrap().unwrap()[0], 0x0c);
+    assert_eq!(read_frame(stream).await.unwrap().unwrap(), [0x0e, 0]);
+}
+
+fn assert_configuration_disconnect(body: &[u8], message: &str) {
+    assert_eq!(&body[..2], &[2, 8]); // Configuration Disconnect, anonymous NBT string
+    assert!(
+        body.windows(message.len())
+            .any(|window| window == message.as_bytes())
+    );
+}
+
+#[tokio::test]
+async fn tcp_configuration_decode_and_dispatch_errors_send_disconnect() {
+    timeout(Duration::from_secs(10), async {
+        for bad_packet in [
+            vec![0xff],
+            vec![3],
+            vec![7, 1],
+            vec![4, 0, 0, 0, 0, 0, 0, 0, 0],
+        ] {
+            let (mut stream, stop, server) = start(Duration::from_secs(1)).await;
+            enter_configuration(&mut stream).await;
+            write_frame(&mut stream, &bad_packet).await.unwrap();
+            let body = read_frame(&mut stream).await.unwrap().unwrap();
+            assert_configuration_disconnect(&body, "invalid configuration packet");
+            assert!(read_frame(&mut stream).await.unwrap().is_none());
+            stop.send(()).unwrap();
+            server.await.unwrap().unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn configuration_idle_uses_phase_deadline_but_partial_frames_still_time_out() {
+    timeout(Duration::from_secs(5), async {
+        let (mut stream, stop, server) = start(Duration::from_millis(150)).await;
+        enter_configuration(&mut stream).await;
+        // An idle configuration prompt is allowed to outlive the frame timeout.
+        assert!(
+            timeout(Duration::from_millis(300), read_frame(&mut stream))
+                .await
+                .is_err()
+        );
+        stream.write_all(&[0x80]).await.unwrap();
+        let body = read_frame(&mut stream).await.unwrap().unwrap();
+        assert_configuration_disconnect(&body, "configuration timed out");
+        assert!(read_frame(&mut stream).await.unwrap().is_none());
+        stop.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn configured_resource_pack_is_negotiated_on_the_wire() {
+    timeout(Duration::from_secs(5), async {
+        for required in [false, true] {
+            let id = uuid::Uuid::from_bytes([1; 16]);
+            let (mut stream, stop, server) = start_config(Config {
+                io_timeout: Duration::from_secs(1),
+                offline_mode: true,
+                server_icon: concat!(env!("CARGO_MANIFEST_DIR"), "/server-icon.png").into(),
+                resource_pack: Some(zcraft::config::ResourcePackConfig {
+                    id: id.to_string(),
+                    url: "https://example.org/pack.zip".into(),
+                    sha1: "0".repeat(40),
+                    required,
+                    prompt: None,
+                }),
+                ..Default::default()
+            })
+            .await;
+            enter_configuration(&mut stream).await;
+            write_frame(&mut stream, &[7, 0]).await.unwrap();
+            for _ in 0..11 {
+                assert_eq!(read_frame(&mut stream).await.unwrap().unwrap()[0], 7);
+            }
+            assert_eq!(read_frame(&mut stream).await.unwrap().unwrap()[0], 0x0d);
+            let offer = read_frame(&mut stream).await.unwrap().unwrap();
+            let mut reader = Reader::new(&offer);
+            assert_eq!(reader.varint().unwrap(), 9);
+            assert_eq!(reader.take(16).unwrap(), id.as_bytes());
+            assert_eq!(
+                reader.string(32767).unwrap(),
+                "https://example.org/pack.zip"
+            );
+            assert_eq!(reader.string(40).unwrap(), "0".repeat(40));
+            assert_eq!(reader.take(2).unwrap(), [u8::from(required), 0]);
+            reader.finish().unwrap();
+            let mut reply = vec![6];
+            reply.extend_from_slice(id.as_bytes());
+            reply.push(1); // decline
+            write_frame(&mut stream, &reply).await.unwrap();
+            let body = read_frame(&mut stream).await.unwrap().unwrap();
+            if required {
+                assert_configuration_disconnect(&body, "required resource pack");
+                assert!(read_frame(&mut stream).await.unwrap().is_none());
+            } else {
+                assert_eq!(body, [3]);
+            }
+            stop.send(()).unwrap();
+            server.await.unwrap().unwrap();
+        }
     })
     .await
     .unwrap();

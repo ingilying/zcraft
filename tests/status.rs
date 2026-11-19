@@ -23,6 +23,8 @@ async fn dispatcher_uses_caller_services_without_retaining_status() {
         let server = ServerContext {
             status: StatusService::new(motd, 20),
             login: zcraft::handler::login::LoginService::offline(),
+            configuration: zcraft::handler::configuration::ConfigurationService::new().unwrap(),
+            play: zcraft::handler::play::PlayService::new().unwrap(),
         };
         let mut session = Session::default();
         session.state = State::Status;
@@ -36,7 +38,7 @@ async fn dispatcher_uses_caller_services_without_retaining_status() {
             )
             .await
             .unwrap();
-        let Some(Clientbound::Status(response)) = result.reply else {
+        let Some(Clientbound::Status(response)) = result.replies.into_iter().next() else {
             panic!("expected status response")
         };
         let json: serde_json::Value = serde_json::from_str(&response.json).unwrap();

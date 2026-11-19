@@ -62,7 +62,7 @@ pub async fn handle_status_request(
     }
     ctx.session.status_sent = true;
     Ok(Outcome {
-        reply: Some(ctx.server.status.response().into()),
+        replies: vec![ctx.server.status.response().into()],
         close: false,
         encryption: None,
     })
@@ -70,12 +70,12 @@ pub async fn handle_status_request(
 
 pub async fn handle_ping(_ctx: &mut Context<'_>, packet: Ping) -> io::Result<Outcome> {
     Ok(Outcome {
-        reply: Some(
+        replies: vec![
             Pong {
                 payload: packet.payload,
             }
             .into(),
-        ),
+        ],
         close: true,
         encryption: None,
     })

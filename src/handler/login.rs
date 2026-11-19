@@ -6,12 +6,9 @@ use crate::{
     identity::Profile,
     protocol::{
         State, invalid,
-        packets::{
-            configuration::ConfigurationDisconnect,
-            login::{
-                EncryptionRequest, EncryptionResponse, LoginAcknowledged, LoginDisconnect,
-                LoginStart, LoginSuccess,
-            },
+        packets::login::{
+            EncryptionRequest, EncryptionResponse, LoginAcknowledged, LoginDisconnect, LoginStart,
+            LoginSuccess,
         },
     },
 };
@@ -63,12 +60,12 @@ pub enum LoginPhase {
 
 pub fn disconnect(reason: &str) -> Outcome {
     Outcome {
-        reply: Some(
+        replies: vec![
             LoginDisconnect {
                 reason: serde_json::json!({"text": reason}).to_string(),
             }
             .into(),
-        ),
+        ],
         close: true,
         encryption: None,
     }
@@ -78,7 +75,7 @@ fn success(ctx: &mut Context<'_>, profile: Profile) -> Outcome {
     ctx.session.profile = Some(profile.clone());
     ctx.session.login = LoginPhase::AwaitAcknowledged;
     Outcome {
-        reply: Some(LoginSuccess { profile }.into()),
+        replies: vec![LoginSuccess { profile }.into()],
         close: false,
         encryption: None,
     }
@@ -102,13 +99,13 @@ pub async fn handle_start(ctx: &mut Context<'_>, packet: LoginStart) -> io::Resu
             token,
         };
         Ok(Outcome {
-            reply: Some(
+            replies: vec![
                 EncryptionRequest {
                     public_key: auth.public_key().to_vec(),
                     verify_token: token,
                 }
                 .into(),
-            ),
+            ],
             close: false,
             encryption: None,
         })
@@ -171,9 +168,5 @@ pub async fn handle_acknowledged(
     }
     ctx.session.login = LoginPhase::Finished;
     ctx.session.state = State::Configuration;
-    Ok(Outcome {
-        reply: Some(ConfigurationDisconnect.into()),
-        close: true,
-        encryption: None,
-    })
+    super::configuration::begin(ctx)
 }

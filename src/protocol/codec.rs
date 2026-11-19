@@ -71,6 +71,13 @@ impl<'a> Reader<'a> {
         Ok(value.to_owned())
     }
 
+    pub fn remaining(&mut self, max_bytes: usize) -> io::Result<Vec<u8>> {
+        if self.bytes.len() > max_bytes {
+            return Err(invalid("payload too large"));
+        }
+        Ok(self.take(self.bytes.len())?.to_vec())
+    }
+
     pub fn byte_array(&mut self, max_bytes: usize) -> io::Result<Vec<u8>> {
         let len = self.varint()?;
         if len < 0 || len as usize > max_bytes {

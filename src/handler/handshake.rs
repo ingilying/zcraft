@@ -14,7 +14,7 @@ pub async fn handle_handshake(ctx: &mut Context<'_>, packet: Handshake) -> io::R
         return Ok(disconnect("ZCraft: please use Minecraft Java 1.21.1."));
     }
     Ok(Outcome {
-        reply: None,
+        replies: Vec::new(),
         close: false,
         encryption: None,
     })

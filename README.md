@@ -27,9 +27,10 @@ ZCraft 探索以 Rust 实现 Minecraft 服务端，将网络传输、协议编�
 通过强类型数据包与声明式注册表扩展协议功能。
 
 > [!IMPORTANT]
-> 项目处于基础架构阶段，**目前不能进入游戏**。可以通过 Minecraft 服务器列表查询
-> MOTD、版本、图标与延迟。已支持离线登录和正版会话认证；登录成功并收到客户端确认后，
-> 进入 Configuration 阶段，随后提示世界尚未实现并断开。暂不适合生产部署。
+> 项目处于早期开发阶段。已实现状态查询、离线/正版登录、Configuration 同步，以及
+> **静态平坦世界的最小观战 Play 流程**，不再在登录后立即断开。
+> 目前仅完成独立协议客户端联调，原版 Java 1.21.1 图形客户端的注册表加载与渲染仍需验证。
+> 尚无完整玩法、保存或多人实体同步，暂不适合生产部署。
 
 ## 功能状态
 
@@ -42,8 +43,12 @@ ZCraft 探索以 Rust 实现 Minecraft 服务端，将网络传输、协议编�
 - [x] 离线登录与 Mojang 正版会话认证
 - [x] RSA 密钥交换与 AES-128-CFB8 加密传输
 - [ ] 数据包压缩
-- [ ] 完整 Configuration / Play 协议阶段
-- [ ] 世界、实体与玩家逻辑
+- [x] Configuration 状态机、11 个动态注册表、功能标志与完成确认
+- [x] Configuration Keep Alive、可选/强制资源包协商与 Play 重新配置 API
+- [x] 最小观战 Play 初始化、25 个静态区块、光照与玩家位置确认
+- [x] Play Keep Alive、传送确认与取消安全的帧读取
+- [ ] 自定义数据包、资源包动态增删及完整玩法语义
+- [ ] 方块交互、玩家实体同步与世界持久化
 
 状态响应的在线人数目前固定为 `0`，尚未实现多版本协议映射。
 
@@ -54,6 +59,7 @@ ZCraft 探索以 Rust 实现 Minecraft 服务端，将网络传输、协议编�
 - 支持 Rust 2024 edition 的近期稳定版 Rust 与 Cargo。
 - Minecraft Java 1.21.1 客户端，用于验证服务器列表及登录流程。
 - C 编译器、Perl 和 Make 等原生构建工具，用于编译随依赖提供的 OpenSSL；首次构建较慢。
+- 首次编译需下载约 51.6 MB 的官方 1.21.1 服务端 JAR，以生成注册表；可使用本地 JAR 或预热缓存离线构建，不需要安装 Java。
 - 正版模式需能直接通过 HTTPS 访问 `sessionserver.mojang.com`。
 
 在项目根目录运行：
@@ -98,7 +104,7 @@ io_timeout_seconds = 10
 | `max_players` | 服务器列表展示的容量，尚不是实际玩家接入限制 |
 | `offline_mode` | 是否启用离线登录，默认 `false`，即要求正版会话认证 |
 | `max_connections` | 最大并发连接数，必须大于 0 且不超过 Tokio 信号量上限 |
-| `io_timeout_seconds` | 每次完整帧读取或响应写入的时限，整数秒，范围 1–86400 |
+| `io_timeout_seconds` | 完整响应批次写入及部分帧读取的时限，整数秒，范围 1–86400 |
 
 缺少字段使用默认值；未知字段、错误类型和无效值会阻止启动。
 已有配置及注释不会被重写。修改后需重启，暂不支持热加载。
@@ -131,10 +137,60 @@ offline_mode = true
 > 不要直接暴露到不可信网络。切换登录模式会改变同一用户名对应的 UUID。
 
 当前支持 `Login Start → Encryption Request/Response（正版模式）→ Login Success → Login Acknowledged`。
-收到确认后发送 Configuration 阶段的 NBT 断开提示，**尚不能进入世界**，也不会计入在线人数。
+收到确认后进入 Configuration，完成注册表同步后进入只读观战世界。
 未实现压缩，不会发送 Set Compression。错误版本、重复或乱序登录包会被拒绝。
-登录/状态连接总时限为 30 秒，Mojang 认证上限为 10 秒，RSA 解密最多并发 16 个任务；
-底层读写仍受 `io_timeout_seconds` 限制。
+登录/状态的入站处理总期限为 30 秒，Mojang 认证上限为 10 秒，
+RSA 解密最多并发 16 个任务。Configuration 每个协商步骤限时 30 秒，资源包步骤限时 120 秒，
+从对应请求写入完成后计时；心跳、客户端设置及资源包进度不会延长步骤期限。
+Configuration 和 Play 每 10 秒发起一次 Keep Alive，响应时限 30 秒；Play 位置确认时限 15 秒。
+这些响应时限均从对应请求写入完成后计时，慢连接发送注册表不会消耗下一次确认的等待窗口。
+每个完整响应批次的写入及部分帧接收仍受 `io_timeout_seconds` 限制。
+Configuration 解码、状态校验或读取超时错误会尽力发送明确的 Disconnect；断开通知的写入同样有界。
+
+### Configuration 与最小世界
+
+服务器不声明可省略的已知数据包；收到客户端的空 known-pack 响应后，发送完整的
+11 个动态注册表及 Update Tags；如配置资源包则等待协商完成，再发送 Finish Configuration，
+收到确认才切换为 Play。同时接收客户端语言、视距、皮肤部件设置和可选插件消息。
+
+默认不请求资源包。可在 `zcraft.toml` 末尾添加以下配置（替换 URL、UUID 及 SHA-1）：
+
+```toml
+[resource_pack]
+id = "00000000-0000-0000-0000-000000000001"
+url = "https://example.org/pack.zip"
+sha1 = "0123456789012345678901234567890123456789"
+required = false
+prompt = "是否加载服务器资源包？"
+```
+
+URL 必须为 HTTP(S)，SHA-1 必须为 40 位十六进制字符串。支持接受、下载、加载及各类失败状态，
+校验 UUID、状态顺序和重复响应；非强制包失败/拒绝后继续，强制包失败/拒绝则断开。
+包下载由客户端执行，服务端不托管或预下载 ZIP；目前每次配置仅支持一个包。
+
+嵌入式服务端可调用 `handler::configuration::request_reconfiguration(&mut Context)`，
+将返回的 `Outcome` 通过正常写入器发送，并调用 `configuration::packet_sent` 报告写入完成。
+此时仍按 Play 解码，收到 `Configuration Acknowledged` 后重新执行配置及观战世界初始化；
+重复请求和未经请求的确认会被拒绝，等待确认也有独立的 30 秒期限。
+同一连接已加载的相同 UUID/SHA-1 资源包会保留，不重复请求加载。
+暂未提供管理命令或配置热加载入口。
+
+- 主世界高度为 `-64..319`，plains 生物群系，固定白天。
+- 加载中心 `(0, 0)` 周围半径 2 的 25 个区块；出生点为 `(8.5, 65, 8.5)`。
+- 地面为基岩、两层泥土、草方块（顶层 y=63），包含高度图和天空光照。
+- 使用观战模式，限制在已加载范围附近；越界会被传送回出生点。
+- 登录身份及皮肤属性通过 Player Info Update 发送，但尚不广播其他玩家实体。
+- 不保存世界，不处理方块修改、聊天广播、背包、配方或实体 AI。
+  一部分明确注册的非交互包仅有界消费并忽略，不代表对应玩法已实现。
+- 标签由构建期数据预编码；自定义数据包及涉及标签的完整玩法暂不支持。
+  服务列表在线人数仍固定为 0。
+
+注册表在编译期从官方服务端 JAR 的 JSON 生成 Rust 常量；有效缓存存在时不重复下载或提取。
+运行时直接使用预编码数据，不依赖旧的第三方 JSON 快照。可用 `ZCRAFT_SERVER_JAR` 指定本地官方 JAR，
+`ZCRAFT_DATA_CACHE` 指定缓存根目录，`ZCRAFT_DATA_OFFLINE=1` 禁止构建脚本联网。
+来源、许可、离线构建及编码约束见 [协议数据说明](docs/protocol-data.md)。
+独立协议客户端验证了配置包、地形和光照解码，以及超过 30 秒的持续连接；
+这不能替代原版图形客户端的实际兼容性验证。
 
 ### 环境变量
 
@@ -206,13 +262,17 @@ src/
 │   ├── mojang.rs         # 会话验证接口、HTTP 查询与响应校验
 │   └── crypto.rs         # RSA、挑战值与 Minecraft 登录哈希
 ├── context.rs            # 会话及共享服务上下文
+├── registry_data.rs      # 编译期生成的 Configuration 注册表数据入口
+├── world.rs              # 静态地形、区块、高度图及光照
 ├── protocol/
 │   ├── codec.rs          # 基础类型编解码
 │   ├── frame.rs          # 帧长度与完整帧读写
 │   ├── registry.rs       # 声明式收发包注册表
 │   └── packets/          # 按协议阶段组织的数据包
-└── handler/              # 无状态分发器与类型化业务处理器
+└── handler/              # 无状态分发器与各阶段状态机，包括 configuration/play
 ```
+
+构建脚本 `build.rs` 和 `build_support/` 负责官方 JAR 获取、校验、选择性提取及 JSON → NBT → Rust 代码生成，生成物保存在构建缓存与 Cargo `OUT_DIR`。
 
 `Dispatcher` 只负责路由和协议状态校验，不构建具体业务响应。
 状态响应及图标缓存由 status 模块负责，处理器通过上下文访问服务，不直接操作 socket。
@@ -235,6 +295,7 @@ src/
 0x01 => Pong(Pong),
 ```
 
+处理器返回的 `Outcome.replies` 支持有序多包回复；关闭连接和启用加密仍通过 Outcome 通知网络层执行。
 注册宏生成枚举、解析、分发、编码及 `From` 转换，无需重复维护多个 `match`。
 同一状态和方向内的重复 ID 会在编译期报错；包 ID 不进入业务处理器。
 字段编解码不包含帧长度和包 ID，新建模块需在父模块声明。
@@ -248,8 +309,22 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 测试覆盖字段与帧编解码、协议分发、TCP 生命周期、配置生成、EULA 启动门禁、图标响应，
-以及离线 UUID、RSA/SPKI、Minecraft 有符号 SHA-1、在线身份校验和双向加密登录流程。
+以及离线 UUID、RSA/SPKI、Minecraft 有符号 SHA-1、在线身份校验、双向加密登录、
+Configuration 顺序、资源包成功/拒绝/失败与状态校验、重新配置、断开提示、
+区块/光照、心跳和慢连接下的配置/传送确认期限。
 在线认证集成测试使用注入的会话验证器，不依赖真实账号；尚未完成真实 Microsoft/Mojang 账号联调。
+
+可选的独立客户端测试需要 Node.js 和两个 npm 包；依赖安装在临时目录，不修改项目：
+
+```sh
+npm install --prefix /tmp/zcraft-client-check minecraft-protocol prismarine-chunk
+NODE_PATH=/tmp/zcraft-client-check/node_modules \\
+  cargo test --test client_compat -- --ignored --nocapture
+```
+
+该测试通过测试服务入口启动本地离线服务，不使用真实账号或用户配置。
+它使用独立实现解析所有注册表和 25 个区块的地面及光照，并维持连接 34 秒，
+验证 Keep Alive 和 Play 阶段不再受原有 30 秒登录期限影响。默认 `cargo test` 跳过此项。
 
 ## 参与贡献
 

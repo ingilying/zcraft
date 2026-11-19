@@ -6,4 +6,6 @@ pub mod handler;
 pub mod identity;
 pub mod network;
 pub mod protocol;
+pub mod registry_data;
 pub mod transport;
+pub mod world;

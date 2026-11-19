@@ -69,6 +69,8 @@ async fn start(
     let server = Arc::new(ServerContext {
         status: StatusService::new("test", 20),
         login,
+        configuration: zcraft::handler::configuration::ConfigurationService::new().unwrap(),
+        play: zcraft::handler::play::PlayService::new().unwrap(),
     });
     let (stop, stopped) = oneshot::channel();
     let task = tokio::spawn(serve_with_context(
@@ -116,19 +118,83 @@ fn assert_success(body: &[u8], expected: &Profile) {
     reader.finish().unwrap();
 }
 async fn configuration_end(client: &mut Transport<TcpStream>) {
-    client.write_frame(&[3]).await.unwrap();
-    let body = client.read_frame().await.unwrap().unwrap();
-    let mut reader = Reader::new(&body);
-    assert_eq!(reader.varint().unwrap(), 2); // Configuration disconnect ID
-    assert_eq!(reader.take(1).unwrap(), &[8]); // Anonymous TAG_String
-    let len = reader.u16().unwrap() as usize;
-    assert!(
-        std::str::from_utf8(reader.take(len).unwrap())
-            .unwrap()
-            .contains("world entry is not implemented")
-    );
+    client.write_frame(&[3]).await.unwrap(); // Login Acknowledged
+    let flags = client.read_frame().await.unwrap().unwrap();
+    let mut reader = Reader::new(&flags);
+    assert_eq!(reader.varint().unwrap(), 0x0c);
+    assert_eq!(reader.varint().unwrap(), 1);
+    assert_eq!(reader.string(32767).unwrap(), "minecraft:vanilla");
     reader.finish().unwrap();
-    assert!(client.read_frame().await.unwrap().is_none());
+    assert_eq!(client.read_frame().await.unwrap().unwrap(), [0x0e, 0]);
+
+    let mut information = vec![0]; // Configuration Client Information
+    put_string("en_us", &mut information).unwrap();
+    information.extend_from_slice(&[8, 0, 1, 0x7f, 1, 0, 1]);
+    client.write_frame(&information).await.unwrap();
+    client.write_frame(&[7, 0]).await.unwrap(); // Selected Known Packs: empty
+
+    let expected = zcraft::registry_data::registry_packets().unwrap();
+    for registry in expected {
+        let frame = client.read_frame().await.unwrap().unwrap();
+        assert_eq!(frame[0], 7);
+        assert_eq!(&frame[1..], registry);
+    }
+    let mut expected_tags = vec![0x0d];
+    expected_tags.extend(zcraft::registry_data::tags_packet().unwrap());
+    assert_eq!(client.read_frame().await.unwrap().unwrap(), expected_tags);
+    assert_eq!(client.read_frame().await.unwrap().unwrap(), [3]); // Finish Configuration
+    client.write_frame(&[3]).await.unwrap(); // Acknowledge Finish
+
+    let expected_ids = [0x2b, 0x3e, 0x38, 0x56, 0x64, 0x25, 0x54, 0x22, 0x0d];
+    let mut entity = 0;
+    for id in expected_ids {
+        let frame = client.read_frame().await.unwrap().unwrap();
+        assert_eq!(frame[0], id);
+        if id == 0x2b {
+            entity = i32::from_be_bytes(frame[1..5].try_into().unwrap());
+            assert!(entity > 0);
+        }
+    }
+    for z in -2..=2 {
+        for x in -2..=2 {
+            let frame = client.read_frame().await.unwrap().unwrap();
+            assert_eq!(frame[0], 0x27);
+            assert_eq!(&frame[1..], zcraft::world::chunk_data(x, z).unwrap());
+        }
+    }
+    assert_eq!(client.read_frame().await.unwrap().unwrap(), [0x0c, 25]);
+    let position = client.read_frame().await.unwrap().unwrap();
+    assert_eq!(position[0], 0x40);
+    let mut reader = Reader::new(&position[1..]);
+    reader.take(8 * 3 + 4 * 2 + 1).unwrap();
+    assert_eq!(reader.varint().unwrap(), 0);
+    reader.finish().unwrap();
+    client.write_frame(&[0, 0]).await.unwrap(); // teleport confirm
+    let mut batch = vec![8];
+    batch.extend_from_slice(&20f32.to_be_bytes());
+    client.write_frame(&batch).await.unwrap();
+    // Test basic spectator movement followed by an out-of-bounds correction.
+    let mut position = vec![0x1a];
+    for coordinate in [9.0f64, 66.0, 9.0] {
+        position.extend_from_slice(&coordinate.to_be_bytes());
+    }
+    position.push(0);
+    client.write_frame(&position).await.unwrap();
+    let mut outside = vec![0x1a];
+    for coordinate in [1000.0f64, 66.0, 9.0] {
+        outside.extend_from_slice(&coordinate.to_be_bytes());
+    }
+    outside.push(0);
+    client.write_frame(&outside).await.unwrap();
+    let correction = client.read_frame().await.unwrap().unwrap();
+    assert_eq!(correction[0], 0x40);
+    assert_eq!(*correction.last().unwrap(), 1);
+    client.write_frame(&[0, 1]).await.unwrap();
+    // Valid spectator action refers to this connection's assigned entity.
+    let mut action = vec![0x25];
+    put_varint(entity, &mut action);
+    action.extend([0, 0]);
+    client.write_frame(&action).await.unwrap();
 }
 async fn stop_server(stop: oneshot::Sender<()>, task: JoinHandle<io::Result<()>>) {
     stop.send(()).unwrap();

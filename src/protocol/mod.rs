@@ -16,4 +16,5 @@ pub enum State {
     Status,
     Login,
     Configuration,
+    Play,
 }

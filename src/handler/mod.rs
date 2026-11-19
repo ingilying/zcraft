@@ -1,6 +1,8 @@
 //! Business handlers operate on typed packets, never on sockets or packet IDs.
+pub mod configuration;
 pub(crate) mod handshake;
 pub mod login;
+pub mod play;
 pub mod status;
 
 pub use crate::context::Context;
@@ -16,6 +18,11 @@ pub struct Session {
     status_sent: bool,
     pub login: login::LoginPhase,
     pub profile: Option<crate::identity::Profile>,
+    pub configuration: configuration::ConfigurationPhase,
+    pub(crate) configuration_runtime: Option<configuration::ConfigurationSession>,
+    pub(crate) loaded_resource_pack: Option<(uuid::Uuid, String)>,
+    pub client_information: Option<crate::protocol::packets::common::ClientInformation>,
+    pub play: Option<play::PlaySession>,
 }
 
 impl Default for Session {
@@ -28,15 +35,30 @@ impl Default for Session {
             status_sent: false,
             login: login::LoginPhase::default(),
             profile: None,
+            configuration: configuration::ConfigurationPhase::NotStarted,
+            configuration_runtime: None,
+            loaded_resource_pack: None,
+            client_information: None,
+            play: None,
         }
     }
 }
 
 pub struct Outcome {
-    pub reply: Option<Clientbound>,
+    pub replies: Vec<Clientbound>,
     pub close: bool,
     /// Enable the transport cipher before writing this outcome's reply.
     pub encryption: Option<[u8; 16]>,
+}
+
+impl Outcome {
+    pub fn empty() -> Self {
+        Self {
+            replies: Vec::new(),
+            close: false,
+            encryption: None,
+        }
+    }
 }
 
 /// Stateless routing and protocol-state validation; owns no business services.
@@ -50,10 +72,10 @@ impl Dispatcher {
     ) -> io::Result<Outcome> {
         let outcome = packet.dispatch(ctx).await?;
         // Handlers may transition state before replying (e.g. handshake -> login).
-        if let Some(reply) = &outcome.reply
-            && reply.state() != ctx.session.state
-        {
-            return Err(invalid("outbound packet not allowed in current session"));
+        for reply in &outcome.replies {
+            if reply.state() != ctx.session.state {
+                return Err(invalid("outbound packet not allowed in current session"));
+            }
         }
         Ok(outcome)
     }

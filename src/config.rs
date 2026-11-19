@@ -24,6 +24,60 @@ pub struct Config {
     /// Deadline for a complete frame or response, not per-byte activity.
     #[serde(rename = "io_timeout_seconds", with = "seconds")]
     pub io_timeout: Duration,
+    /// Optional vanilla resource pack, negotiated before entering Play.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_pack: Option<ResourcePackConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourcePackConfig {
+    pub id: String,
+    pub url: String,
+    pub sha1: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+impl ResourcePackConfig {
+    pub fn validate(&self) -> io::Result<()> {
+        let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+        uuid::Uuid::parse_str(&self.id).map_err(|_| invalid("resource_pack.id must be a UUID"))?;
+        let url = reqwest::Url::parse(&self.url)
+            .map_err(|_| invalid("resource_pack.url must be an HTTP(S) URL"))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || self.url.encode_utf16().count() > 32767
+        {
+            return Err(invalid(
+                "resource_pack.url must be an HTTP(S) URL of at most 32767 characters",
+            ));
+        }
+        if self.sha1.len() != 40 || !self.sha1.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(invalid("resource_pack.sha1 must be 40 hexadecimal digits"));
+        }
+        if self.prompt.as_ref().is_some_and(|prompt| {
+            // Text components use Java modified UTF-8 in anonymous NBT.
+            prompt
+                .chars()
+                .map(|c| {
+                    if c == '\0' {
+                        2
+                    } else if c as u32 > 0xffff {
+                        6
+                    } else {
+                        c.len_utf8()
+                    }
+                })
+                .sum::<usize>()
+                > 65535
+        }) {
+            return Err(invalid("resource_pack.prompt exceeds the NBT string limit"));
+        }
+        Ok(())
+    }
 }
 
 impl Default for Config {
@@ -36,6 +90,7 @@ impl Default for Config {
             offline_mode: false,
             max_connections: 1024,
             io_timeout: Duration::from_secs(10),
+            resource_pack: None,
         }
     }
 }
@@ -121,6 +176,9 @@ impl Config {
             return Err(invalid(
                 "io_timeout_seconds must be positive and at most 86400",
             ));
+        }
+        if let Some(pack) = &self.resource_pack {
+            pack.validate()?;
         }
         Ok(())
     }
