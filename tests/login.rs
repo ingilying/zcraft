@@ -168,14 +168,19 @@ async fn configuration_end(client: &mut Transport<TcpStream>) {
             assert!(entity > 0);
         }
     }
-    for z in -2..=2 {
-        for x in -2..=2 {
-            let frame = client.read_frame().await.unwrap().unwrap();
-            assert_eq!(frame[0], 0x27);
-            assert_eq!(&frame[1..], zcraft::world::chunk_data(x, z).unwrap());
+    let mut chunks = std::collections::BTreeSet::new();
+    for index in 0..8 {
+        let frame = client.read_frame().await.unwrap().unwrap();
+        assert_eq!(frame[0], 0x27);
+        let x = i32::from_be_bytes(frame[1..5].try_into().unwrap());
+        let z = i32::from_be_bytes(frame[5..9].try_into().unwrap());
+        if index == 0 {
+            assert_eq!((x, z), (0, 0));
         }
+        assert!(chunks.insert((x, z)));
+        assert_eq!(&frame[1..], zcraft::world::chunk_data(x, z).unwrap());
     }
-    assert_eq!(client.read_frame().await.unwrap().unwrap(), [0x0c, 25]);
+    assert_eq!(client.read_frame().await.unwrap().unwrap(), [0x0c, 8]);
     let position = client.read_frame().await.unwrap().unwrap();
     assert_eq!(position[0], 0x40);
     let mut reader = Reader::new(&position[1..]);
@@ -194,7 +199,7 @@ async fn configuration_end(client: &mut Transport<TcpStream>) {
     position.push(0);
     client.write_frame(&position).await.unwrap();
     let mut outside = vec![0x1a];
-    for coordinate in [1000.0f64, 66.0, 9.0] {
+    for coordinate in [30_000_000.0f64, 66.0, 9.0] {
         outside.extend_from_slice(&coordinate.to_be_bytes());
     }
     outside.push(0);

@@ -230,7 +230,7 @@ async fn play_peers_sync_spawn_pose_leave_and_reconnect_over_tcp() {
     );
 
     alice
-        .write_frame(&position_look(200.0, 90.0, 45.0))
+        .write_frame(&position_look(30_000_000.0, 90.0, 45.0))
         .await
         .unwrap();
     let correction = read(&mut alice).await.unwrap();

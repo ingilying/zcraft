@@ -9,13 +9,14 @@ use uuid::Uuid;
 use crate::{
     identity::Profile,
     protocol::{Decode, Encode, Reader, invalid, put_string, put_varint},
-    world::{SPAWN_X, SPAWN_Y, SPAWN_Z, VIEW_DISTANCE},
+    world::{SPAWN_X, SPAWN_Y, SPAWN_Z, VIEW_DISTANCE, WORLD_LIMIT},
 };
 
 /// Clientbound 0x2b. A single overworld, dynamic dimension type 0, spectator mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinGame {
     pub entity_id: i32,
+    pub view_distance: i32,
 }
 
 impl Encode for JoinGame {
@@ -25,8 +26,8 @@ impl Encode for JoinGame {
         put_varint(1, out);
         put_string("minecraft:overworld", out)?;
         put_varint(20, out); // Advertised maximum players.
-        put_varint(VIEW_DISTANCE, out);
-        put_varint(VIEW_DISTANCE, out); // Simulation distance.
+        put_varint(self.view_distance, out);
+        put_varint(VIEW_DISTANCE, out); // No dynamic simulation yet.
         out.extend_from_slice(&[0, 1, 0]); // Reduced debug, respawn screen, limited crafting.
         put_varint(0, out); // SpawnInfo: dynamic dimension type ID.
         put_string("minecraft:overworld", out)?;
@@ -88,23 +89,51 @@ impl Encode for PlayerPosition {
 
 /// Clientbound 0x54.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CenterChunk;
+pub struct CenterChunk(pub [i32; 2]);
 
 impl Encode for CenterChunk {
     fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
-        put_varint(0, out);
-        put_varint(0, out);
+        for value in self.0 {
+            put_varint(value, out);
+        }
         Ok(())
     }
 }
 
-/// Clientbound 0x27. Already encoded chunk/light fields, without packet ID.
+/// Clientbound 0x55.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkData(pub Arc<[u8]>);
+pub struct ChunkViewDistance(pub i32);
+
+impl Encode for ChunkViewDistance {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        put_varint(self.0, out);
+        Ok(())
+    }
+}
+
+/// Clientbound 0x21 uses fixed-width Z before X (unlike ChunkData).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgetChunk(pub [i32; 2]);
+
+impl Encode for ForgetChunk {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        let [x, z] = self.0;
+        out.extend_from_slice(&z.to_be_bytes());
+        out.extend_from_slice(&x.to_be_bytes());
+        Ok(())
+    }
+}
+
+/// Clientbound 0x27. Coordinates followed by shared encoded terrain/light.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkData(pub [i32; 2], pub Arc<[u8]>);
 
 impl Encode for ChunkData {
     fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
-        out.extend_from_slice(&self.0);
+        for value in self.0 {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        out.extend_from_slice(&self.1);
         Ok(())
     }
 }
@@ -159,18 +188,18 @@ impl Encode for TimeUpdate {
     }
 }
 
-/// Clientbound 0x25. Fixed 48-block border centered on the initial spawn.
+/// Clientbound 0x25. World-scale border centered at the origin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorldBorder;
 
 impl Encode for WorldBorder {
     fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
-        for value in [8.5f64, 8.5, 48.0, 48.0] {
+        for value in [0.0, 0.0, 2.0 * WORLD_LIMIT, 2.0 * WORLD_LIMIT] {
             out.extend_from_slice(&value.to_be_bytes());
         }
         // Zero is identical in the protocol's VarLong and VarInt encodings.
         out.push(0); // Resize duration.
-        put_varint(29_999_984, out);
+        put_varint(WORLD_LIMIT as i32, out);
         put_varint(5, out);
         put_varint(15, out);
         Ok(())
@@ -513,7 +542,10 @@ mod tests {
 
     #[test]
     fn join_game_has_exact_767_field_order() {
-        let bytes = encoded(&JoinGame { entity_id: 42 });
+        let bytes = encoded(&JoinGame {
+            entity_id: 42,
+            view_distance: 2,
+        });
         let mut reader = Reader::new(&bytes);
         assert_eq!(reader.take(4).unwrap(), 42i32.to_be_bytes());
         assert_eq!(reader.take(1).unwrap(), [0]);
@@ -598,8 +630,16 @@ mod tests {
     fn fixed_world_packets_are_wire_correct() {
         assert!(encoded(&ChunkBatchStart).is_empty());
         assert_eq!(encoded(&ChunkBatchFinished { count: 25 }), [25]);
-        assert_eq!(encoded(&CenterChunk), [0, 0]);
-        assert_eq!(encoded(&ChunkData(Arc::from([1, 2, 3]))), [1, 2, 3]);
+        assert_eq!(encoded(&CenterChunk([-1, 2])), [255, 255, 255, 255, 15, 2]);
+        assert_eq!(encoded(&ChunkViewDistance(16)), [16]);
+        assert_eq!(
+            encoded(&ForgetChunk([-1, 2])),
+            [0, 0, 0, 2, 255, 255, 255, 255]
+        );
+        assert_eq!(
+            encoded(&ChunkData([-1, 2], Arc::from([1, 2, 3]))),
+            [255, 255, 255, 255, 0, 0, 0, 2, 1, 2, 3]
+        );
         assert_eq!(encoded(&KeepAlive { id: -42 }), (-42i64).to_be_bytes());
         let bytes = encoded(&PlayerAbilities);
         let mut reader = Reader::new(&bytes);
@@ -615,7 +655,7 @@ mod tests {
         reader.finish().unwrap();
         let bytes = encoded(&WorldBorder);
         let mut reader = Reader::new(&bytes);
-        for expected in [8.5, 8.5, 48.0, 48.0] {
+        for expected in [0.0, 0.0, 59_999_968.0, 59_999_968.0] {
             assert_eq!(f64_field(&mut reader), expected);
         }
         assert_eq!(reader.varint().unwrap(), 0);

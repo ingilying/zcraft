@@ -1,4 +1,7 @@
 //! Minimal, read-only spectator world. No authoritative gameplay or persistence yet.
+mod chunks;
+
+use self::chunks::ChunkStream;
 use super::{Context, Outcome, Session};
 use crate::{
     players::Peer,
@@ -23,20 +26,34 @@ const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 const TELEPORT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct PlayService {
-    chunks: Vec<Arc<[u8]>>,
+    terrain: Arc<[u8]>,
+    max_view_distance: i32,
     next_entity: AtomicI32,
 }
 impl PlayService {
     pub fn new() -> io::Result<Self> {
-        let mut chunks = Vec::new();
-        for z in -world::VIEW_DISTANCE..=world::VIEW_DISTANCE {
-            for x in -world::VIEW_DISTANCE..=world::VIEW_DISTANCE {
-                chunks.push(world::chunk_data(x, z)?.into());
-            }
-        }
+        Self::with_max_view_distance(world::VIEW_DISTANCE)
+    }
+
+    pub fn with_max_view_distance(max_view_distance: i32) -> io::Result<Self> {
+        world::validate_view_distance(max_view_distance)?;
         Ok(Self {
-            chunks,
+            terrain: world::chunk_payload(),
+            max_view_distance,
             next_entity: AtomicI32::new(1),
+        })
+    }
+
+    pub fn max_view_distance(&self) -> i32 {
+        self.max_view_distance
+    }
+
+    fn view_distance(
+        &self,
+        information: Option<&crate::protocol::packets::common::ClientInformation>,
+    ) -> i32 {
+        information.map_or(self.max_view_distance, |info| {
+            i32::from(info.view_distance).clamp(world::VIEW_DISTANCE, self.max_view_distance)
         })
     }
 }
@@ -52,7 +69,7 @@ pub struct PlaySession {
     next_teleport: i32,
     pending_keep_alive: Option<(i64, Instant)>,
     next_keep_alive: Instant,
-    awaiting_chunks: bool,
+    chunks: ChunkStream,
 }
 
 pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
@@ -74,6 +91,15 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         id
     };
     let now = Instant::now();
+    let view_distance = ctx
+        .server
+        .play
+        .view_distance(ctx.session.client_information.as_ref());
+    let mut chunks = ChunkStream::new(view_distance, now);
+    if let Some(slot) = &ctx.session.reservation {
+        slot.set_view([0, 0], view_distance);
+    }
+    let first_batch = chunks.pump(&ctx.server.play.terrain, now);
     ctx.session.play = Some(PlaySession {
         entity_id,
         position: [world::SPAWN_X, world::SPAWN_Y, world::SPAWN_Z],
@@ -84,34 +110,25 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         next_teleport: 1,
         pending_keep_alive: None,
         next_keep_alive: now + KEEP_ALIVE_INTERVAL,
-        awaiting_chunks: true,
+        chunks,
     });
     let mut replies = vec![
-        JoinGame { entity_id }.into(),
+        JoinGame {
+            entity_id,
+            view_distance,
+        }
+        .into(),
         PlayerInfo { profile }.into(),
         PlayerAbilities.into(),
         DefaultSpawnPosition.into(),
         TimeUpdate.into(),
         WorldBorder.into(),
-        CenterChunk.into(),
+        CenterChunk([0, 0]).into(),
         GameEvent.into(),
-        ChunkBatchStart.into(),
     ];
-    replies.extend(
-        ctx.server
-            .play
-            .chunks
-            .iter()
-            .cloned()
-            .map(|body| ChunkData(body).into()),
-    );
-    replies.push(
-        ChunkBatchFinished {
-            count: ctx.server.play.chunks.len() as i32,
-        }
-        .into(),
-    );
-    // Request confirmation only after all initial chunks have been written.
+    replies.extend(first_batch);
+    // The nearest chunks (including spawn) precede the initial teleport.
+    // The rest of the view streams independently of teleport confirmation.
     replies.push(PlayerPosition { teleport_id: 0 }.into());
     Ok(Outcome {
         replies,
@@ -133,6 +150,12 @@ pub fn packet_sent(session: &mut Session, packet: &crate::protocol::Clientbound,
     let Some(state) = session.play.as_mut() else {
         return;
     };
+    state.chunks.packet_sent(packet, now);
+    if let Clientbound::ChunkData(chunk) = packet
+        && let Some(slot) = &session.reservation
+    {
+        slot.chunk_sent(chunk.0);
+    }
     match packet {
         crate::protocol::Clientbound::PlayerPosition(packet) => {
             if state.pending_teleport.map(|(id, _)| id) == Some(packet.teleport_id) {
@@ -177,6 +200,9 @@ pub fn tick(session: &mut Session, now: Instant) -> io::Result<Outcome> {
         .is_some_and(|(_, sent)| now.duration_since(sent) >= KEEP_ALIVE_TIMEOUT)
     {
         return Ok(closed("ZCraft: keep alive timed out."));
+    }
+    if state.chunks.feedback_timed_out(now) {
+        return Ok(closed("ZCraft: chunk batch feedback timed out."));
     }
     if state.pending_keep_alive.is_none() && now >= state.next_keep_alive {
         let id = rand::random::<i64>();
@@ -262,11 +288,9 @@ fn movement(
         return Ok(Outcome::empty());
     }
     if let Some([x, y, z]) = position {
-        // Keep clients within the preloaded static terrain instead of accepting
-        // unlimited movement into chunks that this prototype cannot stream yet.
-        if !(-15.0..=32.0).contains(&x)
-            || !(-15.0..=32.0).contains(&z)
-            || !(-32.0..=256.0).contains(&y)
+        if !(-world::WORLD_LIMIT..=world::WORLD_LIMIT).contains(&x)
+            || !(-world::WORLD_LIMIT..=world::WORLD_LIMIT).contains(&z)
+            || !(f64::from(world::MIN_Y)..=f64::from(world::MIN_Y + world::HEIGHT)).contains(&y)
         {
             let id = state.next_teleport;
             state.next_teleport = id
@@ -274,9 +298,14 @@ fn movement(
                 .ok_or_else(|| invalid("teleport ID exhausted"))?;
             state.pending_teleport = Some((id, Instant::now()));
             state.position = [world::SPAWN_X, world::SPAWN_Y, world::SPAWN_Z];
+            state.chunks.follow(world::SPAWN_X, world::SPAWN_Z);
+            let view = state.chunks.view();
             state.yaw = 0.0;
             state.pitch = 0.0;
             state.on_ground = false;
+            if let Some(slot) = &ctx.session.reservation {
+                slot.set_view(view.0, view.1);
+            }
             return Ok(Outcome {
                 replies: vec![PlayerPosition { teleport_id: id }.into()],
                 close: false,
@@ -284,6 +313,7 @@ fn movement(
             });
         }
         state.position = [x, y, z];
+        state.chunks.follow(x, z);
     }
     if let Some([yaw, pitch]) = rotation {
         state.yaw = yaw;
@@ -291,7 +321,11 @@ fn movement(
     }
     state.on_ground = on_ground;
     let pose = state.pose();
+    let view = state.chunks.view();
     if let Some(slot) = &ctx.session.reservation {
+        if position.is_some() {
+            slot.set_view(view.0, view.1);
+        }
         slot.update_pose(pose);
     }
     Ok(Outcome::empty())
@@ -313,18 +347,58 @@ pub async fn handle_look(ctx: &mut Context<'_>, p: Look) -> io::Result<Outcome> 
 pub async fn handle_flying(ctx: &mut Context<'_>, p: Flying) -> io::Result<Outcome> {
     movement(ctx, None, None, p.on_ground)
 }
-pub async fn handle_batch(ctx: &mut Context<'_>, _p: ChunkBatchReceived) -> io::Result<Outcome> {
-    let state = play(ctx.session)?;
-    if !state.awaiting_chunks {
-        return Err(invalid("unexpected chunk batch feedback"));
-    }
-    state.awaiting_chunks = false;
+pub async fn handle_batch(ctx: &mut Context<'_>, p: ChunkBatchReceived) -> io::Result<Outcome> {
+    play(ctx.session)?
+        .chunks
+        .feedback(p.chunks_per_tick, Instant::now())?;
     Ok(Outcome::empty())
+}
+
+pub fn next_chunk_update(session: &Session) -> Option<Instant> {
+    session.play.as_ref()?.chunks.next_update()
+}
+
+/// Paces terrain independently from keep-alive and inbound movement packets.
+pub fn stream_chunks(
+    session: &mut Session,
+    service: &PlayService,
+    now: Instant,
+) -> io::Result<Outcome> {
+    let packets = play(session)?.chunks.pump(&service.terrain, now);
+    let mut replies = Vec::new();
+    if let Some(slot) = &session.reservation {
+        let unloaded: std::collections::HashSet<_> = packets
+            .iter()
+            .filter_map(|packet| {
+                if let Clientbound::ForgetChunk(chunk) = packet {
+                    Some(chunk.0)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !unloaded.is_empty() {
+            replies = slot.before_unload(&unloaded);
+        }
+    }
+    replies.extend(packets);
+    Ok(Outcome {
+        replies,
+        close: false,
+        encryption: None,
+    })
 }
 pub async fn handle_information(
     ctx: &mut Context<'_>,
     packet: PlayClientInformation,
 ) -> io::Result<Outcome> {
+    let distance = ctx.server.play.view_distance(Some(&packet.0));
+    let chunks = &mut play(ctx.session)?.chunks;
+    chunks.set_radius(distance);
+    let (center, radius) = chunks.view();
+    if let Some(slot) = &ctx.session.reservation {
+        slot.set_view(center, radius);
+    }
     ctx.session.client_information = Some(packet.0);
     Ok(Outcome::empty())
 }
@@ -345,6 +419,19 @@ mod tests {
     use super::*;
     use crate::protocol::Clientbound;
     #[test]
+    fn client_view_distance_is_capped_by_the_service_limit() {
+        use crate::protocol::{Decode, Reader, packets::common::ClientInformation};
+
+        let service = PlayService::with_max_view_distance(6).unwrap();
+        assert_eq!(service.view_distance(None), 6);
+        for (requested, expected) in [(2, 2), (4, 4), (6, 6), (127, 6)] {
+            let bytes = [2, b'e', b'n', requested, 0, 1, 127, 1, 0, 1];
+            let information = ClientInformation::decode(&mut Reader::new(&bytes)).unwrap();
+            assert_eq!(service.view_distance(Some(&information)), expected);
+        }
+    }
+
+    #[test]
     fn keep_alive_and_teleport_deadlines_are_independent() {
         let now = Instant::now();
         let mut session = Session {
@@ -358,7 +445,7 @@ mod tests {
                 next_teleport: 1,
                 pending_keep_alive: None,
                 next_keep_alive: now,
-                awaiting_chunks: false,
+                chunks: ChunkStream::new(2, now),
             }),
             ..Session::default()
         };

@@ -13,6 +13,20 @@ const client = mc.createClient({
   keepAlive: true, hideErrors: false
 })
 let chunks = 0
+let batchCount = 0
+let center = '0,0'
+const loaded = new Set()
+const route = [[0, 0], [1, 0], [10, -4], [-1, -1]]
+let step = 0
+let unloads = 0
+function key (x, z) { return `${x},${z}` }
+function expected (x, z) {
+  const chunks = []
+  for (let dx = -2; dx <= 2; dx++) {
+    for (let dz = -2; dz <= 2; dz++) chunks.push(key(x + dx, z + dz))
+  }
+  return chunks.sort()
+}
 let registries = 0
 let heartbeats = 0
 let positioned = false
@@ -58,7 +72,17 @@ client.on('packet', (packet, meta) => {
       client.write('teleport_confirm', { teleportId: packet.teleportId })
       client.write('position', { x: 8.5, y: 65, z: 8.5, onGround: false })
     }
+    if (meta.name === 'update_view_position') center = key(packet.chunkX, packet.chunkZ)
+    if (meta.name === 'unload_chunk') {
+      assert(loaded.delete(key(packet.chunkX, packet.chunkZ)), 'unload must refer to a loaded chunk')
+      unloads++
+    }
+    if (meta.name === 'chunk_batch_start') batchCount = 0
     if (meta.name === 'map_chunk') {
+      const id = key(packet.x, packet.z)
+      assert(!loaded.has(id), 'duplicate chunk')
+      loaded.add(id)
+      batchCount++
       const chunk = new Chunk({ minY: -64, worldHeight: 384 })
       chunk.load(packet.chunkData)
       chunk.loadParsedLight(packet.skyLight, packet.blockLight,
@@ -73,9 +97,18 @@ client.on('packet', (packet, meta) => {
       chunks++
     }
     if (meta.name === 'chunk_batch_finished') {
-      assert.equal(packet.batchSize, 25)
-      assert.equal(chunks, 25)
+      assert.equal(packet.batchSize, batchCount)
+      assert(batchCount > 0 && batchCount <= 8)
       client.write('chunk_batch_received', { chunksPerTick: 20 })
+      if (step < route.length && loaded.size === 25) {
+        const [x, z] = route[step++]
+        assert.equal(center, key(x, z))
+        assert.deepEqual([...loaded].sort(), expected(x, z))
+        if (step < route.length) {
+          const [nextX, nextZ] = route[step]
+          client.write('position', { x: nextX * 16 + 0.5, y: 65, z: nextZ * 16 + 0.5, onGround: false })
+        }
+      }
     }
     if (meta.name === 'keep_alive') heartbeats++
   } catch (error) { fail(error) }
@@ -85,12 +118,14 @@ finishTimer = setTimeout(() => {
   try {
     assert(joined && positioned)
     assert.equal(registries, 11)
-    assert.equal(chunks, 25)
+    assert.equal(step, route.length)
+    assert.equal(chunks, 80)
+    assert.equal(unloads, 55)
     assert(heartbeats >= 3)
     assert(Date.now() - started > 30000)
     completed = true
     clearTimeout(deadline)
-    console.log(`PASS: ${version}, ${registries} registries, ${chunks} decoded terrain/light chunks, ${heartbeats} heartbeats, Play alive beyond 30s`)
+    console.log(`PASS: ${version}, ${registries} registries, ${chunks} decoded terrain/light chunks, ${unloads} unloads, ${heartbeats} heartbeats, Play alive beyond 30s`)
     client.end()
   } catch (error) { fail(error) }
 }, 34000)

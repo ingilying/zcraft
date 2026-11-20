@@ -38,7 +38,7 @@ pub async fn serve(
         status: StatusService::from_config(&config)?,
         login: LoginService::from_config(&config).await?,
         configuration,
-        play: crate::handler::play::PlayService::new()?,
+        play: crate::handler::play::PlayService::with_max_view_distance(config.max_view_distance)?,
     });
     serve_validated(listener, config, server, shutdown).await
 }
@@ -56,6 +56,12 @@ pub async fn serve_with_context(
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "server context player capacity must match config.max_players",
+        ));
+    }
+    if server.play.max_view_distance() != config.max_view_distance {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "server context view distance must match config.max_view_distance",
         ));
     }
     server.status.validate()?;
@@ -193,6 +199,7 @@ enum ConnectionEvent {
     Frame(Vec<u8>),
     Broadcast(crate::players::Delivery),
     Tick,
+    Chunks,
     Eof,
 }
 
@@ -232,6 +239,11 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
         } else {
             frame_deadline.min(login_deadline)
         };
+        let chunk_update = if state_before == State::Play && configuration_deadline.is_none() {
+            crate::handler::play::next_chunk_update(&session)
+        } else {
+            None
+        };
         let event = until_lagged(inbox.as_ref(), async {
             tokio::select! {
                 frame = read_frame_until(&mut transport, reading_until, deadline) => {
@@ -240,6 +252,12 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 _ = ticks.tick(), if state_before == State::Play || configuration_deadline.is_some() => {
                     Ok(ConnectionEvent::Tick)
                 }
+                _ = async {
+                    match chunk_update {
+                        Some(at) => sleep_until(at).await,
+                        None => pending().await,
+                    }
+                } => Ok(ConnectionEvent::Chunks),
                 body = async {
                     match &inbox {
                         Some(inbox) => inbox.next().await,
@@ -284,6 +302,9 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 crate::handler::configuration::tick(&mut session, Instant::now())
             }
             Ok(ConnectionEvent::Tick) => crate::handler::play::tick(&mut session, Instant::now()),
+            Ok(ConnectionEvent::Chunks) => {
+                crate::handler::play::stream_chunks(&mut session, &server.play, Instant::now())
+            }
             Ok(ConnectionEvent::Broadcast(delivery)) => {
                 let writing_until = Instant::now() + deadline;
                 for body in delivery.bodies()? {

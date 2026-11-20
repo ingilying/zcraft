@@ -26,6 +26,23 @@ pub const SPAWN_X: f64 = 8.5;
 pub const SPAWN_Y: f64 = 65.0;
 pub const SPAWN_Z: f64 = 8.5;
 pub const VIEW_DISTANCE: i32 = 2;
+pub const MAX_VIEW_DISTANCE: i32 = 16;
+pub const WORLD_LIMIT: f64 = 29_999_984.0;
+
+pub(crate) fn chunk_at(x: f64, z: f64) -> [i32; 2] {
+    [(x / 16.0).floor() as i32, (z / 16.0).floor() as i32]
+}
+
+pub(crate) fn validate_view_distance(distance: i32) -> io::Result<()> {
+    if (VIEW_DISTANCE..=MAX_VIEW_DISTANCE).contains(&distance) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "max_view_distance must be 2..=16",
+        ))
+    }
+}
 
 const SECTION_COUNT: usize = (HEIGHT / 16) as usize;
 const LIGHT_SECTION_COUNT: usize = SECTION_COUNT + 2;
@@ -47,28 +64,39 @@ pub fn chunk_data(x: i32, z: i32) -> io::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(40 * 1024);
     out.extend_from_slice(&x.to_be_bytes());
     out.extend_from_slice(&z.to_be_bytes());
-    put_heightmaps(&mut out);
+    put_chunk_payload(&mut out);
+    Ok(out)
+}
+
+// All coordinates share exactly one immutable terrain/light payload.
+pub(crate) fn chunk_payload() -> std::sync::Arc<[u8]> {
+    let mut out = Vec::with_capacity(40 * 1024);
+    put_chunk_payload(&mut out);
+    out.into()
+}
+
+fn put_chunk_payload(out: &mut Vec<u8>) {
+    put_heightmaps(out);
 
     let sections = section_data();
-    put_varint(sections.len() as i32, &mut out);
+    put_varint(sections.len() as i32, out);
     out.extend_from_slice(&sections);
-    put_varint(0, &mut out); // Block entity count.
+    put_varint(0, out); // Block entity count.
 
-    put_bitset(LIT_SKY_SECTIONS, &mut out);
-    put_bitset(0, &mut out); // No nonzero emitted block light.
-    put_bitset(DARK_SKY_SECTIONS, &mut out);
-    put_bitset(ALL_LIGHT_SECTIONS, &mut out); // Explicitly clear all block light.
+    put_bitset(LIT_SKY_SECTIONS, out);
+    put_bitset(0, out); // No nonzero emitted block light.
+    put_bitset(DARK_SKY_SECTIONS, out);
+    put_bitset(ALL_LIGHT_SECTIONS, out); // Explicitly clear all block light.
 
-    put_varint(LIT_SKY_SECTIONS.count_ones() as i32, &mut out);
+    put_varint(LIT_SKY_SECTIONS.count_ones() as i32, out);
     for _ in 0..LIT_SKY_SECTIONS.count_ones() {
-        put_varint(LIGHT_BYTES as i32, &mut out);
+        put_varint(LIGHT_BYTES as i32, out);
         // Two level-15 sky-light samples per byte. The slab ends at a section
         // boundary; no partially lit section is required. Air under the solid,
         // infinite slab receives no sky light. Air at/above y=64 is full daylight.
         out.resize(out.len() + LIGHT_BYTES, 0xff);
     }
-    put_varint(0, &mut out); // Block-light array count.
-    Ok(out)
+    put_varint(0, out); // Block-light array count.
 }
 
 fn put_heightmaps(out: &mut Vec<u8>) {

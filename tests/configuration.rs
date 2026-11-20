@@ -119,7 +119,7 @@ async fn configuration_rejects_early_finish_and_duplicate_known_packs() {
             .iter()
             .filter(|p| matches!(p, Clientbound::ChunkData(_)))
             .count(),
-        25
+        8
     );
     assert!(
         dispatcher

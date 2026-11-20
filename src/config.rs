@@ -19,6 +19,8 @@ pub struct Config {
     /// Relative paths are resolved from the working directory.
     pub server_icon: String,
     pub max_players: u32,
+    /// Maximum per-player chunk radius (2–16). Smaller client settings win.
+    pub max_view_distance: i32,
     /// Disables Mojang verification. Unsafe on untrusted networks.
     pub offline_mode: bool,
     pub max_connections: usize,
@@ -90,6 +92,7 @@ impl Default for Config {
             motd: "ZCraft — Rust Minecraft Server".into(),
             server_icon: "server-icon.png".into(),
             max_players: 20,
+            max_view_distance: crate::world::VIEW_DISTANCE,
             offline_mode: false,
             max_connections: 1024,
             compression_threshold: DEFAULT_COMPRESSION_THRESHOLD,
@@ -185,6 +188,7 @@ impl Config {
         if !(-1..=crate::protocol::MAX_FRAME_SIZE as i32).contains(&self.compression_threshold) {
             return Err(invalid("compression_threshold must be -1..=2097151"));
         }
+        crate::world::validate_view_distance(self.max_view_distance)?;
         if let Some(pack) = &self.resource_pack {
             pack.validate()?;
         }
