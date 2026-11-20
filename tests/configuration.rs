@@ -820,7 +820,7 @@ async fn slow_initial_batch_does_not_consume_the_teleport_confirmation_window() 
     // Simulate 20 seconds of backpressure before the final position packet is
     // flushed. The confirmation deadline must start at flush, not begin().
     let flushed = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-    zcraft::handler::play::packet_sent(ctx.session, position, flushed);
+    zcraft::handler::play::packet_sent(ctx.session, position, flushed).unwrap();
     assert!(
         !zcraft::handler::play::tick(ctx.session, flushed + std::time::Duration::from_secs(14))
             .unwrap()

@@ -17,6 +17,7 @@ fn missing_file_generates_roundtrippable_defaults() {
     assert!(contents.contains("io_timeout_seconds = 10"));
     assert!(contents.contains("compression_threshold = 256"));
     assert!(contents.contains("max_view_distance = 2"));
+    assert!(contents.contains("game_mode = \"spectator\""));
     assert!(contents.contains("offline_mode = false"));
     assert_eq!(Config::load_or_create(&path).unwrap(), config);
     assert_eq!(fs::read_to_string(path).unwrap(), contents);
@@ -48,6 +49,7 @@ fn invalid_files_are_reported_and_never_overwritten() {
         "max_connections = -1",
         "max_view_distance = 1",
         "max_view_distance = 17",
+        "game_mode = 'survival'",
         "compression_threshold = -2",
         "compression_threshold = 2097152",
         "io_timeout_seconds = 0",

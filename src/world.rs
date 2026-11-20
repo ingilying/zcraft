@@ -2,8 +2,8 @@
 //!
 //! Registry contract: overworld dimension type at dynamic ID 0, min_y -64,
 //! height 384, and plains biome at dynamic ID 0. The terrain is bedrock at y=60,
-//! dirt at y=61..=62, grass at y=63, and air elsewhere. No persistence, block
-//! entities, block updates, or lighting engine are provided.
+//! dirt at y=61..=62, grass at y=63, and air elsewhere. Creative edits are
+//! in memory, with vertical skylight only and no block entities.
 //!
 //! Versioned wire/ID references (numeric facts only; no bundled game assets):
 //! - https://github.com/PrismarineJS/minecraft-data/blob/master/data/pc/1.21.1/protocol.json
@@ -17,6 +17,12 @@
 //! - https://minecraft.wiki/w/Java_Edition_protocol/Packets#Chunk_Data_and_Update_Light
 //!   Light bits cover the dimension's sections plus one boundary at each end;
 //!   arrays follow set bits in ascending order, with 2048 bytes per nibble array.
+
+mod edits;
+pub use edits::{BlockPos, HOTBAR};
+pub(crate) use edits::{
+    BlockWorld, Snapshot, changed_blocks, edited_payload, light_payload, sky_heights,
+};
 
 use std::io;
 
@@ -100,6 +106,10 @@ fn put_chunk_payload(out: &mut Vec<u8>) {
 }
 
 fn put_heightmaps(out: &mut Vec<u8>) {
+    put_heightmaps_with(out, &[(SURFACE_Y + 1 - MIN_Y) as u16; 256]);
+}
+
+fn put_heightmaps_with(out: &mut Vec<u8>, heights: &[u16; 256]) {
     out.push(10); // Anonymous root TAG_Compound, without a root-name field.
     for name in ["MOTION_BLOCKING", "WORLD_SURFACE"] {
         out.push(12); // Named TAG_Long_Array.
@@ -108,12 +118,10 @@ fn put_heightmaps(out: &mut Vec<u8>) {
         const ENTRIES_PER_LONG: usize = 64 / 9;
         const LONG_COUNT: usize = 256_usize.div_ceil(ENTRIES_PER_LONG);
         out.extend_from_slice(&(LONG_COUNT as i32).to_be_bytes());
-        let first_air = (SURFACE_Y + 1 - MIN_Y) as u64;
-        for long_index in 0..LONG_COUNT {
-            let count = (256 - long_index * ENTRIES_PER_LONG).min(ENTRIES_PER_LONG);
+        for heights in heights.chunks(ENTRIES_PER_LONG) {
             let mut packed = 0u64;
-            for index in 0..count {
-                packed |= first_air << (index * 9);
+            for (index, &height) in heights.iter().enumerate() {
+                packed |= u64::from(height) << (index * 9);
             }
             out.extend_from_slice(&packed.to_be_bytes());
         }

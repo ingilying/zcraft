@@ -38,7 +38,10 @@ pub async fn serve(
         status: StatusService::from_config(&config)?,
         login: LoginService::from_config(&config).await?,
         configuration,
-        play: crate::handler::play::PlayService::with_max_view_distance(config.max_view_distance)?,
+        play: crate::handler::play::PlayService::with_options(
+            config.max_view_distance,
+            config.game_mode,
+        )?,
     });
     serve_validated(listener, config, server, shutdown).await
 }
@@ -62,6 +65,11 @@ pub async fn serve_with_context(
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "server context view distance must match config.max_view_distance",
+        ));
+    }
+    if server.play.game_mode() != config.game_mode {
+        return Err(crate::protocol::invalid(
+            "server context game mode must match config.game_mode",
         ));
     }
     server.status.validate()?;
@@ -366,7 +374,7 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
             let body = reply.encode()?;
             write_until(&mut transport, &body, writing_until, inbox.as_ref()).await?;
             let sent = Instant::now();
-            crate::handler::play::packet_sent(&mut session, &reply, sent);
+            crate::handler::play::packet_sent(&mut session, &reply, sent)?;
             crate::handler::configuration::packet_sent(&mut session, &reply, sent);
         }
         if received_frame {

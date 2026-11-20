@@ -1,4 +1,4 @@
-//! Minimal spectator-world Play packets for Minecraft Java 1.21.1 (767).
+//! Minimal flat-world Play packets for Minecraft Java 1.21.1 (767).
 //!
 //! Field layouts and packet IDs are taken from PrismarineJS/minecraft-data:
 //! https://github.com/PrismarineJS/minecraft-data/blob/master/data/pc/1.21.1/protocol.json
@@ -7,16 +7,18 @@ use std::{io, sync::Arc};
 use uuid::Uuid;
 
 use crate::{
+    config::GameMode,
     identity::Profile,
     protocol::{Decode, Encode, Reader, invalid, put_string, put_varint},
     world::{SPAWN_X, SPAWN_Y, SPAWN_Z, VIEW_DISTANCE, WORLD_LIMIT},
 };
 
-/// Clientbound 0x2b. A single overworld, dynamic dimension type 0, spectator mode.
+/// Clientbound 0x2b. A single overworld with dynamic dimension type 0.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinGame {
     pub entity_id: i32,
     pub view_distance: i32,
+    pub game_mode: GameMode,
 }
 
 impl Encode for JoinGame {
@@ -32,20 +34,24 @@ impl Encode for JoinGame {
         put_varint(0, out); // SpawnInfo: dynamic dimension type ID.
         put_string("minecraft:overworld", out)?;
         out.extend_from_slice(&0i64.to_be_bytes()); // Hashed seed.
-        out.extend_from_slice(&[3, 0xff, 0, 1, 0]); // Spectator, previous=-1, debug, flat, death absent.
+        out.extend_from_slice(&[self.game_mode.wire_id(), 0xff, 0, 1, 0]); // Mode, previous=-1, debug, flat, death absent.
         put_varint(0, out); // Portal cooldown.
         out.push(0); // Enforces secure chat.
         Ok(())
     }
 }
 
-/// Clientbound 0x38: invulnerable, flying, allowed to fly; not creative.
+/// Clientbound 0x38: game-mode abilities (including creative flight).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlayerAbilities;
+pub struct PlayerAbilities(pub GameMode);
 
 impl Encode for PlayerAbilities {
     fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
-        out.push(0x07);
+        out.push(if self.0 == GameMode::Creative {
+            0x0d
+        } else {
+            0x07
+        });
         out.extend_from_slice(&0.05f32.to_be_bytes());
         out.extend_from_slice(&0.1f32.to_be_bytes());
         Ok(())
@@ -247,6 +253,7 @@ impl Encode for PlayDisconnect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerInfo {
     pub profile: Profile,
+    pub game_mode: GameMode,
 }
 
 impl Encode for PlayerInfo {
@@ -270,7 +277,7 @@ impl Encode for PlayerInfo {
                 put_string(signature, out)?;
             }
         }
-        put_varint(3, out); // Spectator.
+        put_varint(i32::from(self.game_mode.wire_id()), out);
         out.push(1); // Listed boolean (also canonical VarInt 1).
         Ok(())
     }
@@ -545,6 +552,7 @@ mod tests {
         let bytes = encoded(&JoinGame {
             entity_id: 42,
             view_distance: 2,
+            game_mode: GameMode::Spectator,
         });
         let mut reader = Reader::new(&bytes);
         assert_eq!(reader.take(4).unwrap(), 42i32.to_be_bytes());
@@ -583,6 +591,7 @@ mod tests {
             ],
         };
         let bytes = encoded(&PlayerInfo {
+            game_mode: GameMode::Spectator,
             profile: profile.clone(),
         });
         let mut reader = Reader::new(&bytes);
@@ -641,7 +650,7 @@ mod tests {
             [255, 255, 255, 255, 0, 0, 0, 2, 1, 2, 3]
         );
         assert_eq!(encoded(&KeepAlive { id: -42 }), (-42i64).to_be_bytes());
-        let bytes = encoded(&PlayerAbilities);
+        let bytes = encoded(&PlayerAbilities(GameMode::Spectator));
         let mut reader = Reader::new(&bytes);
         assert_eq!(reader.take(1).unwrap(), [7]);
         assert_eq!(f32_field(&mut reader), 0.05);

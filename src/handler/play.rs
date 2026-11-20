@@ -1,13 +1,20 @@
-//! Minimal, read-only spectator world. No authoritative gameplay or persistence yet.
+//! Minimal flat world with spectator and fixed-hotbar creative modes.
+pub(crate) mod blocks;
 mod chunks;
 
 use self::chunks::ChunkStream;
 use super::{Context, Outcome, Session};
 use crate::{
+    config::GameMode,
     players::Peer,
     protocol::{
         Clientbound, invalid,
-        packets::{play::*, play_common::*, play_entities::EntityPose},
+        packets::{
+            play::*,
+            play_blocks::{CreativeHotbar, SelectedSlot},
+            play_common::*,
+            play_entities::EntityPose,
+        },
     },
     world,
 };
@@ -27,6 +34,8 @@ const TELEPORT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct PlayService {
     terrain: Arc<[u8]>,
+    blocks: Option<Arc<world::BlockWorld>>,
+    game_mode: GameMode,
     max_view_distance: i32,
     next_entity: AtomicI32,
 }
@@ -36,12 +45,22 @@ impl PlayService {
     }
 
     pub fn with_max_view_distance(max_view_distance: i32) -> io::Result<Self> {
+        Self::with_options(max_view_distance, GameMode::Spectator)
+    }
+
+    pub fn with_options(max_view_distance: i32, game_mode: GameMode) -> io::Result<Self> {
         world::validate_view_distance(max_view_distance)?;
         Ok(Self {
             terrain: world::chunk_payload(),
+            blocks: (game_mode == GameMode::Creative).then(Arc::default),
+            game_mode,
             max_view_distance,
             next_entity: AtomicI32::new(1),
         })
+    }
+
+    pub fn game_mode(&self) -> GameMode {
+        self.game_mode
     }
 
     pub fn max_view_distance(&self) -> i32 {
@@ -70,6 +89,7 @@ pub struct PlaySession {
     pending_keep_alive: Option<(i64, Instant)>,
     next_keep_alive: Instant,
     chunks: ChunkStream,
+    creative: Option<blocks::CreativeSession>,
 }
 
 pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
@@ -99,7 +119,17 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
     if let Some(slot) = &ctx.session.reservation {
         slot.set_view([0, 0], view_distance);
     }
-    let first_batch = chunks.pump(&ctx.server.play.terrain, now);
+    let mut first_batch = chunks.pump(&ctx.server.play.terrain, now);
+    let mut creative = ctx
+        .server
+        .play
+        .blocks
+        .clone()
+        .map(blocks::CreativeSession::new);
+    if let Some(creative) = &mut creative {
+        creative.prepare_chunks(&mut first_batch);
+    }
+    let game_mode = ctx.server.play.game_mode;
     ctx.session.play = Some(PlaySession {
         entity_id,
         position: [world::SPAWN_X, world::SPAWN_Y, world::SPAWN_Z],
@@ -111,21 +141,26 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         pending_keep_alive: None,
         next_keep_alive: now + KEEP_ALIVE_INTERVAL,
         chunks,
+        creative,
     });
     let mut replies = vec![
         JoinGame {
             entity_id,
             view_distance,
+            game_mode,
         }
         .into(),
-        PlayerInfo { profile }.into(),
-        PlayerAbilities.into(),
+        PlayerInfo { profile, game_mode }.into(),
+        PlayerAbilities(game_mode).into(),
         DefaultSpawnPosition.into(),
         TimeUpdate.into(),
         WorldBorder.into(),
         CenterChunk([0, 0]).into(),
         GameEvent.into(),
     ];
+    if game_mode == GameMode::Creative {
+        replies.extend([Clientbound::from(CreativeHotbar), SelectedSlot(0).into()]);
+    }
     replies.extend(first_batch);
     // The nearest chunks (including spawn) precede the initial teleport.
     // The rest of the view streams independently of teleport confirmation.
@@ -146,15 +181,18 @@ fn play(session: &mut Session) -> io::Result<&mut PlaySession> {
 
 /// The network reports completed writes; response deadlines start when the
 /// request actually leaves the output batch, not when that batch was built.
-pub fn packet_sent(session: &mut Session, packet: &crate::protocol::Clientbound, now: Instant) {
+pub fn packet_sent(session: &mut Session, packet: &Clientbound, now: Instant) -> io::Result<()> {
     let Some(state) = session.play.as_mut() else {
-        return;
+        return Ok(());
     };
     state.chunks.packet_sent(packet, now);
     if let Clientbound::ChunkData(chunk) = packet
         && let Some(slot) = &session.reservation
     {
         slot.chunk_sent(chunk.0);
+        if let Some(creative) = &mut state.creative {
+            creative.chunk_sent(slot, chunk.0)?;
+        }
     }
     match packet {
         crate::protocol::Clientbound::PlayerPosition(packet) => {
@@ -170,6 +208,7 @@ pub fn packet_sent(session: &mut Session, packet: &crate::protocol::Clientbound,
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn closed(reason: &str) -> Outcome {
@@ -249,6 +288,7 @@ pub async fn handle_teleport(
                 pose,
                 info: Clientbound::from(PlayerInfo {
                     profile: profile.clone(),
+                    game_mode: ctx.server.play.game_mode,
                 })
                 .encode()?
                 .into(),
@@ -275,6 +315,14 @@ impl PlaySession {
     fn pose(&self) -> EntityPose {
         EntityPose::new(self.position, self.yaw, self.pitch, self.on_ground)
     }
+
+    fn update_view(&mut self, slot: &crate::players::Reservation) {
+        let (center, radius) = self.chunks.view();
+        slot.set_view(center, radius);
+        if self.creative.is_some() {
+            slot.retire_blocks(&self.chunks.retire_outside());
+        }
+    }
 }
 
 fn movement(
@@ -283,7 +331,13 @@ fn movement(
     rotation: Option<[f32; 2]>,
     on_ground: bool,
 ) -> io::Result<Outcome> {
-    let state = play(ctx.session)?;
+    let slot = ctx.session.reservation.as_ref();
+    let state = ctx
+        .session
+        .play
+        .as_mut()
+        .ok_or_else(|| invalid("Play session not initialized"))?;
+    let old_view = state.chunks.view();
     if state.pending_teleport.is_some() {
         return Ok(Outcome::empty());
     }
@@ -299,12 +353,13 @@ fn movement(
             state.pending_teleport = Some((id, Instant::now()));
             state.position = [world::SPAWN_X, world::SPAWN_Y, world::SPAWN_Z];
             state.chunks.follow(world::SPAWN_X, world::SPAWN_Z);
-            let view = state.chunks.view();
             state.yaw = 0.0;
             state.pitch = 0.0;
             state.on_ground = false;
-            if let Some(slot) = &ctx.session.reservation {
-                slot.set_view(view.0, view.1);
+            if let Some(slot) = slot
+                && old_view != state.chunks.view()
+            {
+                state.update_view(slot);
             }
             return Ok(Outcome {
                 replies: vec![PlayerPosition { teleport_id: id }.into()],
@@ -321,10 +376,9 @@ fn movement(
     }
     state.on_ground = on_ground;
     let pose = state.pose();
-    let view = state.chunks.view();
-    if let Some(slot) = &ctx.session.reservation {
-        if position.is_some() {
-            slot.set_view(view.0, view.1);
+    if let Some(slot) = slot {
+        if old_view != state.chunks.view() {
+            state.update_view(slot);
         }
         slot.update_pose(pose);
     }
@@ -364,7 +418,11 @@ pub fn stream_chunks(
     service: &PlayService,
     now: Instant,
 ) -> io::Result<Outcome> {
-    let packets = play(session)?.chunks.pump(&service.terrain, now);
+    let state = play(session)?;
+    let mut packets = state.chunks.pump(&service.terrain, now);
+    if let Some(creative) = &mut state.creative {
+        creative.prepare_chunks(&mut packets);
+    }
     let mut replies = Vec::new();
     if let Some(slot) = &session.reservation {
         let unloaded: std::collections::HashSet<_> = packets
@@ -393,11 +451,16 @@ pub async fn handle_information(
     packet: PlayClientInformation,
 ) -> io::Result<Outcome> {
     let distance = ctx.server.play.view_distance(Some(&packet.0));
-    let chunks = &mut play(ctx.session)?.chunks;
-    chunks.set_radius(distance);
-    let (center, radius) = chunks.view();
-    if let Some(slot) = &ctx.session.reservation {
-        slot.set_view(center, radius);
+    let state = ctx
+        .session
+        .play
+        .as_mut()
+        .ok_or_else(|| invalid("Play session not initialized"))?;
+    if state.chunks.view().1 != distance {
+        state.chunks.set_radius(distance);
+        if let Some(slot) = &ctx.session.reservation {
+            state.update_view(slot);
+        }
     }
     ctx.session.client_information = Some(packet.0);
     Ok(Outcome::empty())
@@ -446,6 +509,7 @@ mod tests {
                 pending_keep_alive: None,
                 next_keep_alive: now,
                 chunks: ChunkStream::new(2, now),
+                creative: None,
             }),
             ..Session::default()
         };

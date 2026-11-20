@@ -30,6 +30,7 @@ function expected (x, z) {
 let registries = 0
 let heartbeats = 0
 let positioned = false
+let spectatorAck = false
 let joined = false
 let completed = false
 let finishTimer
@@ -71,6 +72,7 @@ client.on('packet', (packet, meta) => {
       assert.equal(packet.y, 65)
       client.write('teleport_confirm', { teleportId: packet.teleportId })
       client.write('position', { x: 8.5, y: 65, z: 8.5, onGround: false })
+      client.write('block_dig', { status: 0, location: { x: 8, y: 63, z: 8 }, face: 1, sequence: 1 })
     }
     if (meta.name === 'update_view_position') center = key(packet.chunkX, packet.chunkZ)
     if (meta.name === 'unload_chunk') {
@@ -110,13 +112,15 @@ client.on('packet', (packet, meta) => {
         }
       }
     }
+    if (meta.name === 'acknowledge_player_digging') spectatorAck = packet.sequenceId === 1
+    assert.notEqual(meta.name, 'block_change', 'spectator must not edit terrain')
     if (meta.name === 'keep_alive') heartbeats++
   } catch (error) { fail(error) }
 })
 finishTimer = setTimeout(() => {
   if (completed) return
   try {
-    assert(joined && positioned)
+    assert(joined && positioned && spectatorAck)
     assert.equal(registries, 11)
     assert.equal(step, route.length)
     assert.equal(chunks, 80)

@@ -11,6 +11,23 @@ use std::{
 pub const DEFAULT_CONFIG_PATH: &str = "zcraft.toml";
 pub const DEFAULT_COMPRESSION_THRESHOLD: i32 = 256;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GameMode {
+    #[default]
+    Spectator,
+    Creative,
+}
+
+impl GameMode {
+    pub(crate) fn wire_id(self) -> u8 {
+        match self {
+            Self::Creative => 1,
+            Self::Spectator => 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -21,6 +38,7 @@ pub struct Config {
     pub max_players: u32,
     /// Maximum per-player chunk radius (2–16). Smaller client settings win.
     pub max_view_distance: i32,
+    pub game_mode: GameMode,
     /// Disables Mojang verification. Unsafe on untrusted networks.
     pub offline_mode: bool,
     pub max_connections: usize,
@@ -93,6 +111,7 @@ impl Default for Config {
             server_icon: "server-icon.png".into(),
             max_players: 20,
             max_view_distance: crate::world::VIEW_DISTANCE,
+            game_mode: GameMode::default(),
             offline_mode: false,
             max_connections: 1024,
             compression_threshold: DEFAULT_COMPRESSION_THRESHOLD,

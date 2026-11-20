@@ -55,6 +55,7 @@ struct Registry {
     // Both indexes only contain visible, non-lagged Play sessions.
     entities: ChunkIndex,
     watchers: ChunkIndex,
+    block_watchers: ChunkIndex,
 }
 
 #[derive(Debug)]
@@ -97,6 +98,21 @@ impl Slot {
             self.signals.ready.notify_one();
             true
         }
+    }
+
+    fn discard_terrain(&mut self, chunks: &HashSet<Chunk>) {
+        self.queue.retain_mut(|delivery| {
+            if let Delivery::Terrain { chunk, ack, .. } = delivery
+                && chunks.contains(chunk)
+            {
+                if let Some(body) = ack.take() {
+                    *delivery = Delivery::Packet(body);
+                    return true;
+                }
+                return false;
+            }
+            true
+        });
     }
 
     fn tracks(&self, chunk: Chunk) -> bool {
@@ -172,6 +188,11 @@ pub(crate) struct Peer {
 #[derive(Debug)]
 pub(crate) enum Delivery {
     Packet(Arc<[u8]>),
+    Terrain {
+        chunk: Chunk,
+        updates: Arc<[Arc<[u8]>]>,
+        ack: Option<Arc<[u8]>>,
+    },
     Add {
         peer: Peer,
         spawn: bool,
@@ -193,8 +214,18 @@ impl Delivery {
     pub(crate) fn bodies(self) -> io::Result<impl Iterator<Item = Arc<[u8]>> + Send> {
         let mut bodies = [None, None];
         let encode = |packet: Clientbound| packet.encode().map(Arc::<[u8]>::from);
+        let mut terrain = None;
+        let mut ack = None;
         match self {
             Self::Packet(body) => bodies[0] = Some(body),
+            Self::Terrain {
+                updates,
+                ack: sequence,
+                ..
+            } => {
+                terrain = Some(updates);
+                ack = sequence;
+            }
             Self::Add { peer, spawn } => {
                 bodies[0] = Some(peer.info);
                 if spawn {
@@ -228,7 +259,13 @@ impl Delivery {
                 }
             }
         }
-        Ok(bodies.into_iter().flatten())
+        let mut index = 0;
+        let updates = std::iter::from_fn(move || {
+            let body = terrain.as_ref()?.get(index)?.clone();
+            index += 1;
+            Some(body)
+        });
+        Ok(bodies.into_iter().flatten().chain(updates).chain(ack))
     }
 }
 
@@ -244,6 +281,25 @@ fn pose_chunk(pose: EntityPose) -> Chunk {
 }
 
 impl Registry {
+    fn enqueue_terrain(
+        &mut self,
+        uuid: Uuid,
+        chunk: Chunk,
+        updates: Arc<[Arc<[u8]>]>,
+        ack: Option<Arc<[u8]>>,
+    ) {
+        if let Some(slot) = self.players.get_mut(&uuid)
+            && !slot.lagged
+            && !slot.enqueue(Delivery::Terrain {
+                chunk,
+                updates,
+                ack,
+            })
+        {
+            self.deactivate(uuid);
+        }
+    }
+
     fn withdraw(&mut self, source: Uuid) {
         for slot in self.players.values_mut() {
             slot.dirty.remove(&source);
@@ -545,6 +601,55 @@ impl Reservation {
         }
     }
 
+    /// Called under the shared world edit lock, after the chunk write. Even
+    /// before teleport confirmation terrain needs updates; entity visibility
+    /// is activated separately by `show`.
+    pub(crate) fn watch_blocks(&self, chunk: Chunk, catchup: Arc<[Arc<[u8]>]>) {
+        let mut registry = lock(&self.0.registry);
+        let uuid = self.0.uuid;
+        registry.block_watchers.insert(chunk, uuid);
+        if !catchup.is_empty() {
+            registry.enqueue_terrain(uuid, chunk, catchup, None);
+        }
+    }
+
+    /// The world lock orders edits, snapshot reconciliation and queued updates.
+    pub(crate) fn publish_blocks(&self, chunk: Chunk, updates: Arc<[Arc<[u8]>]>, ack: Arc<[u8]>) {
+        let mut registry = lock(&self.0.registry);
+        let viewers: Vec<_> = registry.block_watchers.at(chunk).collect();
+        for viewer in viewers {
+            let ack = (viewer == self.0.uuid).then(|| ack.clone());
+            registry.enqueue_terrain(viewer, chunk, updates.clone(), ack);
+        }
+    }
+
+    pub(crate) fn correct_blocks(&self, corrections: Vec<(Chunk, Arc<[u8]>)>, ack: Arc<[u8]>) {
+        let mut registry = lock(&self.0.registry);
+        let uuid = self.0.uuid;
+        for (chunk, body) in corrections {
+            registry.enqueue_terrain(uuid, chunk, Arc::from([body]), None);
+        }
+        if let Some(slot) = self.0.slot(&mut registry)
+            && !slot.lagged
+            && !slot.enqueue(Delivery::Packet(ack))
+        {
+            registry.deactivate(uuid);
+        }
+    }
+
+    pub(crate) fn retire_blocks(&self, chunks: &HashSet<Chunk>) {
+        if chunks.is_empty() {
+            return;
+        }
+        let mut registry = lock(&self.0.registry);
+        for &chunk in chunks {
+            registry.block_watchers.remove(chunk, self.0.uuid);
+        }
+        if let Some(slot) = self.0.slot(&mut registry) {
+            slot.discard_terrain(chunks);
+        }
+    }
+
     pub(crate) fn before_unload(&self, chunks: &HashSet<Chunk>) -> Vec<Clientbound> {
         let mut registry = lock(&self.0.registry);
         let Registry {
@@ -578,9 +683,12 @@ impl Reservation {
         slot.dirty.clear();
         slot.departed.clear();
         slot.view = None;
-        slot.sent_chunks.clear();
+        let chunks = std::mem::take(&mut slot.sent_chunks);
         slot.wire_entities.0.clear();
         let known = std::mem::take(&mut slot.known);
+        for chunk in chunks {
+            registry.block_watchers.remove(chunk, self.0.uuid);
+        }
         drop(registry);
         // Fixed-size chunks bound the wire size even with a large max_players.
         let mut known = known.into_iter().peekable();
@@ -608,6 +716,9 @@ impl Drop for Reservation {
         let mut registry = lock(&self.0.registry);
         registry.deactivate(self.0.uuid);
         let slot = registry.players.remove(&self.0.uuid).expect("owned slot");
+        for chunk in slot.sent_chunks {
+            registry.block_watchers.remove(chunk, self.0.uuid);
+        }
         if slot.online {
             registry.online -= 1;
         }

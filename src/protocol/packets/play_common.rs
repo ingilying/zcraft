@@ -2,7 +2,7 @@ use super::common::{ClientInformation, PluginMessage};
 use crate::protocol::{Decode, Reader};
 use std::io;
 
-// Explicitly unsupported actions in the read-only world. Bound and discard;
+// Explicitly unsupported actions. Bound and discard;
 // none can mutate the world, authenticate a player or broadcast chat.
 macro_rules! ignored {
     ($($name:ident),* $(,)?) => {$(
@@ -23,11 +23,9 @@ ignored!(
     IgnoredClientCommand,
     IgnoredTabComplete,
     IgnoredCloseWindow,
-    IgnoredPlayerDigging,
     IgnoredAdvancementTab,
     IgnoredSpectate,
-    IgnoredBlockPlace,
-    IgnoredUseItem
+    IgnoredInventoryClick
 );
 
 #[derive(Debug, PartialEq, Eq)]

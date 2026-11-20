@@ -28,6 +28,9 @@ pub(super) struct ChunkStream {
     radius: i32,
     advertised_radius: i32,
     loaded: BTreeSet<Chunk>,
+    // A creative chunk whose subscription was removed must reload even if
+    // the client moves back into range before its unload is written.
+    retiring: BTreeSet<Chunk>,
     // Old chunks are drained before adding any new ones, so the set never
     // exceeds the largest possible view square, even on huge jumps.
     unload_remaining: bool,
@@ -45,6 +48,7 @@ impl ChunkStream {
             radius,
             advertised_radius: radius,
             loaded: BTreeSet::new(),
+            retiring: BTreeSet::new(),
             unload_remaining: false,
             batch: None,
             batch_size: MAX_BATCH,
@@ -65,6 +69,23 @@ impl ChunkStream {
         (self.center, self.radius)
     }
 
+    pub(super) fn tracks(&self, [x, z]: Chunk) -> bool {
+        let [cx, cz] = self.center;
+        (x - cx).abs().max((z - cz).abs()) <= self.radius
+            && self.loaded.contains(&[x, z])
+            && !self.retiring.contains(&[x, z])
+    }
+
+    pub(super) fn retire_outside(&mut self) -> std::collections::HashSet<Chunk> {
+        let [cx, cz] = self.center;
+        self.loaded
+            .iter()
+            .copied()
+            .filter(|&[x, z]| (x - cx).abs().max((z - cz).abs()) > self.radius)
+            .filter(|&chunk| self.retiring.insert(chunk))
+            .collect()
+    }
+
     fn desired_count(&self) -> usize {
         (2 * self.radius + 1).pow(2) as usize
     }
@@ -73,6 +94,7 @@ impl ChunkStream {
         if self.center != self.advertised_center
             || self.radius != self.advertised_radius
             || self.unload_remaining
+            || !self.retiring.is_empty()
         {
             Some(self.next)
         } else if self.batch.is_none() && self.loaded.len() < self.desired_count() {
@@ -97,10 +119,9 @@ impl ChunkStream {
             replies.push(CenterChunk(self.center).into());
         }
         let [cx, cz] = self.center;
-        let mut outside = self
-            .loaded
-            .iter()
-            .filter(|&&[x, z]| (x - cx).abs().max((z - cz).abs()) > self.radius);
+        let mut outside = self.loaded.iter().filter(|&&[x, z]| {
+            (x - cx).abs().max((z - cz).abs()) > self.radius || self.retiring.contains(&[x, z])
+        });
         replies.extend(
             outside
                 .by_ref()
@@ -151,6 +172,7 @@ impl ChunkStream {
             }
             Clientbound::ForgetChunk(packet) => {
                 self.loaded.remove(&packet.0);
+                self.retiring.remove(&packet.0);
             }
             Clientbound::ChunkBatchFinished(_) => {
                 self.batch = Some(Batch::AwaitFeedback(now));
