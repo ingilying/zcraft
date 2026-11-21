@@ -25,6 +25,7 @@ pub struct Session {
     pub client_information: Option<crate::protocol::packets::common::ClientInformation>,
     pub play: Option<play::PlaySession>,
     pub(crate) entity_id: Option<i32>,
+    chat_rate: play::chat::ChatRate,
 }
 
 impl Session {
@@ -58,6 +59,7 @@ impl Default for Session {
             client_information: None,
             play: None,
             entity_id: None,
+            chat_rate: play::chat::ChatRate::default(),
         }
     }
 }

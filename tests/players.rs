@@ -27,7 +27,7 @@ fn services(max_players: u32) -> Arc<ServerContext> {
         status: StatusService::new("test", max_players),
         login: LoginService::offline(),
         play: PlayService::new().unwrap(),
-        configuration: ConfigurationService::new().unwrap(),
+        configuration: ConfigurationService::new(),
     })
 }
 

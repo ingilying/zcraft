@@ -3,6 +3,7 @@ use super::{Context, Outcome};
 use crate::{
     auth::{AuthService, offline_profile, valid_username},
     config::Config,
+    handler::configuration::ConfigurationPhase,
     identity::Profile,
     protocol::{
         State, invalid,
@@ -178,5 +179,6 @@ pub async fn handle_acknowledged(
     }
     ctx.session.login = LoginPhase::Finished;
     ctx.session.state = State::Configuration;
+    ctx.session.configuration = ConfigurationPhase::NotStarted;
     super::configuration::begin(ctx)
 }

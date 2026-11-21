@@ -79,7 +79,7 @@ async fn start_with_threshold(
     let server = Arc::new(ServerContext {
         status: StatusService::new("test", 20),
         login,
-        configuration: zcraft::handler::configuration::ConfigurationService::new().unwrap(),
+        configuration: zcraft::handler::configuration::ConfigurationService::new(),
         play: zcraft::handler::play::PlayService::new().unwrap(),
     });
     let (stop, stopped) = oneshot::channel();
@@ -146,19 +146,19 @@ async fn configuration_end(client: &mut Transport<TcpStream>) {
     client.write_frame(&information).await.unwrap();
     client.write_frame(&[7, 0]).await.unwrap(); // Selected Known Packs: empty
 
-    let expected = zcraft::registry_data::registry_packets().unwrap();
+    let expected = zcraft::registry_data::registry_packets();
     for registry in expected {
         let frame = client.read_frame().await.unwrap().unwrap();
         assert_eq!(frame[0], 7);
         assert_eq!(&frame[1..], registry);
     }
     let mut expected_tags = vec![0x0d];
-    expected_tags.extend(zcraft::registry_data::tags_packet().unwrap());
+    expected_tags.extend(zcraft::registry_data::tags_packet());
     assert_eq!(client.read_frame().await.unwrap().unwrap(), expected_tags);
     assert_eq!(client.read_frame().await.unwrap().unwrap(), [3]); // Finish Configuration
     client.write_frame(&[3]).await.unwrap(); // Acknowledge Finish
 
-    let expected_ids = [0x2b, 0x3e, 0x38, 0x56, 0x64, 0x25, 0x54, 0x22, 0x0d];
+    let expected_ids = [0x2b, 0x3e, 0x38, 0x56, 0x64, 0x25, 0x54, 0x22, 0x11, 0x0d];
     let mut entity = 0;
     for id in expected_ids {
         let frame = client.read_frame().await.unwrap().unwrap();

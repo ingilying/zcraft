@@ -1,5 +1,6 @@
 //! Minimal flat world with spectator and fixed-hotbar creative modes.
 pub(crate) mod blocks;
+pub(crate) mod chat;
 mod chunks;
 
 use self::chunks::ChunkStream;
@@ -12,6 +13,7 @@ use crate::{
         packets::{
             play::*,
             play_blocks::{CreativeHotbar, SelectedSlot},
+            play_chat::DeclareCommands,
             play_common::*,
             play_entities::EntityPose,
         },
@@ -36,6 +38,7 @@ pub struct PlayService {
     terrain: Arc<[u8]>,
     blocks: Option<Arc<world::BlockWorld>>,
     game_mode: GameMode,
+    commands: crate::command::CommandRegistry,
     max_view_distance: i32,
     next_entity: AtomicI32,
 }
@@ -54,9 +57,20 @@ impl PlayService {
             terrain: world::chunk_payload(),
             blocks: (game_mode == GameMode::Creative).then(Arc::default),
             game_mode,
+            commands: crate::command::CommandRegistry::default(),
             max_view_distance,
             next_entity: AtomicI32::new(1),
         })
+    }
+
+    /// Install a validated immutable registry before serving connections.
+    pub fn with_commands(mut self, commands: crate::command::CommandRegistry) -> Self {
+        self.commands = commands;
+        self
+    }
+
+    pub fn commands(&self) -> &crate::command::CommandRegistry {
+        &self.commands
     }
 
     pub fn game_mode(&self) -> GameMode {
@@ -130,6 +144,7 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         creative.prepare_chunks(&mut first_batch);
     }
     let game_mode = ctx.server.play.game_mode;
+    let command_source = crate::command::CommandSource::player(profile.uuid);
     ctx.session.play = Some(PlaySession {
         entity_id,
         position: [world::SPAWN_X, world::SPAWN_Y, world::SPAWN_Z],
@@ -157,6 +172,7 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         WorldBorder.into(),
         CenterChunk([0, 0]).into(),
         GameEvent.into(),
+        DeclareCommands::new(ctx.server.play.commands(), &command_source).into(),
     ];
     if game_mode == GameMode::Creative {
         replies.extend([Clientbound::from(CreativeHotbar), SelectedSlot(0).into()]);
@@ -282,8 +298,15 @@ pub async fn handle_teleport(
         if ctx.session.configuration == super::configuration::ConfigurationPhase::Finished
             && let Some(slot) = &ctx.session.reservation
         {
+            slot.set_chat_mode(
+                ctx.session
+                    .client_information
+                    .as_ref()
+                    .map_or(0, |info| info.chat_mode),
+            );
             slot.show(Peer {
                 uuid: profile.uuid,
+                name: Arc::from(profile.name.as_str()),
                 id: entity_id,
                 pose,
                 info: Clientbound::from(PlayerInfo {
@@ -461,6 +484,9 @@ pub async fn handle_information(
         if let Some(slot) = &ctx.session.reservation {
             state.update_view(slot);
         }
+    }
+    if let Some(slot) = &ctx.session.reservation {
+        slot.set_chat_mode(packet.0.chat_mode);
     }
     ctx.session.client_information = Some(packet.0);
     Ok(Outcome::empty())

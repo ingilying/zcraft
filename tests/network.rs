@@ -75,7 +75,7 @@ async fn state_packet_validation_and_dispatch() {
     let server = ServerContext {
         status: StatusService::new("test", 20),
         login: zcraft::handler::login::LoginService::offline(),
-        configuration: zcraft::handler::configuration::ConfigurationService::new().unwrap(),
+        configuration: zcraft::handler::configuration::ConfigurationService::new(),
         play: zcraft::handler::play::PlayService::new().unwrap(),
     };
     let mut session = Session::default();

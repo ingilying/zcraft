@@ -9,6 +9,18 @@ pub struct ServerContext {
 }
 
 impl ServerContext {
+    /// Execute a trusted server command without a player connection. Permission
+    /// and source are assigned by the caller, never taken from a client packet.
+    pub fn execute_command(
+        &self,
+        source: &crate::command::CommandSource,
+        input: &str,
+    ) -> std::io::Result<crate::command::CommandResult> {
+        self.play
+            .commands()
+            .execute(input, source, &mut self.players())
+    }
+
     /// Shared admission, presence, and broadcast service.
     pub fn players(&self) -> &crate::players::Players {
         self.status.players()

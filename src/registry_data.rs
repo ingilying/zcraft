@@ -1,7 +1,6 @@
 //! Official Java 1.21.1 registries generated at build time.
 //! Acquisition, JSON conversion and NBT encoding live in build_support/.
 //! Runtime only copies pre-encoded packet bodies; no JSON parsing or downloads.
-use std::io;
 
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/registries.rs"));
@@ -11,17 +10,17 @@ pub use generated::{
     SOURCE_JAR_SHA1, TAG_COUNTS, TAG_REGISTRY_NAMES,
 };
 
-pub fn registry_packets() -> io::Result<Vec<Vec<u8>>> {
-    Ok(generated::REGISTRY_PACKETS
+pub fn registry_packets() -> Vec<Vec<u8>> {
+    generated::REGISTRY_PACKETS
         .iter()
         .map(|packet| packet.to_vec())
-        .collect())
+        .collect()
 }
 
 /// Full vanilla network-safe tags, using the same dynamic registry IDs as
 /// `registry_packets()` and official static registry IDs (not block state IDs).
-pub fn tags_packet() -> io::Result<Vec<u8>> {
-    Ok(generated::TAGS_PACKET.to_vec())
+pub fn tags_packet() -> Vec<u8> {
+    generated::TAGS_PACKET.to_vec()
 }
 
 #[cfg(test)]
@@ -126,8 +125,8 @@ mod tests {
             ("minecraft:enchantment", 42),
             ("minecraft:jukebox_song", 19),
         ];
-        let packets = registry_packets().unwrap();
-        assert_eq!(packets, registry_packets().unwrap());
+        let packets = registry_packets();
+        assert_eq!(packets, registry_packets());
         assert_eq!(packets.len(), expected.len());
         for (packet, (name, count)) in packets.iter().zip(expected) {
             assert!(packet.len() < MAX_PACKET_BYTES);
@@ -162,6 +161,6 @@ mod tests {
         assert_eq!(REGISTRY_COUNTS.iter().sum::<usize>(), 313);
         assert_eq!(TAG_REGISTRY_NAMES.len(), 13);
         assert_eq!(TAG_COUNTS.iter().sum::<usize>(), 514);
-        assert!(tags_packet().unwrap().len() > 1);
+        assert!(tags_packet().len() > 1);
     }
 }

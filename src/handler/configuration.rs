@@ -18,23 +18,29 @@ pub struct ConfigurationService {
     tags: Arc<[u8]>,
     resource_pack: Option<AddResourcePack>,
 }
+impl Default for ConfigurationService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConfigurationService {
-    pub fn new() -> io::Result<Self> {
-        Ok(Self {
-            registries: registry_data::registry_packets()?
+    pub fn new() -> Self {
+        Self {
+            registries: registry_data::registry_packets()
                 .into_iter()
                 .map(Arc::from)
                 .collect(),
-            tags: registry_data::tags_packet()?.into(),
+            tags: registry_data::tags_packet().into(),
             resource_pack: None,
-        })
+        }
     }
 
     /// Embedders may opt in to one vanilla pack; none is requested by default.
     pub fn with_resource_pack(mut self, pack: ResourcePackConfig) -> io::Result<Self> {
         pack.validate()?;
         self.resource_pack = Some(AddResourcePack {
-            id: uuid::Uuid::parse_str(&pack.id).map_err(|_| invalid("invalid pack UUID"))?,
+            id: uuid::Uuid::parse_str(&pack.id).unwrap(),
             url: pack.url,
             sha1: pack.sha1,
             required: pack.required,
@@ -83,11 +89,6 @@ pub fn deadline(session: &Session) -> Option<Instant> {
 }
 
 pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
-    if ctx.session.state != State::Configuration
-        || ctx.session.configuration != ConfigurationPhase::NotStarted
-    {
-        return Err(invalid("configuration already started or wrong state"));
-    }
     ctx.session.configuration = ConfigurationPhase::AwaitKnownPacks;
     ctx.session.configuration_runtime = Some(ConfigurationSession::new(Instant::now()));
     Ok(Outcome {

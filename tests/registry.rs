@@ -17,7 +17,7 @@ async fn typed_inbound_conversion_and_generated_routing() {
     let server = ServerContext {
         status: StatusService::new("test", 20),
         login: zcraft::handler::login::LoginService::offline(),
-        configuration: zcraft::handler::configuration::ConfigurationService::new().unwrap(),
+        configuration: zcraft::handler::configuration::ConfigurationService::new(),
         play: zcraft::handler::play::PlayService::new().unwrap(),
     };
     let mut session = Session::default();
@@ -77,7 +77,7 @@ async fn direct_packet_construction_cannot_bypass_state_guard() {
     let server = ServerContext {
         status: StatusService::new("test", 20),
         login: zcraft::handler::login::LoginService::offline(),
-        configuration: zcraft::handler::configuration::ConfigurationService::new().unwrap(),
+        configuration: zcraft::handler::configuration::ConfigurationService::new(),
         play: zcraft::handler::play::PlayService::new().unwrap(),
     };
     assert!(

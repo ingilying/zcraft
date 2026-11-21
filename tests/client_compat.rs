@@ -30,13 +30,19 @@ async fn independent_protocol_clients_edit_and_reload_blocks() {
     check_client("check-blocks.cjs", GameMode::Creative).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Node.js and minecraft-protocol via NODE_PATH"]
+async fn independent_protocol_clients_chat_and_run_commands() {
+    check_client("check-chat.cjs", GameMode::Spectator).await;
+}
+
 async fn check_client(script: &'static str, mode: GameMode) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = Arc::new(ServerContext {
         status: StatusService::new("test", 20),
         login: LoginService::offline(),
-        configuration: ConfigurationService::new().unwrap(),
+        configuration: ConfigurationService::new(),
         play: PlayService::with_options(Config::default().max_view_distance, mode).unwrap(),
     });
     let (stop, stopped) = oneshot::channel();

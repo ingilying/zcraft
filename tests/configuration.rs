@@ -42,7 +42,7 @@ fn services() -> ServerContext {
     ServerContext {
         status: StatusService::new("test", 20),
         login: LoginService::offline(),
-        configuration: ConfigurationService::new().unwrap(),
+        configuration: ConfigurationService::new(),
         play: PlayService::new().unwrap(),
     }
 }

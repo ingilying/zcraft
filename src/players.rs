@@ -1,8 +1,10 @@
 //! Authenticated connection reservations and bounded Play packet fanout.
+mod chat;
 use crate::{
     protocol::{Clientbound, invalid, packets::play_entities::*},
     world::chunk_at,
 };
+pub(crate) use chat::ChatRequest;
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque, hash_map::Entry},
     io,
@@ -63,6 +65,7 @@ struct Slot {
     signals: Arc<Signals>,
     online: bool,
     receiving: bool,
+    chat_mode: i32,
     lagged: bool,
     queue: VecDeque<Delivery>,
     visible: Option<Peer>,
@@ -180,6 +183,7 @@ impl Slot {
 #[derive(Debug, Clone)]
 pub(crate) struct Peer {
     pub uuid: Uuid,
+    pub name: Arc<str>,
     pub id: i32,
     pub pose: EntityPose,
     pub info: Arc<[u8]>,
@@ -188,6 +192,10 @@ pub(crate) struct Peer {
 #[derive(Debug)]
 pub(crate) enum Delivery {
     Packet(Arc<[u8]>),
+    Chat {
+        body: Arc<[u8]>,
+        private: bool,
+    },
     Terrain {
         chunk: Chunk,
         updates: Arc<[Arc<[u8]>]>,
@@ -217,7 +225,7 @@ impl Delivery {
         let mut terrain = None;
         let mut ack = None;
         match self {
-            Self::Packet(body) => bodies[0] = Some(body),
+            Self::Packet(body) | Self::Chat { body, .. } => bodies[0] = Some(body),
             Self::Terrain {
                 updates,
                 ack: sequence,
@@ -403,6 +411,7 @@ impl Players {
                     signals: signals.clone(),
                     online: false,
                     receiving: false,
+                    chat_mode: 0,
                     lagged: false,
                     queue: VecDeque::new(),
                     visible: None,
@@ -894,6 +903,7 @@ mod tests {
     fn peer(i: u128) -> Peer {
         Peer {
             uuid: Uuid::from_u128(i),
+            name: Arc::from(format!("Player{i}")),
             id: i as i32,
             pose: EntityPose::new([0.0; 3], 0.0, 0.0, false),
             info: Arc::from([0x3e]),

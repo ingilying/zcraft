@@ -106,28 +106,7 @@ impl Encode for AddResourcePack {
         out.push(u8::from(self.required));
         out.push(u8::from(self.prompt.is_some()));
         if let Some(prompt) = &self.prompt {
-            // Anonymous TAG_String text component, encoded with Java modified
-            // UTF-8 (including NUL and UTF-16 surrogate pairs).
-            let mut bytes = Vec::new();
-            for unit in prompt.encode_utf16() {
-                match unit {
-                    1..=0x7f => bytes.push(unit as u8),
-                    0..=0x7ff => {
-                        bytes.push(0xc0 | (unit >> 6) as u8);
-                        bytes.push(0x80 | (unit & 0x3f) as u8);
-                    }
-                    _ => {
-                        bytes.push(0xe0 | (unit >> 12) as u8);
-                        bytes.push(0x80 | ((unit >> 6) & 0x3f) as u8);
-                        bytes.push(0x80 | (unit & 0x3f) as u8);
-                    }
-                }
-            }
-            let length = u16::try_from(bytes.len())
-                .map_err(|_| invalid("resource pack prompt exceeds NBT string limit"))?;
-            out.push(8);
-            out.extend_from_slice(&length.to_be_bytes());
-            out.extend_from_slice(&bytes);
+            super::common::put_nbt_text(prompt, out)?;
         }
         Ok(())
     }

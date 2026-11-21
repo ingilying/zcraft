@@ -13,6 +13,35 @@ pub struct ClientInformation {
     pub server_listing: bool,
 }
 
+/// An anonymous TAG_String text component using Java modified UTF-8.
+pub(super) fn put_nbt_text(text: &str, out: &mut Vec<u8>) -> io::Result<()> {
+    // Modified UTF-8 never uses fewer bytes than standard UTF-8.
+    if text.len() > u16::MAX as usize {
+        return Err(invalid("text exceeds NBT string limit"));
+    }
+    let mut bytes = Vec::with_capacity(text.len());
+    for unit in text.encode_utf16() {
+        match unit {
+            1..=0x7f => bytes.push(unit as u8),
+            0..=0x7ff => {
+                bytes.push(0xc0 | (unit >> 6) as u8);
+                bytes.push(0x80 | (unit & 0x3f) as u8);
+            }
+            _ => {
+                bytes.push(0xe0 | (unit >> 12) as u8);
+                bytes.push(0x80 | ((unit >> 6) & 0x3f) as u8);
+                bytes.push(0x80 | (unit & 0x3f) as u8);
+            }
+        }
+    }
+    let length =
+        u16::try_from(bytes.len()).map_err(|_| invalid("text exceeds NBT string limit"))?;
+    out.push(8);
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(&bytes);
+    Ok(())
+}
+
 fn boolean(reader: &mut Reader<'_>) -> io::Result<bool> {
     match reader.take(1)?[0] {
         0 => Ok(false),

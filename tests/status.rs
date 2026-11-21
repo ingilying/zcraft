@@ -23,7 +23,7 @@ async fn dispatcher_uses_caller_services_without_retaining_status() {
         let server = ServerContext {
             status: StatusService::new(motd, 20),
             login: zcraft::handler::login::LoginService::offline(),
-            configuration: zcraft::handler::configuration::ConfigurationService::new().unwrap(),
+            configuration: zcraft::handler::configuration::ConfigurationService::new(),
             play: zcraft::handler::play::PlayService::new().unwrap(),
         };
         let mut session = Session::default();

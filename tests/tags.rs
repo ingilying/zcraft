@@ -86,7 +86,7 @@ fn skip_nbt(kind: u8, reader: &mut Reader<'_>) {
 
 fn dynamic_ids() -> BTreeMap<String, Vec<String>> {
     let mut ids = BTreeMap::new();
-    for packet in registry_data::registry_packets().unwrap() {
+    for packet in registry_data::registry_packets() {
         let mut reader = Reader::new(&packet);
         let registry = reader.string(32767).unwrap();
         let mut entries = Vec::new();
@@ -104,8 +104,8 @@ fn dynamic_ids() -> BTreeMap<String, Vec<String>> {
 
 #[test]
 fn full_update_tags_is_deterministic_complete_bounded_and_uses_valid_registry_ids() {
-    let packet = registry_data::tags_packet().unwrap();
-    assert_eq!(packet, registry_data::tags_packet().unwrap());
+    let packet = registry_data::tags_packet();
+    assert_eq!(packet, registry_data::tags_packet());
     assert!(packet.len() < 2_097_150);
     let wire = decode_tags(&packet);
     let expected = [
@@ -185,7 +185,7 @@ fn fresh_official_jar_tags_resolve_to_the_exact_runtime_bytes_when_source_is_ava
     let first = tags::generate(directory.path(), &ids).unwrap();
     let second = tags::generate(directory.path(), &ids).unwrap();
     assert_eq!(first.body, second.body);
-    assert_eq!(first.body, registry_data::tags_packet().unwrap());
+    assert_eq!(first.body, registry_data::tags_packet());
     assert_eq!(
         first.counts.iter().map(|(_, count)| count).sum::<usize>(),
         514

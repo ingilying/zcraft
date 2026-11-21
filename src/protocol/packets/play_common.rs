@@ -17,9 +17,6 @@ macro_rules! ignored {
     )*};
 }
 ignored!(
-    IgnoredChatCommand,
-    IgnoredSignedCommand,
-    IgnoredChatMessage,
     IgnoredClientCommand,
     IgnoredTabComplete,
     IgnoredCloseWindow,

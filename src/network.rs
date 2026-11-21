@@ -30,7 +30,7 @@ pub async fn serve(
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
     config.validate()?;
-    let mut configuration = crate::handler::configuration::ConfigurationService::new()?;
+    let mut configuration = crate::handler::configuration::ConfigurationService::new();
     if let Some(pack) = &config.resource_pack {
         configuration = configuration.with_resource_pack(pack.clone())?;
     }
