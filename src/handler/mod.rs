@@ -26,6 +26,7 @@ pub struct Session {
     pub play: Option<play::PlaySession>,
     pub(crate) entity_id: Option<i32>,
     chat_rate: play::chat::ChatRate,
+    next_completion: Option<tokio::time::Instant>,
 }
 
 impl Session {
@@ -60,6 +61,7 @@ impl Default for Session {
             play: None,
             entity_id: None,
             chat_rate: play::chat::ChatRate::default(),
+            next_completion: None,
         }
     }
 }

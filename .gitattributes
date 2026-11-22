@@ -1,0 +1,2 @@
+# Oracle TSV preserves an empty final column as a trailing tab.
+tests/fixtures/brigadier-1.3.10.tsv whitespace=-blank-at-eol

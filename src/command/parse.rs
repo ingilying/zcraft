@@ -1,46 +1,66 @@
-use super::{Argument, ArgumentKind};
-use std::{collections::BTreeMap, fmt, ops::Range};
+//! StringReader semantics follow Brigadier 1.3.10 (see docs/third-party).
+use super::ArgumentKind;
+use std::{any::Any, collections::BTreeMap, fmt, ops::Range, sync::Arc};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ArgumentValue {
     Text(String),
     Integer(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
     Bool(bool),
+    Custom(Arc<dyn Any + Send + Sync>),
 }
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Arguments(BTreeMap<String, ArgumentValue>);
+
+#[derive(Debug, Default, Clone)]
+pub struct Arguments(pub(super) BTreeMap<String, (ArgumentValue, Range<usize>)>);
 impl Arguments {
     pub fn get(&self, name: &str) -> Option<&ArgumentValue> {
-        self.0.get(name)
+        self.0.get(name).map(|entry| &entry.0)
+    }
+    pub fn span(&self, name: &str) -> Option<Range<usize>> {
+        self.0.get(name).map(|entry| entry.1.clone())
     }
     pub fn text(&self, name: &str) -> Option<&str> {
-        match self.get(name) {
-            Some(ArgumentValue::Text(value)) => Some(value),
-            _ => None,
+        if let ArgumentValue::Text(value) = self.get(name)? {
+            Some(value)
+        } else {
+            None
         }
     }
     pub fn integer(&self, name: &str) -> Option<i32> {
-        match self.get(name) {
-            Some(ArgumentValue::Integer(value)) => Some(*value),
-            _ => None,
+        if let ArgumentValue::Integer(value) = self.get(name)? {
+            Some(*value)
+        } else {
+            None
         }
     }
     pub fn boolean(&self, name: &str) -> Option<bool> {
-        match self.get(name) {
-            Some(ArgumentValue::Bool(value)) => Some(*value),
-            _ => None,
+        if let ArgumentValue::Bool(value) = self.get(name)? {
+            Some(*value)
+        } else {
+            None
+        }
+    }
+    pub fn custom<T: Any>(&self, name: &str) -> Option<&T> {
+        if let ArgumentValue::Custom(value) = self.get(name)? {
+            value.downcast_ref()
+        } else {
+            None
         }
     }
 }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandError {
     pub message: String,
-    /// UTF-8 byte offsets into the original command, not character indices.
+    /// Java-compatible UTF-16 offsets into the original command.
     pub span: Range<usize>,
     pub usage: Option<String>,
 }
 impl CommandError {
-    pub(super) fn new(message: impl Into<String>, span: Range<usize>) -> Self {
+    pub fn new(message: impl Into<String>, span: Range<usize>) -> Self {
         Self {
             message: message.into(),
             span,
@@ -63,132 +83,168 @@ impl fmt::Display for CommandError {
 }
 impl std::error::Error for CommandError {}
 
-pub(super) struct Cursor<'a> {
-    input: &'a str,
-    pos: usize,
+/// UTF-16 cursor over a valid Unicode input. Substrings containing a split
+/// surrogate are returned lossily because Rust strings cannot contain one.
+#[derive(Clone)]
+pub struct StringReader<'a> {
+    units: &'a [u16],
+    cursor: usize,
 }
-impl<'a> Cursor<'a> {
-    pub fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
+impl<'a> StringReader<'a> {
+    pub fn new(units: &'a [u16]) -> Self {
+        Self { units, cursor: 0 }
     }
-    pub fn space(&mut self) {
-        while self.input.as_bytes().get(self.pos) == Some(&b' ') {
-            self.pos += 1;
-        }
+    pub fn cursor(&self) -> usize {
+        self.cursor
     }
-    pub fn slash(&mut self) {
-        if self.input.as_bytes().get(self.pos) == Some(&b'/') {
-            self.pos += 1;
-        }
+    pub fn set_cursor(&mut self, cursor: usize) {
+        self.cursor = cursor.min(self.units.len());
     }
-    pub fn word(&mut self) -> Result<(String, Range<usize>), CommandError> {
-        self.space();
-        let start = self.pos;
-        while self.pos < self.input.len() && self.input.as_bytes()[self.pos] != b' ' {
-            self.pos += 1;
-        }
-        if self.pos == start {
-            return Err(CommandError::new("Expected an argument.", start..start));
-        }
-        let text = &self.input[start..self.pos];
-        if !text
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'+'))
-        {
-            return Err(CommandError::new(
-                "Expected an unquoted word (or a quoted string where supported).",
-                start..self.pos,
-            ));
-        }
-        Ok((text.into(), start..self.pos))
+    pub fn remaining(&self) -> &'a [u16] {
+        &self.units[self.cursor..]
     }
-    fn string(&mut self) -> Result<(String, Range<usize>), CommandError> {
-        self.space();
-        let start = self.pos;
-        if self.input.as_bytes().get(self.pos) != Some(&b'"') {
-            return self.word();
-        }
-        self.pos += 1;
-        let mut value = String::new();
-        while let Some(ch) = self.input[self.pos..].chars().next() {
-            self.pos += ch.len_utf8();
-            match ch {
-                '"' => {
-                    if self.pos < self.input.len() && self.input.as_bytes()[self.pos] != b' ' {
-                        return Err(CommandError::new(
-                            "Expected space after quoted string.",
-                            start..self.pos,
-                        ));
-                    }
-                    return Ok((value, start..self.pos));
+    pub fn peek(&self) -> Option<u16> {
+        self.remaining().first().copied()
+    }
+    pub fn read(&mut self) -> Option<u16> {
+        let unit = self.peek()?;
+        self.cursor += 1;
+        Some(unit)
+    }
+    pub fn error(&self, message: impl Into<String>) -> CommandError {
+        CommandError::new(message, self.cursor..self.cursor)
+    }
+    fn take_while(&mut self, filter: impl Fn(u16) -> bool) -> String {
+        let start = self.cursor;
+        self.cursor += self
+            .remaining()
+            .iter()
+            .copied()
+            .take_while(|&u| filter(u))
+            .count();
+        String::from_utf16_lossy(&self.units[start..self.cursor])
+    }
+    pub fn read_word(&mut self) -> String {
+        self.take_while(|unit| {
+            unit <= 127 && ((unit as u8).is_ascii_alphanumeric() || b"_-.+".contains(&(unit as u8)))
+        })
+    }
+    pub fn read_string(&mut self) -> Result<String, CommandError> {
+        let Some(end @ (34 | 39)) = self.peek() else {
+            return Ok(self.read_word());
+        };
+        self.read();
+        let mut result = Vec::new();
+        let mut escaped = false;
+        while let Some(unit) = self.read() {
+            if escaped {
+                if unit != end && unit != 92 {
+                    self.cursor -= 1;
+                    return Err(self.error(format!(
+                        "Invalid escape sequence '{}' in quoted string",
+                        String::from_utf16_lossy(&[unit])
+                    )));
                 }
-                '\\' => {
-                    let next = self.input[self.pos..].chars().next();
-                    match next {
-                        Some(next @ ('\\' | '"')) => {
-                            self.pos += 1;
-                            value.push(next);
-                        }
-                        _ => {
-                            return Err(CommandError::new(
-                                "Invalid quoted escape.",
-                                self.pos - 1..self.pos,
-                            ));
-                        }
-                    }
-                }
-                _ => value.push(ch),
+                result.push(unit);
+                escaped = false;
+            } else if unit == 92 {
+                escaped = true;
+            } else if unit == end {
+                return Ok(String::from_utf16_lossy(&result));
+            } else {
+                result.push(unit);
             }
         }
-        Err(CommandError::new(
-            "Unterminated quoted string.",
-            start..self.pos,
-        ))
+        Err(self.error("Unclosed quoted string"))
     }
-    pub fn arguments(&mut self, definitions: &[Argument]) -> Result<Arguments, CommandError> {
-        let mut result = Arguments::default();
-        for argument in definitions {
-            self.space();
-            let start = self.pos;
-            let (text, span) = match argument.kind {
-                ArgumentKind::String => self.string()?,
-                ArgumentKind::Greedy => {
-                    let end = self.input.trim_end_matches(' ').len();
-                    if end <= start {
-                        return Err(CommandError::new("Expected an argument.", start..start));
-                    }
-                    self.pos = end;
-                    (self.input[start..end].into(), start..end)
-                }
-                _ => self.word()?,
+    pub fn read_remaining(&mut self) -> String {
+        self.take_while(|_| true)
+    }
+    fn number<T: std::str::FromStr + PartialOrd + fmt::Display>(
+        &mut self,
+        kind: &str,
+        min: T,
+        max: T,
+    ) -> Result<T, CommandError> {
+        let start = self.cursor;
+        let text = self.take_while(|u| matches!(u, 45 | 46 | 48..=57));
+        if text.is_empty() {
+            return Err(self.error(format!("Expected {kind}")));
+        }
+        let value = match text.parse::<T>() {
+            Ok(value) => value,
+            Err(_) => {
+                self.cursor = start;
+                return Err(self.error(format!("Invalid {kind} '{text}'")));
+            }
+        };
+        if value < min || value > max {
+            self.cursor = start;
+            let label = match kind {
+                "integer" => "Integer",
+                "long" => "Long",
+                "float" => "Float",
+                _ => "Double",
             };
-            let value = match argument.kind {
-                ArgumentKind::Integer { min, max } => {
-                    let value = text
-                        .parse::<i32>()
-                        .ok()
-                        .filter(|value| (min..=max).contains(value))
-                        .ok_or_else(|| {
-                            CommandError::new(format!("Expected integer in {min}..={max}."), span)
-                        })?;
-                    ArgumentValue::Integer(value)
+            let (comparison, bound) = if value < min {
+                ("less", min)
+            } else {
+                ("more", max)
+            };
+            let display = |number: T| {
+                let mut text = number.to_string();
+                if matches!(kind, "float" | "double")
+                    && number
+                        .to_string()
+                        .parse::<f64>()
+                        .is_ok_and(|x| x.is_finite())
+                    && !text.contains('.')
+                {
+                    text.push_str(".0");
                 }
-                ArgumentKind::Bool => ArgumentValue::Bool(match text.as_str() {
+                text
+            };
+            return Err(self.error(format!(
+                "{label} must not be {comparison} than {}, found {}",
+                display(bound),
+                display(value)
+            )));
+        }
+        Ok(value)
+    }
+    pub(super) fn argument(&mut self, kind: &ArgumentKind) -> Result<ArgumentValue, CommandError> {
+        Ok(match kind {
+            ArgumentKind::Word => ArgumentValue::Text(self.read_word()),
+            ArgumentKind::String => ArgumentValue::Text(self.read_string()?),
+            ArgumentKind::Greedy => ArgumentValue::Text(self.read_remaining()),
+            ArgumentKind::Bool => {
+                let start = self.cursor;
+                let value = self.read_string()?;
+                ArgumentValue::Bool(match value.as_str() {
                     "true" => true,
                     "false" => false,
-                    _ => return Err(CommandError::new("Expected true or false.", span)),
-                }),
-                _ => ArgumentValue::Text(text),
-            };
-            result.0.insert(argument.name.clone(), value);
-        }
-        self.space();
-        if self.pos != self.input.len() {
-            return Err(CommandError::new(
-                "Unexpected trailing argument.",
-                self.pos..self.input.len(),
-            ));
-        }
-        Ok(result)
+                    "" => return Err(self.error("Expected bool")),
+                    _ => {
+                        self.cursor = start;
+                        return Err(self.error(format!(
+                            "Invalid bool, expected true or false but found '{value}'"
+                        )));
+                    }
+                })
+            }
+            ArgumentKind::Integer { min, max } => {
+                ArgumentValue::Integer(self.number("integer", *min, *max)?)
+            }
+            ArgumentKind::Long { min, max } => {
+                ArgumentValue::Long(self.number("long", *min, *max)?)
+            }
+            ArgumentKind::Float { min, max } => {
+                ArgumentValue::Float(self.number("float", *min, *max)?)
+            }
+            ArgumentKind::Double { min, max } => {
+                ArgumentValue::Double(self.number("double", *min, *max)?)
+            }
+            ArgumentKind::Custom(parser) => parser.parse(self)?,
+        })
     }
 }

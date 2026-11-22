@@ -66,6 +66,8 @@ struct Slot {
     online: bool,
     receiving: bool,
     chat_mode: i32,
+    // A command chain is bound to one uninterrupted ready-Play lifetime.
+    command_epoch: Arc<()>,
     lagged: bool,
     queue: VecDeque<Delivery>,
     visible: Option<Peer>,
@@ -322,6 +324,7 @@ impl Registry {
     fn deactivate(&mut self, uuid: Uuid) {
         let slot = self.players.get_mut(&uuid).expect("owned slot");
         if let Some(peer) = slot.visible.take() {
+            slot.command_epoch = Arc::new(());
             self.entities.remove(pose_chunk(peer.pose), uuid);
             for &chunk in &slot.sent_chunks {
                 if in_view(slot.view, chunk) {
@@ -412,6 +415,7 @@ impl Players {
                     online: false,
                     receiving: false,
                     chat_mode: 0,
+                    command_epoch: Arc::new(()),
                     lagged: false,
                     queue: VecDeque::new(),
                     visible: None,

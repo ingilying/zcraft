@@ -76,5 +76,5 @@ fn custom_registration_is_executable_from_console_and_block_without_a_session() 
         .execute_command(&unprivileged, "msg Alice secret")
         .unwrap();
     assert!(!unavailable.success);
-    assert_eq!(unavailable.feedback, ["Player unavailable."]);
+    assert!(unavailable.feedback.is_empty());
 }

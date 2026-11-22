@@ -2,8 +2,14 @@
 //! Sources are trusted server inputs, never data accepted from a client packet.
 mod builtins;
 mod parse;
-pub use parse::{ArgumentValue, Arguments, CommandError};
-use std::{collections::HashSet, io};
+mod runtime;
+mod source;
+mod tree;
+pub use parse::{ArgumentValue, Arguments, CommandError, StringReader};
+pub use runtime::*;
+pub use source::*;
+use std::{collections::HashSet, io, sync::Arc};
+pub use tree::*;
 use uuid::Uuid;
 
 pub const MAX_COMMAND_BYTES: usize = 4096;
@@ -75,21 +81,65 @@ pub trait CommandHost {
     fn list_players(&mut self) -> io::Result<CommandResult>;
     fn action(&mut self, player: Uuid, text: &str) -> io::Result<CommandResult>;
     fn whisper(&mut self, player: Uuid, target: &str, text: &str) -> io::Result<CommandResult>;
+    /// Optional liveness/policy check before each runtime step and feedback.
+    fn command_active(&self, _source: &SourceStack) -> bool {
+        true
+    }
+    /// Only present inside a scheduled executor. Use this instead of invoking
+    /// the dispatcher recursively to schedule follow-up work.
+    fn execution(&mut self) -> Option<&mut dyn ExecutionControl> {
+        None
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Custom types can be used for server-only nodes, or provide a verified
+/// client parser descriptor when they implement that parser's wire semantics.
+pub trait ArgumentParser: std::fmt::Debug + Send + Sync {
+    fn parse(&self, reader: &mut StringReader<'_>) -> Result<ArgumentValue, CommandError>;
+    fn examples(&self) -> &[&str] {
+        &[]
+    }
+    fn wire(&self) -> Option<(i32, Vec<u8>)> {
+        None
+    }
+}
+#[derive(Debug, Clone)]
 pub enum ArgumentKind {
     Word,
-    /// Brigadier quotable phrase: a word, or a double-quoted string with \\ and \" escapes.
     String,
     Greedy,
-    Integer {
-        min: i32,
-        max: i32,
-    },
+    Integer { min: i32, max: i32 },
+    Long { min: i64, max: i64 },
+    Float { min: f32, max: f32 },
+    Double { min: f64, max: f64 },
     Bool,
+    Custom(Arc<dyn ArgumentParser>),
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl ArgumentKind {
+    fn examples(&self) -> &[&str] {
+        match self {
+            Self::Word => &["word", "words_with_underscores"],
+            Self::String => &["\"quoted phrase\"", "word", "\"\""],
+            Self::Greedy => &["word", "words with spaces", "\"and symbols\""],
+            Self::Bool => &["true", "false"],
+            Self::Integer { .. } | Self::Long { .. } => &["0", "123", "-123"],
+            Self::Float { .. } | Self::Double { .. } => {
+                &["0", "1.2", ".5", "-1", "-.5", "-1234.56"]
+            }
+            Self::Custom(parser) => parser.examples(),
+        }
+    }
+    fn valid(&self) -> bool {
+        match self {
+            Self::Integer { min, max } => min <= max,
+            Self::Long { min, max } => min <= max,
+            Self::Float { min, max } => min.is_finite() && max.is_finite() && min <= max,
+            Self::Double { min, max } => min.is_finite() && max.is_finite() && min <= max,
+            _ => true,
+        }
+    }
+}
+#[derive(Debug, Clone)]
 pub struct Argument {
     pub name: String,
     pub kind: ArgumentKind,
@@ -107,11 +157,15 @@ pub struct Invocation<'a> {
     pub source: &'a CommandSource,
     pub arguments: &'a Arguments,
     pub registry: &'a CommandRegistry,
+    pub input: &'a str,
+    pub nodes: &'a [ParsedNode],
+    /// Present in Minecraft runtime execution, absent in pure Brigadier mode.
+    pub stack: Option<&'a SourceStack>,
 }
 pub type Executor = fn(&Invocation<'_>, &mut dyn CommandHost) -> io::Result<CommandResult>;
 
-/// A command has one ordered, required argument path. Aliases share this path
-/// and executor. Optional arguments / branching subcommands are not implemented.
+/// Convenience registration for a simple argument path with aliases.
+/// Use `CommandRegistryBuilder::add_node` for branching graphs.
 #[derive(Clone)]
 pub struct Command {
     pub name: String,
@@ -159,9 +213,21 @@ impl Command {
     }
 }
 
-#[derive(Default)]
 pub struct CommandRegistryBuilder {
     commands: Vec<Command>,
+    nodes: Vec<CommandNode>,
+    limits: DispatchLimits,
+    consumer: Option<ResultConsumer>,
+}
+impl Default for CommandRegistryBuilder {
+    fn default() -> Self {
+        Self {
+            commands: Vec::new(),
+            nodes: vec![CommandNode::root()],
+            limits: DispatchLimits::default(),
+            consumer: None,
+        }
+    }
 }
 impl CommandRegistryBuilder {
     pub fn new() -> Self {
@@ -174,17 +240,70 @@ impl CommandRegistryBuilder {
         self.commands.push(command);
         self
     }
-    /// Freeze definitions and reject ambiguity before serving clients.
-    pub fn build(self) -> Result<CommandRegistry, String> {
-        let mut names = HashSet::new();
-        let mut nodes = 1;
-        for command in &self.commands {
-            nodes += 1 + command.aliases.len() + command.arguments.len();
-            if nodes > MAX_NODES || command.arguments.len() > 16 {
-                return Err("command registry too large".into());
+    pub fn limits(&mut self, limits: DispatchLimits) -> &mut Self {
+        self.limits = limits;
+        self
+    }
+    pub fn result_consumer(&mut self, consumer: ResultConsumer) -> &mut Self {
+        self.consumer = Some(consumer);
+        self
+    }
+
+    /// Like Brigadier addChild, keep the first node's type, requirement and
+    /// redirect; a subsequent executor replaces the old one. Add descendants
+    /// to the returned ID to merge multiple registrations.
+    pub fn add_node(&mut self, parent: NodeId, node: CommandNode) -> Result<NodeId, String> {
+        if self
+            .nodes
+            .get(parent.0)
+            .is_none_or(|parent| parent.redirect.is_some())
+        {
+            return Err("invalid parent or redirect cannot have children".into());
+        }
+        if node.name.is_empty()
+            || node.name.encode_utf16().count() > 64
+            || node.name.contains(' ')
+            || matches!(node.kind, NodeKind::Root)
+            || matches!(&node.kind, NodeKind::Argument(kind) if !kind.valid())
+            || node
+                .redirect
+                .is_some_and(|redirect| redirect.target.0 >= self.nodes.len())
+        {
+            return Err("invalid command node".into());
+        }
+        if let Some(id) = self.nodes[parent.0]
+            .children
+            .iter()
+            .copied()
+            .find(|id| self.nodes[id.0].name == node.name)
+        {
+            if node.execute.is_some() {
+                self.nodes[id.0].execute = node.execute;
             }
-            if command.description.len() > 256 || !valid_text(&command.description) {
-                return Err("invalid command description".into());
+            return Ok(id);
+        }
+        if self.nodes.len() >= MAX_NODES {
+            return Err("command registry too large".into());
+        }
+        let id = NodeId(self.nodes.len());
+        self.nodes.push(node);
+        self.nodes[parent.0].children.push(id);
+        Ok(id)
+    }
+
+    pub fn build(mut self) -> Result<CommandRegistry, String> {
+        let commands = std::mem::take(&mut self.commands);
+        let mut names: HashSet<_> = self.nodes[0]
+            .children
+            .iter()
+            .map(|id| self.nodes[id.0].name.clone())
+            .collect();
+        for command in &commands {
+            if command.arguments.len() > 16
+                || command.description.len() > 256
+                || !valid_text(&command.description)
+            {
+                return Err("invalid command definition".into());
             }
             for name in std::iter::once(&command.name).chain(&command.aliases) {
                 if !identifier(name) || !names.insert(name.clone()) {
@@ -193,29 +312,51 @@ impl CommandRegistryBuilder {
             }
             let mut args = HashSet::new();
             for (index, argument) in command.arguments.iter().enumerate() {
-                if !identifier(&argument.name) || !args.insert(&argument.name) {
-                    return Err("invalid or duplicate argument".into());
+                if !identifier(&argument.name)
+                    || !args.insert(&argument.name)
+                    || !argument.kind.valid()
+                    || matches!(argument.kind, ArgumentKind::Greedy)
+                        && index + 1 != command.arguments.len()
+                {
+                    return Err("invalid command argument".into());
                 }
-                match argument.kind {
-                    ArgumentKind::Greedy if index + 1 != command.arguments.len() => {
-                        return Err("greedy argument must be last".into());
-                    }
-                    ArgumentKind::Integer { min, max } if min > max => {
-                        return Err("invalid integer bounds".into());
-                    }
-                    _ => {}
+            }
+            let mut literal = CommandNode::literal(&command.name);
+            literal.permission = command.permission;
+            literal.player_only = command.player_only;
+            if command.arguments.is_empty() {
+                literal.execute = Some(command.execute);
+            }
+            let primary = self.add_node(NodeId::ROOT, literal.clone())?;
+            for alias in &command.aliases {
+                let mut alias_node = literal.clone().redirects(primary, None);
+                alias_node.name.clone_from(alias);
+                self.add_node(NodeId::ROOT, alias_node)?;
+            }
+            let mut parent = primary;
+            for (index, arg) in command.arguments.iter().enumerate() {
+                let mut node = CommandNode::argument(&arg.name, arg.kind.clone());
+                if index + 1 == command.arguments.len() {
+                    node.execute = Some(command.execute);
                 }
+                parent = self.add_node(parent, node)?;
             }
         }
         Ok(CommandRegistry {
-            commands: self.commands,
+            commands,
+            nodes: self.nodes,
+            limits: self.limits,
+            consumer: self.consumer,
         })
     }
 }
 
-/// Immutable after validation. Shared by dispatch, help and the protocol tree.
+/// Immutable graph shared by dispatch, help and wire encoding.
 pub struct CommandRegistry {
     commands: Vec<Command>,
+    nodes: Vec<CommandNode>,
+    limits: DispatchLimits,
+    consumer: Option<ResultConsumer>,
 }
 impl Default for CommandRegistry {
     fn default() -> Self {
@@ -249,6 +390,28 @@ impl CommandRegistry {
             }
             text.push_str(&line);
         }
+        let known: HashSet<_> = self
+            .commands
+            .iter()
+            .flat_map(|command| {
+                std::iter::once(command.name.as_str())
+                    .chain(command.aliases.iter().map(String::as_str))
+            })
+            .collect();
+        for (id, usage) in self.smart_usage(NodeId::ROOT, source) {
+            if known.contains(self.nodes[id.0].name.as_str()) {
+                continue;
+            }
+            if text.len() + usage.len() > 8192 {
+                text.push_str("; …");
+                break;
+            }
+            if !text.is_empty() {
+                text.push_str("; ");
+            }
+            text.push('/');
+            text.push_str(&usage);
+        }
         text
     }
     pub fn execute(
@@ -257,49 +420,38 @@ impl CommandRegistry {
         source: &CommandSource,
         host: &mut dyn CommandHost,
     ) -> io::Result<CommandResult> {
-        let (command, arguments) = match self.parse(input, source) {
-            Ok(parsed) => parsed,
-            Err(error) => return Ok(CommandResult::failure(error.to_string())),
-        };
-        (command.execute)(
-            &Invocation {
-                source,
-                arguments: &arguments,
-                registry: self,
-            },
-            host,
-        )
+        match self.server_parse(input, source) {
+            Ok(parsed) => parsed.execute(host),
+            Err(result) => Ok(result),
+        }
     }
-    pub fn parse<'a>(
+
+    fn server_parse<'a>(
         &'a self,
-        input: &str,
+        input: &'a str,
         source: &CommandSource,
-    ) -> Result<(&'a Command, Arguments), CommandError> {
-        if input.len() > MAX_COMMAND_BYTES || !valid_text(input) {
-            return Err(CommandError::new("Invalid command text.", 0..input.len()));
+    ) -> Result<ParseResults<'a>, CommandResult> {
+        if input.len() > MAX_COMMAND_BYTES {
+            return Err(CommandResult::failure("Invalid command text."));
         }
-        let mut cursor = parse::Cursor::new(input);
-        cursor.space();
-        cursor.slash();
-        let (name, span) = cursor.word()?;
-        let command = self
-            .commands
-            .iter()
-            .find(|command| {
-                command.name == name || command.aliases.iter().any(|alias| alias == &name)
-            })
-            .ok_or_else(|| CommandError::new("Unknown command. Use /help.", span.clone()))?;
-        if command.permission > source.permission {
-            return Err(CommandError::new("Permission denied.", span));
+        let input = input.trim();
+        let input = input.strip_prefix('/').unwrap_or(input);
+        // Explicit, friendly source errors for the server adapter. The
+        // Brigadier dispatcher itself skips inaccessible nodes.
+        let name = input.split(' ').next().unwrap_or("");
+        if let Some(node) = self.find_node(&[name]).and_then(|id| self.node(id)) {
+            if node.permission > source.permission {
+                return Err(CommandResult::failure("Permission denied."));
+            }
+            if node.player_only && !matches!(source.kind, SourceKind::Player(_)) {
+                return Err(CommandResult::failure("This command requires a player."));
+            }
         }
-        if command.player_only && !matches!(source.kind, SourceKind::Player(_)) {
-            return Err(CommandError::new("This command requires a player.", span));
+        let parsed = self.dispatch(input, source);
+        if parsed.contexts()[0].nodes.is_empty() && parsed.errors().is_empty() {
+            return Err(CommandResult::failure("Unknown command. Use /help."));
         }
-        let args = cursor.arguments(&command.arguments).map_err(|mut error| {
-            error.usage = Some(command.usage());
-            error
-        })?;
-        Ok((command, args))
+        Ok(parsed)
     }
 }
 fn allowed(command: &Command, source: &CommandSource) -> bool {

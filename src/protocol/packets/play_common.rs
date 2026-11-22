@@ -18,7 +18,6 @@ macro_rules! ignored {
 }
 ignored!(
     IgnoredClientCommand,
-    IgnoredTabComplete,
     IgnoredCloseWindow,
     IgnoredAdvancementTab,
     IgnoredSpectate,

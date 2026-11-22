@@ -16,9 +16,23 @@ impl ServerContext {
         source: &crate::command::CommandSource,
         input: &str,
     ) -> std::io::Result<crate::command::CommandResult> {
-        self.play
-            .commands()
-            .execute(input, source, &mut self.players())
+        Ok(self
+            .run_command(&crate::command::SourceStack::new(source.clone()), input)
+            .result)
+    }
+
+    /// Run one bounded Minecraft command chain with a trusted source stack.
+    pub fn run_command(
+        &self,
+        source: &crate::command::SourceStack,
+        input: &str,
+    ) -> crate::command::ExecutionReport {
+        self.play.commands().run(
+            input,
+            source,
+            &mut self.players().command_host(source),
+            crate::command::ExecutionLimits::default(),
+        )
     }
 
     /// Shared admission, presence, and broadcast service.

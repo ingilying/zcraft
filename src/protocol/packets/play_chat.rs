@@ -1,8 +1,63 @@
-//! Minecraft Java 1.21.1 (767) chat framing and a static Brigadier command tree.
+//! Minecraft Java 1.21.1 (767) chat and command packets.
 use crate::protocol::{Decode, Encode, Reader, invalid, put_string, put_varint};
 use std::io;
 
 const MAX_INPUT: usize = 256;
+pub const MAX_COMPLETION_INPUT: usize = 32500;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CommandCompletionRequest {
+    pub transaction: i32,
+    pub input: String,
+}
+impl Decode for CommandCompletionRequest {
+    fn decode(reader: &mut Reader<'_>) -> io::Result<Self> {
+        Ok(Self {
+            transaction: reader.varint()?,
+            input: reader.string(MAX_COMPLETION_INPUT)?,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CommandCompletionResponse {
+    pub transaction: i32,
+    pub matches: Vec<crate::command::Suggestion>,
+}
+impl Encode for CommandCompletionResponse {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        use crate::command::{MAX_SUGGESTION_BYTES, MAX_SUGGESTIONS};
+        let span = self
+            .matches
+            .first()
+            .map_or(0..0, |first| first.span.clone());
+        if self.matches.len() > MAX_SUGGESTIONS
+            || span.start > span.end
+            || span.end > MAX_COMPLETION_INPUT
+            || self.matches.iter().any(|s| {
+                s.span != span
+                    || s.text.len() > MAX_SUGGESTION_BYTES
+                    || s.tooltip
+                        .as_ref()
+                        .is_some_and(|text| text.len() > MAX_SUGGESTION_BYTES)
+            })
+        {
+            return Err(invalid("invalid command suggestions"));
+        }
+        put_varint(self.transaction, out);
+        put_varint(span.start as i32, out);
+        put_varint(span.len() as i32, out);
+        put_varint(self.matches.len() as i32, out);
+        for suggestion in &self.matches {
+            put_string(&suggestion.text, out)?;
+            out.push(u8::from(suggestion.tooltip.is_some()));
+            if let Some(tooltip) = &suggestion.tooltip {
+                super::common::put_nbt_text(tooltip, out)?;
+            }
+        }
+        Ok(())
+    }
+}
 const MAX_SIGNATURES: i32 = 8;
 const SIGNATURE_BYTES: usize = 256;
 const LAST_SEEN_BYTES: usize = 3;
@@ -82,12 +137,14 @@ impl Encode for SystemChat {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct DeclareCommands(Vec<Node>);
+pub struct DeclareCommands(Vec<WireNode>);
 
 #[derive(Debug, PartialEq, Eq)]
-struct Node {
-    name: Option<String>,
-    argument: Option<crate::command::ArgumentKind>,
+struct WireNode {
+    flags: u8,
+    name: String,
+    parser: Option<(i32, Vec<u8>)>,
+    redirect: Option<i32>,
     children: Vec<i32>,
 }
 
@@ -96,90 +153,130 @@ impl DeclareCommands {
         registry: &crate::command::CommandRegistry,
         source: &crate::command::CommandSource,
     ) -> Self {
-        let mut nodes = vec![Node {
-            name: None,
-            argument: None,
-            children: Vec::new(),
-        }];
-        for command in registry.available(source) {
-            let literal_start = nodes.len();
-            let literal_count = 1 + command.aliases.len();
-            let argument_start = literal_start + literal_count;
-            for name in std::iter::once(&command.name).chain(&command.aliases) {
-                let index = nodes.len() as i32;
-                nodes[0].children.push(index);
-                nodes.push(Node {
-                    name: Some(name.clone()),
-                    argument: None,
-                    children: if command.arguments.is_empty() {
-                        vec![]
-                    } else {
-                        vec![argument_start as i32]
-                    },
-                });
+        use crate::command::{NodeId, NodeKind};
+        // Only expose reachable, usable nodes with a client-side parser.
+        // Every redirect needs a target that is independently visible.
+        let mut ids = vec![NodeId::ROOT];
+        let mut index = std::collections::HashMap::from([(NodeId::ROOT, 0i32)]);
+        let mut i = 0;
+        while let Some(&id) = ids.get(i) {
+            for &child in registry.node(id).expect("registered node").children() {
+                let node = registry.node(child).expect("registered child");
+                if node.can_use(source)
+                    && !matches!(node.kind(), NodeKind::Argument(kind) if parser(kind).is_none())
+                    && !index.contains_key(&child)
+                {
+                    index.insert(child, ids.len() as i32);
+                    ids.push(child);
+                }
             }
-            for (index, argument) in command.arguments.iter().enumerate() {
-                nodes.push(Node {
-                    name: Some(argument.name.clone()),
-                    argument: Some(argument.kind.clone()),
-                    children: if index + 1 == command.arguments.len() {
-                        vec![]
-                    } else {
-                        vec![(argument_start + index + 1) as i32]
-                    },
-                });
-            }
+            i += 1;
         }
-        Self(nodes)
+        // Remove redirects to nodes absent from the filtered tree without
+        // discarding an independently executable literal.
+        Self(
+            ids.into_iter()
+                .map(|id| {
+                    let node = registry.node(id).expect("registered node");
+                    let redirect = node.redirect().and_then(|r| index.get(&r.target).copied());
+                    let (kind, parser) = match node.kind() {
+                        NodeKind::Root => (0, None),
+                        NodeKind::Literal => (1, None),
+                        NodeKind::Argument(kind) => (2, parser(kind)),
+                    };
+                    WireNode {
+                        flags: kind
+                            | if node.executable() { 4 } else { 0 }
+                            | if redirect.is_some() { 8 } else { 0 }
+                            | if kind == 2 && node.has_suggestion_provider() {
+                                16
+                            } else {
+                                0
+                            },
+                        name: node.name().into(),
+                        parser,
+                        redirect,
+                        children: node
+                            .children()
+                            .iter()
+                            .filter_map(|id| index.get(id).copied())
+                            .collect(),
+                    }
+                })
+                .collect(),
+        )
     }
+}
+
+fn parser(kind: &crate::command::ArgumentKind) -> Option<(i32, Vec<u8>)> {
+    use crate::command::ArgumentKind::*;
+    fn bounds<const N: usize>(lower: Option<[u8; N]>, upper: Option<[u8; N]>) -> Vec<u8> {
+        let mut bytes = vec![u8::from(lower.is_some()) | (u8::from(upper.is_some()) << 1)];
+        bytes.extend(lower.into_iter().flatten());
+        bytes.extend(upper.into_iter().flatten());
+        bytes
+    }
+    Some(match kind {
+        Bool => (0, vec![]),
+        Float { min, max } => (
+            1,
+            bounds(
+                (*min != -f32::MAX).then(|| min.to_be_bytes()),
+                (*max != f32::MAX).then(|| max.to_be_bytes()),
+            ),
+        ),
+        Double { min, max } => (
+            2,
+            bounds(
+                (*min != -f64::MAX).then(|| min.to_be_bytes()),
+                (*max != f64::MAX).then(|| max.to_be_bytes()),
+            ),
+        ),
+        Integer { min, max } => (
+            3,
+            bounds(
+                (*min != i32::MIN).then(|| min.to_be_bytes()),
+                (*max != i32::MAX).then(|| max.to_be_bytes()),
+            ),
+        ),
+        Long { min, max } => (
+            4,
+            bounds(
+                (*min != i64::MIN).then(|| min.to_be_bytes()),
+                (*max != i64::MAX).then(|| max.to_be_bytes()),
+            ),
+        ),
+        Word => (5, vec![0]),
+        String => (5, vec![1]),
+        Greedy => (5, vec![2]),
+        Custom(parser) => {
+            return parser
+                .wire()
+                .filter(|(id, body)| (0..=53).contains(id) && body.len() <= 1024);
+        }
+    })
 }
 
 impl Encode for DeclareCommands {
     fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
-        use crate::command::ArgumentKind;
         put_varint(self.0.len() as i32, out);
         for node in &self.0 {
-            let kind = if node.name.is_none() {
-                0
-            } else if node.argument.is_some() {
-                2
-            } else {
-                1
-            };
-            out.push(
-                kind | if kind != 0 && node.children.is_empty() {
-                    4
-                } else {
-                    0
-                },
-            );
+            out.push(node.flags);
             put_varint(node.children.len() as i32, out);
             for &child in &node.children {
                 put_varint(child, out);
             }
-            if let Some(name) = &node.name {
-                put_string(name, out)?;
+            if let Some(redirect) = node.redirect {
+                put_varint(redirect, out);
             }
-            if let Some(argument) = &node.argument {
-                match argument {
-                    ArgumentKind::Bool => put_varint(0, out), // brigadier:bool
-                    ArgumentKind::Integer { min, max } => {
-                        put_varint(3, out); // brigadier:integer
-                        out.push(3); // Both bounds.
-                        out.extend_from_slice(&min.to_be_bytes());
-                        out.extend_from_slice(&max.to_be_bytes());
-                    }
-                    ArgumentKind::Word | ArgumentKind::String | ArgumentKind::Greedy => {
-                        put_varint(5, out); // brigadier:string
-                        put_varint(
-                            match argument {
-                                ArgumentKind::Word => 0,
-                                ArgumentKind::String => 1,
-                                _ => 2,
-                            },
-                            out,
-                        );
-                    }
+            if node.flags & 3 != 0 {
+                put_string(&node.name, out)?;
+            }
+            if let Some((parser, properties)) = &node.parser {
+                put_varint(*parser, out);
+                out.extend(properties);
+                if node.flags & 16 != 0 {
+                    put_string("minecraft:ask_server", out)?;
                 }
             }
         }
@@ -192,6 +289,48 @@ impl Encode for DeclareCommands {
 mod tests {
     use super::*;
     use crate::protocol::{Clientbound, State, decode};
+
+    #[test]
+    fn completion_packets_validate_structure_and_encode_utf16_ranges() {
+        let mut body = vec![0x0b, 17];
+        put_string("/test 🙂", &mut body).unwrap();
+        assert_eq!(
+            decode(State::Play, &body).unwrap(),
+            CommandCompletionRequest {
+                transaction: 17,
+                input: "/test 🙂".into()
+            }
+            .into()
+        );
+        for n in 0..body.len() {
+            assert!(decode(State::Play, &body[..n]).is_err());
+        }
+        body.push(0);
+        assert!(decode(State::Play, &body).is_err());
+        let mut body = vec![0x0b, 0];
+        put_string(&"x".repeat(MAX_COMPLETION_INPUT + 1), &mut body).unwrap();
+        assert!(decode(State::Play, &body).is_err());
+
+        let response = CommandCompletionResponse {
+            transaction: 17,
+            matches: vec![crate::command::Suggestion {
+                span: 6..8,
+                text: "x".into(),
+                tooltip: Some("提示".into()),
+            }],
+        };
+        let encoded = Clientbound::from(response).encode().unwrap();
+        assert_eq!(&encoded[..10], &[0x10, 17, 6, 2, 1, 1, b'x', 1, 8, 0]);
+        let invalid = CommandCompletionResponse {
+            transaction: 17,
+            matches: vec![crate::command::Suggestion {
+                span: usize::MAX..usize::MAX,
+                text: "x".into(),
+                tooltip: None,
+            }],
+        };
+        assert!(Clientbound::from(invalid).encode().is_err());
+    }
 
     #[test]
     fn chat_message_is_bounded_and_optional_signature_is_consumed() {

@@ -47,7 +47,7 @@ fn registry() -> CommandRegistry {
 }
 
 #[test]
-fn parser_has_types_quotes_utf8_spans_and_bounded_input() {
+fn parser_has_types_quotes_cursor_and_adapter_budget() {
     let registry = registry();
     let source = source(SourceKind::Console, 4);
     let result = registry
@@ -70,9 +70,8 @@ fn parser_has_types_quotes_utf8_spans_and_bounded_input() {
         ("echo x 0 yes", "yes"),
         ("echo x 0 true extra", "extra"),
     ] {
-        let error = registry.parse(input, &source).err().unwrap();
-        assert_eq!(&input[error.span], marker);
-        assert!(error.usage.unwrap().contains("<amount>"));
+        let error = registry.dispatch(input, &source).error().unwrap();
+        assert_eq!(error.span.start, input.find(marker).unwrap());
     }
     for invalid in [
         "echo \"unfinished",
@@ -82,15 +81,23 @@ fn parser_has_types_quotes_utf8_spans_and_bounded_input() {
         "echo x 2147483648 true",
         "echo unquoted名字 0 true",
     ] {
-        assert!(registry.parse(invalid, &source).is_err(), "{invalid}");
+        assert!(
+            registry.dispatch(invalid, &source).error().is_some(),
+            "{invalid}"
+        );
     }
     let long = format!("me {}", "x".repeat(MAX_COMMAND_BYTES));
     assert!(
-        registry
-            .parse(&long, &CommandSource::player(Uuid::nil()))
-            .is_err()
+        !registry
+            .execute(
+                &long,
+                &CommandSource::player(Uuid::nil()),
+                &mut Host::default()
+            )
+            .unwrap()
+            .success
     );
-    assert!(registry.parse("help\nlist", &source).is_err());
+    assert!(registry.dispatch("help\nlist", &source).error().is_some());
 }
 
 #[test]
@@ -197,6 +204,9 @@ fn wire_tree_uses_validated_arguments_and_permission_filter() {
             for _ in 0..children {
                 let child = r.varint().unwrap();
                 assert!(child > 0 && child < count);
+            }
+            if flags & 8 != 0 {
+                assert!((0..count).contains(&r.varint().unwrap()));
             }
             if index == 0 {
                 assert_eq!(flags, 0);

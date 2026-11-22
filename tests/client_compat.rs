@@ -3,6 +3,10 @@
 use std::{process::Command, sync::Arc};
 use tokio::{net::TcpListener, sync::oneshot};
 use zcraft::{
+    command::{
+        ArgumentKind, CommandNode, CommandRegistryBuilder, NodeId, SuggestionContext,
+        SuggestionFuture,
+    },
     config::{Config, GameMode},
     context::ServerContext,
     handler::{
@@ -39,11 +43,46 @@ async fn independent_protocol_clients_chat_and_run_commands() {
 async fn check_client(script: &'static str, mode: GameMode) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    let mut play = PlayService::with_options(Config::default().max_view_distance, mode).unwrap();
+    if script == "check-chat.cjs" {
+        fn suggest(context: SuggestionContext<'_>) -> SuggestionFuture<'_> {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                assert!(matches!(
+                    context.source.kind,
+                    zcraft::command::SourceKind::Player(_)
+                ));
+                if context.remaining() == "wait" {
+                    return std::future::pending().await;
+                }
+                let mut value = context.suggest("你好🙂");
+                value.tooltip = Some("异步提示".into());
+                Ok(vec![value])
+            })
+        }
+        let mut builder = CommandRegistryBuilder::with_builtins();
+        let fixture = builder
+            .add_node(NodeId::ROOT, CommandNode::literal("fixture"))
+            .unwrap();
+        builder
+            .add_node(
+                fixture,
+                CommandNode::argument("text", ArgumentKind::Greedy).suggests_async(suggest),
+            )
+            .unwrap();
+        builder
+            .add_node(
+                NodeId::ROOT,
+                CommandNode::literal("fixture_hidden").requires(|source| source.permission > 0),
+            )
+            .unwrap();
+        play = play.with_commands(builder.build().unwrap());
+    }
     let server = Arc::new(ServerContext {
         status: StatusService::new("test", 20),
         login: LoginService::offline(),
         configuration: ConfigurationService::new(),
-        play: PlayService::with_options(Config::default().max_view_distance, mode).unwrap(),
+        play,
     });
     let (stop, stopped) = oneshot::channel();
     let task = tokio::spawn(serve_with_context(

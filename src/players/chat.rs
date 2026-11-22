@@ -190,7 +190,86 @@ impl Registry {
     }
 }
 
+/// Host bound to the originating player's current ready-Play lifetime. A
+/// reconnect or reconfiguration must not revive an older queued command chain.
+struct SessionCommandHost<'a> {
+    players: &'a super::Players,
+    binding: Option<(Uuid, Option<Arc<()>>)>,
+}
+
+impl super::Players {
+    pub fn command_host(&self, source: &crate::command::SourceStack) -> impl CommandHost + '_ {
+        let binding = source.authenticated_player().map(|uuid| {
+            let epoch = lock(&self.registry)
+                .players
+                .get(&uuid)
+                .filter(|slot| slot.chat_ready())
+                .map(|slot| slot.command_epoch.clone());
+            (uuid, epoch)
+        });
+        SessionCommandHost {
+            players: self,
+            binding,
+        }
+    }
+}
+
+impl SessionCommandHost<'_> {
+    fn active(&self, registry: &Registry) -> bool {
+        self.binding.as_ref().is_none_or(|(uuid, epoch)| {
+            epoch.as_ref().is_some_and(|epoch| {
+                registry.players.get(uuid).is_some_and(|slot| {
+                    slot.chat_ready() && Arc::ptr_eq(epoch, &slot.command_epoch)
+                })
+            })
+        })
+    }
+    fn player_chat(&self, player: Uuid, request: ChatRequest<'_>) -> io::Result<CommandResult> {
+        let mut registry = lock(&self.players.registry);
+        if self.binding.as_ref().map(|(uuid, _)| *uuid) != Some(player) || !self.active(&registry) {
+            return Ok(CommandResult::failure("Player unavailable."));
+        }
+        registry.dispatch_chat(player, request)
+    }
+}
+
+impl CommandHost for SessionCommandHost<'_> {
+    fn command_active(&self, source: &crate::command::SourceStack) -> bool {
+        source.authenticated_player() == self.binding.as_ref().map(|(uuid, _)| *uuid)
+            && self.active(&lock(&self.players.registry))
+    }
+    fn list_players(&mut self) -> io::Result<CommandResult> {
+        Ok(lock(&self.players.registry).chat_roster())
+    }
+    fn action(&mut self, player: Uuid, text: &str) -> io::Result<CommandResult> {
+        if !safe_command_text(text) {
+            return Ok(CommandResult::failure("Invalid command text."));
+        }
+        self.player_chat(player, ChatRequest::Action(text))
+    }
+    fn whisper(&mut self, player: Uuid, target: &str, text: &str) -> io::Result<CommandResult> {
+        if !crate::auth::valid_username(target) || !safe_command_text(text) {
+            return Ok(CommandResult::failure("Invalid command text."));
+        }
+        self.player_chat(
+            player,
+            ChatRequest::Whisper {
+                target,
+                message: text,
+            },
+        )
+    }
+}
+
 impl CommandHost for &super::Players {
+    fn command_active(&self, source: &crate::command::SourceStack) -> bool {
+        source.authenticated_player().is_none_or(|player| {
+            lock(&self.registry)
+                .players
+                .get(&player)
+                .is_some_and(Slot::chat_ready)
+        })
+    }
     fn list_players(&mut self) -> io::Result<CommandResult> {
         Ok(lock(&self.registry).chat_roster())
     }
@@ -271,6 +350,40 @@ mod tests {
         assert_eq!(queued(&bob), 0);
         assert_eq!(whisper("bob"), "[To BOB] secret");
         assert_eq!(queued(&alternate), 1);
+    }
+
+    #[test]
+    fn command_host_does_not_revive_after_reconfiguration_or_reconnect() {
+        use crate::command::{CommandSource, SourceStack};
+        let players = Players::new(1);
+        let alice = ready(&players, 1, "Alice");
+        let source = SourceStack::new(CommandSource::player(Uuid::from_u128(1)));
+        let mut old_host = players.command_host(&source);
+        assert!(old_host.command_active(&source));
+        alice.pause();
+        assert!(!old_host.command_active(&source));
+        alice.enter_play();
+        alice.show(Peer {
+            uuid: Uuid::from_u128(1),
+            name: "Alice".into(),
+            id: 1,
+            pose: EntityPose::new([8.5, 65.0, 8.5], 0.0, 0.0, false),
+            info: Arc::from([]),
+        });
+        assert!(!old_host.command_active(&source));
+        assert!(
+            !old_host
+                .action(Uuid::from_u128(1), "stale")
+                .unwrap()
+                .success
+        );
+        let second_host = players.command_host(&source);
+        assert!(second_host.command_active(&source));
+        drop(alice);
+        let _replacement = ready(&players, 1, "Alice");
+        assert!(!old_host.command_active(&source));
+        assert!(!second_host.command_active(&source));
+        assert!(players.command_host(&source).command_active(&source));
     }
 
     #[test]

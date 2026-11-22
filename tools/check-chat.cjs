@@ -69,10 +69,12 @@ function expectTree ({ nodes, rootIndex }) {
   const root = nodes[rootIndex]
   assert.equal(root.flags.command_node_type, 0)
   const commands = Object.fromEntries(root.children.map(i => [nodes[i].extraNodeData.name, nodes[i]]))
-  assert.deepEqual(Object.keys(commands).sort(), ['help', 'list', 'me', 'msg', 'tell'])
+  assert.deepEqual(Object.keys(commands).sort(), ['fixture', 'help', 'list', 'me', 'msg', 'tell'])
   for (const command of ['help', 'list']) assert.equal(commands[command].flags.has_command, 1)
   for (const command of ['msg', 'tell']) {
-    const target = nodes[commands[command].children[0]]
+    const branch = command === 'tell' ? nodes[commands.tell.redirectNode] : commands.msg
+    assert.equal(branch, commands.msg)
+    const target = nodes[branch.children[0]]
     assert.equal(target.extraNodeData.name, 'target')
     assert.equal(target.extraNodeData.parser, 'brigadier:string')
     assert.equal(target.extraNodeData.properties, 'SINGLE_WORD')
@@ -82,6 +84,10 @@ function expectTree ({ nodes, rootIndex }) {
     assert.equal(message.flags.has_command, 1)
   }
   assert.equal(nodes[commands.me.children[0]].extraNodeData.properties, 'GREEDY_PHRASE')
+  const fixture = nodes[commands.fixture.children[0]]
+  assert.equal(fixture.flags.has_custom_suggestions, 1)
+  assert.equal(fixture.extraNodeData.suggestionType, 'minecraft:ask_server')
+  assert.equal(nodes[commands.me.children[0]].flags.has_custom_suggestions, 0)
 }
 
 function settings (state, chatFlags) {
@@ -104,6 +110,30 @@ async function run () {
   const bob = await join('Bob')
   const cara = await join('Cara')
   expectTree(alice.tree)
+  async function complete (state, transactionId, text) {
+    let reply
+    const receive = packet => { if (packet.transactionId === transactionId) reply = packet }
+    state.client.on('tab_complete', receive)
+    try {
+      state.client.write('tab_complete', { transactionId, text })
+      await waitFor(() => reply, 'completion transaction ' + transactionId)
+      return reply
+    } finally {
+      state.client.removeListener('tab_complete', receive)
+    }
+  }
+  const literal = await complete(alice, 17, '/he')
+  assert.equal(literal.start, 1)
+  assert.equal(literal.length, 2)
+  assert.deepEqual(literal.matches.map(value => value.match), ['help'])
+  const unicode = await complete(bob, 18, '/fixture 🙂')
+  assert.equal(unicode.start, 9)
+  assert.equal(unicode.length, 2)
+  assert.equal(unicode.matches[0].match, '你好🙂')
+  assert.equal(unicode.matches[0].tooltip.value, '异步提示')
+  assert.deepEqual((await complete(cara, 19, '/fixture_hidden')).matches, [])
+  await new Promise(resolve => setTimeout(resolve, 230))
+  assert.deepEqual((await complete(bob, 20, '/fixture wait')).matches, [])
   cara.client.chat('/list')
   await expectMessage(cara, 'Online (3): Alice, Bob, Cara')
 
@@ -163,7 +193,7 @@ async function run () {
   })
   alice.client.chat('/list')
   await expectMessage(alice, 'Online (3): Alice, Bob, Cara')
-  console.log('PASS: command tree, Unicode, signed command framing, private isolation, chat settings, and Play heartbeat')
+  console.log('PASS: command tree, async completion, UTF-16 ranges, tooltip, permissions, timeout, Unicode chat, private isolation, and Play heartbeat')
 }
 
 run().catch(error => {

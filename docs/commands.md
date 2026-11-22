@@ -1,107 +1,82 @@
 # 命令系统
 
-命令入口与聊天、网络协议分离：
+目标基线是 Java 1.21.1（协议 767）随附的 **Brigadier 1.3.10**。已实现第一阶段的命令树核心，以及第二阶段的来源上下文和有界执行队列；仍不是完整的 Minecraft 命令运行环境。
 
-- `src/command/mod.rs`：注册定义、权限/来源、执行接口与结果。
-- `src/command/parse.rs`：参数类型、引号与错误位置。
-- `src/command/builtins.rs`：`help`、`list`、`me`、`msg`（别名 `tell`）。
-- `src/protocol/packets/play_chat.rs`：把同一注册表转换为协议 767 命令树。
-- `src/handler/play/chat.rs`：玩家就绪检查、限频及调用，不再解析具体命令。
+- `src/command/mod.rs`：注册、命令来源、Host 与玩家/控制台适配层。
+- `src/command/tree.rs`：不可变节点树、重定向图、解析结果、执行与补全。
+- `src/command/parse.rs`：UTF-16 reader、内建参数、自定义解析器接口。
+- `src/command/source.rs`、`runtime.rs`：来源变换、反馈回调、有界任务队列与执行帧。
+- `src/command/builtins.rs`：保留 `/help`、`/list`、`/me`、`/msg`、`/tell`，未新增内置命令。
+- `src/protocol/packets/play_chat.rs`：从同一注册表生成客户端命令树。
 
-## 注册新命令
+核心语义参考官方 [Brigadier](https://github.com/Mojang/brigadier) 1.3.10 源码。相关 MIT 许可见 [第三方许可](third-party/brigadier-LICENSE)。
 
-注册表构建后不可修改；在启动前注入 `PlayService`，无需修改聊天处理器或协议编解码：
+## 注册
+
+简单命令使用 `Command::new(...).argument(...).alias(...)` 后交给 `CommandRegistryBuilder::register`；复杂命令通过节点 API 注册。节点的 executor 不依赖叶节点，因而可表达默认行为和可选参数。
 
 ```rust
 use zcraft::{
-    command::{ArgumentKind, Command, CommandRegistryBuilder, CommandResult},
+    command::{ArgumentKind, CommandNode, CommandRegistryBuilder, CommandResult, NodeId},
     handler::play::PlayService,
 };
 
 fn custom_play_service() -> Result<PlayService, Box<dyn std::error::Error>> {
-let mut builder = CommandRegistryBuilder::with_builtins();
-builder.register(
-    Command::new("count", "return a numeric result", |call, _host| {
-        Ok(CommandResult::success(
-            call.arguments.integer("value").expect("declared argument"),
-        ))
-    })
-    .alias("result")
-    .permission(2)
-    .argument("value", ArgumentKind::Integer { min: 0, max: 100 }),
-);
-let registry = builder.build().expect("valid command definitions");
-Ok(PlayService::new()?.with_commands(registry))
+    let mut builder = CommandRegistryBuilder::with_builtins();
+    let demo = builder.add_node(
+        NodeId::ROOT,
+        CommandNode::literal("demo").executes(|_, _| Ok(CommandResult::success(1))),
+    )?;
+    let count = builder.add_node(demo, CommandNode::literal("count"))?;
+    builder.add_node(
+        count,
+        CommandNode::argument("value", ArgumentKind::Integer { min: 0, max: 100 })
+            .executes(|call, _| {
+                Ok(CommandResult::success(call.arguments.integer("value").unwrap()))
+            }),
+    )?;
+    Ok(PlayService::new()?.with_commands(builder.build()?))
 }
-// 把返回的 PlayService 放入 ServerContext，然后调用 serve_with_context。
 ```
 
-`Command::new` 接收不捕获环境的执行函数/闭包。函数取得 `Invocation`（来源、类型化参数、注册表）及 `CommandHost`。Host 目前提供列举玩家、玩家动作消息和私聊三项能力；新增有副作用的游戏命令时，应扩展受控 Host 能力及其服务端实现，而非从命令解析层访问 Session 或 socket。纯计算命令不需要修改 Host。
+将返回的服务放入 `ServerContext`，再调用 `serve_with_context`。树冻结后不可修改。同一父节点下重名时复用节点，保留最初类型、要求及重定向；新 executor 可覆盖旧 executor。调用方可以在返回的节点上继续挂载新的分支。`find_node`/`path` 查找路径，`find_ambiguities` 通过类型示例提示相邻分支的重叠。
 
-执行函数是同步的，不应执行阻塞 I/O 或长时间计算。返回反馈应保持简短；反馈以系统消息发送时仍受 NBT 字符串/协议长度限制。
+## 解析与执行
 
-## 一份定义，多处使用
+- `registry.dispatch(input, source)` 返回可复用的 `ParseResults`，即使输入不完整也能检查游标、已解析路径、参数范围、候选错误和补全。
+- `dispatch_at` 从指定 UTF-16 游标开始。核心接收原样输入，不移除 `/` 或修剪空格。`ServerContext::execute_command` 是服务端便利适配器，处理前导 `/`、首尾空白和 4096 字节上限；网络聊天入口另行检查字符与 256 UTF-16 码元限制。
+- 支持六种内建参数解析器：布尔、i32、i64、f32、f64、字符串（单词、单/双引号或剩余文本）。`ArgumentParser` 可返回任意 `Send + Sync` 类型，使用 `Arguments::custom` 取值。无协议描述的自定义类型只在服务端出现。
+- `ParseResults::execute` 接受 `CommandHost`，无需 Session 或 socket。`CommandResult` 包含成功状态、整数值与反馈。执行函数不应阻塞 I/O。回调返回的 `io::Error` 不参与分叉的普通命令失败处理。
+- `requires` 给节点设置来源谓词；`redirects` 建立上下文链，`forks` 为子链提供多个来源。普通重定向汇总值，分叉汇总成功次数。`result_consumer` 观察单次执行结果。
+- 重定向进入目标**子树**，不重新解析目标节点自身。命令注册者必须为别名/入口设适当的前置要求；便捷别名继承原命令权限。来源修改器是可信服务端代码，不能直接使用客户端提供的权限值。
+- `all_usage`、`smart_usage` 提供树用法。`ParseResults::suggestions(cursor)` 执行同步 provider；`suggestions_async(cursor)` 同时轮询独立异步 provider，同一节点没有异步 provider 时回退到同步版本。两者都按节点权限过滤，使用 UTF-16 替换范围，拒绝越界/切开代理对的范围，合并后排序去重。异步 provider 出错则跳过，取消会丢弃待完成的 future。
 
-每项定义包含名称、别名、说明、最低权限、是否仅限玩家、参数和执行函数：
+服务端策略限制最多 1024 个节点，默认最多 8192 次分支访问、128 层解析和 256 个派生来源。预算不足显式失败，不冒充语法错误。服务端入口在其上使用独立的来源栈和帧/队列运行时；同步执行，不做跨 tick 调度。
 
-- `parse` 根据定义读取并校验参数。
-- `execute` 在执行函数前检查来源和权限。
-- `help` 自动生成当前来源可用的帮助与用法。
-- `DeclareCommands::new` 生成相同来源可用的客户端命令树。
-- 别名复用参数路径和执行函数，不能绕过权限。
+## 来源与执行队列
 
-构建阶段拒绝重名/冲突别名、非法名称、重复参数名、倒置整数边界和不处于末尾的贪婪参数。最多 1024 个协议节点，每个命令最多 16 个参数。
+`ServerContext::run_command` 接受 `SourceStack`，支持位置、旋转、维度比例、执行实体及脚/眼锚点变换；
+执行实体与原认证身份分离，提供静默反馈和组合结果回调。Executor 可通过 `host.execution()`
+排入同帧或子帧任务、返回帧结果或取消整条链，预算在所有任务间共享。
+默认成本 128、派生来源 64、待执行任务 64、帧深度 16；玩家命令绑定当前 Play 生命周期，
+重新配置或重连不会复活旧链。完整语义、调用示例及与原版的差异见 [执行运行时](command-runtime.md)。
 
-## 参数与解析
+玩家，由认证会话提供 UUID、位置和固定权限 0；控制台及未来命令方块可由服务端构造 `CommandSource`，携带权限及 `Origin { world, position }`。`/help` 和 `/list` 可程序化调用；`/me`、`/msg`、`/tell` 仅供玩家。命令方块本身、OP 与权限热更新均未实现。
 
-当前每条命令是一条有序的**必填参数路径**，支持：
+在线补全：协议 767 的 `0x0b` 请求与 `0x10` 响应保留事务 ID 和 UTF-16 替换范围，支持可选 NBT 提示。带 `.suggests(...)` 或 `.suggests_async(...)` 的可序列化参数节点声明 `minecraft:ask_server`；其他节点不声明。`suggests_async` 接收返回 `SuggestionFuture` 的函数（例如 `|ctx| Box::pin(async move { Ok(vec![ctx.suggest("example")]) })`）。同步和异步 provider 都应为可信、非阻塞代码，不应自行启动无法取消的工作。
 
-| 类型 | 语义 | 协议解析器 |
-|---|---|---|
-| `Word` | 单词，字符集为 ASCII 字母数字及 `_-.+` | `brigadier:string` / SINGLE_WORD |
-| `String` | 单词或双引号字符串，支持 `\"`、`\\` 转义及引号内 Unicode | `brigadier:string` / QUOTABLE_PHRASE |
-| `Greedy` | 剩余文本，保留内部空格，必须位于末尾 | `brigadier:string` / GREEDY_PHRASE |
-| `Integer { min, max }` | 带上下界的 i32 | `brigadier:integer` |
-| `Bool` | `true` 或 `false` | `brigadier:bool` |
+每个就绪 Play 连接每 200 ms 最多处理一次补全（超频直接丢弃），与聊天限频独立；核心输入上限为 4096 字节，返回最多 128 项，单项文本和提示各最多 1024 字节。连接内等待上限为 100 ms，超时取消本次补全并返回空结果；不启动后台任务，重新配置期间不处理补全。
 
-支持可选前导 `/`，参数间使用 ASCII 空格。拒绝尾随多余参数、换行、格式控制符和方向覆盖字符。`CommandError` 包含错误说明、原始输入的 UTF-8 **字节**范围及用法。面向网络玩家的错误是私有反馈，不会广播。
-
-核心输入最多 4096 字节；玩家聊天包仍执行独立的 256 UTF-16 单元限制。框架不是完整 Brigadier：暂不支持可选参数、分支子命令、选择器、相对坐标或动态补全建议。
-
-## 来源、权限与反馈
-
-`CommandSource` 是**可信服务端输入**：
-
-- `Player(uuid)`：玩家身份；网络入口仅从认证会话取 UUID，权限固定为 0，位置来自服务端 Play 状态。
-- `Console`：程序化服务端调用，可明确赋予权限。
-- `CommandBlock`：预留的非玩家来源，通过 `Origin { world, position }` 提供上下文。
-
-没有 OP 系统或权限热更新。不得把客户端传来的 UUID、权限等级或命令方块位置直接填入来源。隐藏客户端命令树不能代替服务端权限检查，二者都执行检查。
-
-调用不需要 Session 或网络连接：
-
-```rust
-use zcraft::command::{CommandSource, Origin, SourceKind};
-
-let source = CommandSource {
-    kind: SourceKind::CommandBlock,
-    permission: 2,
-    origin: Some(Origin {
-        world: "minecraft:overworld".into(),
-        position: [8.0, 64.0, 8.0],
-    }),
-};
-// let result = server_context.execute_command(&source, "list")?;
-```
-
-也可直接用 `CommandRegistry::execute` 和自己的 `CommandHost`，用于无服务器测试或嵌入。
-
-`CommandResult` 包含 `success`、数值 `value` 及私有 `feedback`；语法、权限、普通业务失败返回失败结果，底层 I/O 错误保留为 `io::Error`。`list` 的数值结果为可参与聊天的在线玩家数。`help`/`list` 支持所有来源，`me`/`msg`/`tell` 仅支持玩家；目标不可用会返回失败结果，私聊不会泄露给第三方。
-
-玩家入口保留原有聊天限频和设置。核心不依赖玩家限频；未来命令方块的 tick 调度、执行总预算、条件链、输出保存及反馈去向必须由调用方实现，本次没有实现这些机制，也没有提供控制台读取循环。
+尚未完成：Minecraft 来源栈全部方法、跨 tick/命令方块与函数调度、48 种 Minecraft 专用参数及依赖世界的求值。Rust 字符串不保留未配对代理项；极端浮点错误的 Java 数字显示细节未完整移植。当前差分覆盖不是对所有输入完全兼容的证明。
 
 ## 验证
 
-- `src/command/tests.rs`：类型、引号、Unicode、错误范围、注册约束、权限、别名、协议树。
-- `tests/commands.rs`：注入自定义命令，在真实 `ServerContext` 中用控制台/模拟命令方块调用，无需连接。
-- `tools/check-chat.cjs`：独立客户端解码命令树并验证原有聊天与私聊行为。
+默认 Rust 测试读取 `tests/fixtures/brigadier-1.3.10.tsv`，无需 Java。参考工具从官方 1.21.1 服务端 JAR 抽取准确版本，并对照 `META-INF/libraries.list` 验证嵌套 JAR 的 SHA-256。可选测试重新运行官方 Java dispatcher，确保 fixture 未过期：
+
+```sh
+cargo test --locked --test brigadier
+ZCRAFT_BRIGADIER_SERVER_JAR=target/zcraft-data/1.21.1/server.jar \
+  cargo test --locked --test brigadier regenerate_against_reference_jar -- --ignored
+```
+
+覆盖 106 组输入/权限组合：解析游标、错误文本及位置、执行结果、建议文本及替换范围；另有 51 条普通与智能用法。独立 Minecraft 协议客户端测试验证 `tell` 的真实 redirect 节点及原有聊天行为。
