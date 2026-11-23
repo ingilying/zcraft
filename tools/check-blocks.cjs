@@ -45,6 +45,12 @@ const place = (peer, location, sequence, hand = 0) => peer.write('block_place', 
 })
 const dig = (peer, location, sequence) => peer.write('block_dig', { status: 0, location, face: 1, sequence })
 const ack = (peer, sequenceId) => peer.expect('acknowledge_player_digging', p => p.sequenceId === sequenceId)
+const emptyStack = { itemCount: 0 }
+const stack = (itemId, itemCount = 64) => ({ itemCount, itemId, addedComponentCount: 0, removedComponentCount: 0, components: [], removeComponents: [] })
+const click = (peer, stateId, location, cursorItem, changedItem) => peer.write('window_click', {
+  windowId: 0, stateId, slot: location, mouseButton: 0, mode: 0,
+  changedSlots: [{ location, item: changedItem }], cursorItem
+})
 const change = (peer, location, type, since) => peer.expect('block_change', p => same(p.location, location) && p.type === type, since)
 const chunkWith = (packet) => {
   const chunk = new Chunk({ minY: -64, worldHeight: 384 })
@@ -107,6 +113,22 @@ async function run () {
   place(a, support, 3)
   await change(a, target, glass, cursorA)
   await ack(a, 3)
+
+  // Server-authoritative storage: move glass to another hotbar slot. Client
+  // changedSlots/cursor reports are advisory and the server returns full state.
+  cursorA = a.events.length
+  click(a, corrected.stateId, 38, stack(md.itemsByName.glass.id), emptyStack)
+  const carrying = await a.expect('window_items', p => p.carriedItem.itemId === md.itemsByName.glass.id && p.items[38].itemCount === 0, cursorA)
+  cursorA = a.events.length
+  click(a, carrying.stateId, 39, emptyStack, stack(md.itemsByName.glass.id))
+  const stored = await a.expect('window_items', p => p.carriedItem.itemCount === 0 && p.items[39].itemId === md.itemsByName.glass.id, cursorA)
+  assert(stored.stateId > carrying.stateId)
+  slot(a, 3)
+  cursorA = a.events.length
+  place(a, { ...support, x: 12 }, 7)
+  await change(a, { ...target, x: 12 }, glass, cursorA)
+  await ack(a, 7)
+
   cursorB = b.events.length
   move(b, 8.5, 8.5)
   const reloaded = chunkWith(await b.expect('map_chunk', p => p.x === 0 && p.z === 0, cursorB))
@@ -128,7 +150,7 @@ async function run () {
   place(a, { ...support, x: 11 }, 6)
   await change(b, { ...target, x: 11 }, dirt, cursorB)
   await ack(a, 6)
-  console.log('PASS: creative inventory, ordered break/place and acknowledgements, nearby sync, light, out-of-reach/offhand denial, and edited chunk reload')
+  console.log('PASS: authoritative inventory storage, item-driven placement, ordered mining/placement acknowledgements, nearby sync, light, denial, and edited chunk reload')
 }
 
 const timeout = setTimeout(() => {

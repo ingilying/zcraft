@@ -1,5 +1,6 @@
 //! Block interaction and inventory packets for Java 1.21.1 / protocol 767.
 use crate::{
+    game::{Inventory, InventoryClick, ItemStack, SLOT_COUNT, item_by_id},
     protocol::{Decode, Encode, Reader, invalid, put_varint},
     world::BlockPos,
 };
@@ -69,25 +70,107 @@ impl Decode for BlockPlace {
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub struct CreativeSlot;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncomingStack {
+    Empty,
+    Supported(ItemStack),
+    Unsupported,
+}
+impl IncomingStack {
+    pub fn supported(self) -> Option<Option<ItemStack>> {
+        match self {
+            Self::Empty => Some(None),
+            Self::Supported(stack) => Some(Some(stack)),
+            Self::Unsupported => None,
+        }
+    }
+}
+fn item_stack(r: &mut Reader<'_>) -> io::Result<IncomingStack> {
+    let count = r.varint()?;
+    if count == 0 {
+        return Ok(IncomingStack::Empty);
+    }
+    if !(1..=64).contains(&count) {
+        return Err(invalid("invalid item count"));
+    }
+    let id = r.varint()?;
+    let added = r.varint()?;
+    let removed = r.varint()?;
+    if added != 0 || removed != 0 {
+        return Err(invalid("item components are not supported"));
+    }
+    let Some(item) = item_by_id(id) else {
+        return Ok(IncomingStack::Unsupported);
+    };
+    Ok(ItemStack::new(item.kind, count as u8)
+        .map_or(IncomingStack::Unsupported, IncomingStack::Supported))
+}
+fn put_item_stack(stack: Option<ItemStack>, out: &mut Vec<u8>) {
+    if let Some(stack) = stack {
+        put_varint(i32::from(stack.count), out);
+        put_varint(stack.definition().protocol_id, out);
+        put_varint(0, out);
+        put_varint(0, out)
+    } else {
+        put_varint(0, out)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CreativeSlot {
+    pub slot: i16,
+    pub item: IncomingStack,
+}
 impl Decode for CreativeSlot {
     fn decode(r: &mut Reader<'_>) -> io::Result<Self> {
-        r.u16()?;
-        // Reject changes as a policy. Never deserialize user-provided components.
-        r.remaining(16_384)?;
-        Ok(Self)
+        Ok(Self {
+            slot: r.i16()?,
+            item: item_stack(r)?,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct InventoryClickPacket {
+    pub window: u8,
+    pub state_id: i32,
+    pub click: InventoryClick,
+}
+impl Decode for InventoryClickPacket {
+    fn decode(r: &mut Reader<'_>) -> io::Result<Self> {
+        let packet = Self {
+            window: r.u8()?,
+            state_id: r.varint()?,
+            click: InventoryClick {
+                slot: r.i16()?,
+                button: r.i8()?,
+                mode: r.varint()?,
+            },
+        };
+        let changed = r.varint()?;
+        if !(0..=128).contains(&changed) {
+            return Err(invalid("invalid changed-slot count"));
+        }
+        for _ in 0..changed {
+            r.i16()?;
+            item_stack(r)?;
+        }
+        item_stack(r)?;
+        Ok(packet)
     }
 }
 
 #[derive(Debug, PartialEq)]
-pub struct UseItem(pub i32);
+pub struct UseItem {
+    pub hand: i32,
+    pub sequence: i32,
+}
 impl Decode for UseItem {
     fn decode(r: &mut Reader<'_>) -> io::Result<Self> {
-        r.varint()?;
-        let id = sequence(r)?;
+        let hand = r.varint()?;
+        let sequence = sequence(r)?;
         r.take(8)?;
-        Ok(Self(id))
+        Ok(Self { hand, sequence })
     }
 }
 
@@ -126,24 +209,31 @@ impl Encode for LightUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreativeHotbar;
-impl Encode for CreativeHotbar {
+pub struct InventoryContent(pub Inventory);
+impl Encode for InventoryContent {
     fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
-        out.extend([0, 0]); // Player inventory container and state ID.
-        put_varint(46, out);
-        for slot in 0usize..46 {
-            if let Some(&(id, _)) = slot
-                .checked_sub(36)
-                .and_then(|i| crate::world::HOTBAR.get(i))
-            {
-                out.push(64);
-                put_varint(id, out);
-                out.extend([0, 0]); // No component overrides.
-            } else {
-                out.push(0);
-            }
+        out.push(0);
+        put_varint(self.0.state_id(), out);
+        put_varint(SLOT_COUNT as i32, out);
+        for stack in self.0.slots() {
+            put_item_stack(*stack, out)
         }
-        out.push(0); // Empty cursor stack.
+        put_item_stack(self.0.carried(), out);
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetInventorySlot {
+    pub state_id: i32,
+    pub slot: i16,
+    pub item: Option<ItemStack>,
+}
+impl Encode for SetInventorySlot {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        out.push(0);
+        put_varint(self.state_id, out);
+        out.extend(self.slot.to_be_bytes());
+        put_item_stack(self.item, out);
         Ok(())
     }
 }
@@ -172,5 +262,74 @@ mod tests {
         let mut ack = Vec::new();
         BlockAck(300).encode(&mut ack).unwrap();
         assert_eq!(ack, [0xac, 2]);
+    }
+
+    #[test]
+    fn inventory_slots_are_bounded_typed_and_component_free() {
+        let inventory = Inventory::default();
+        let mut body = Vec::new();
+        InventoryContent(inventory.clone())
+            .encode(&mut body)
+            .unwrap();
+        let mut r = Reader::new(&body);
+        assert_eq!(r.u8().unwrap(), 0);
+        assert_eq!(r.varint().unwrap(), 0);
+        assert_eq!(r.varint().unwrap(), SLOT_COUNT as i32);
+        for (index, expected) in inventory.slots().iter().enumerate() {
+            let decoded = item_stack(&mut r).unwrap().supported().unwrap();
+            assert_eq!(decoded, *expected, "slot {index}");
+        }
+        assert_eq!(item_stack(&mut r).unwrap(), IncomingStack::Empty);
+        r.finish().unwrap();
+
+        let mut known = Vec::new();
+        known.extend(36i16.to_be_bytes());
+        put_item_stack(ItemStack::new(crate::game::ItemKind::Stone, 12), &mut known);
+        let mut r = Reader::new(&known);
+        assert_eq!(
+            CreativeSlot::decode(&mut r).unwrap().item,
+            IncomingStack::Supported(ItemStack::new(crate::game::ItemKind::Stone, 12).unwrap())
+        );
+        r.finish().unwrap();
+
+        let mut unknown = Vec::new();
+        unknown.extend(36i16.to_be_bytes());
+        for value in [1, 9999, 0, 0] {
+            put_varint(value, &mut unknown);
+        }
+        assert_eq!(
+            CreativeSlot::decode(&mut Reader::new(&unknown))
+                .unwrap()
+                .item,
+            IncomingStack::Unsupported
+        );
+
+        let mut component = Vec::new();
+        component.extend(36i16.to_be_bytes());
+        for value in [1, 1, 1, 0] {
+            put_varint(value, &mut component);
+        }
+        assert!(CreativeSlot::decode(&mut Reader::new(&component)).is_err());
+
+        let mut click = vec![0]; // Player inventory container.
+        put_varint(7, &mut click);
+        click.extend(38i16.to_be_bytes());
+        click.push(0);
+        put_varint(0, &mut click);
+        put_varint(1, &mut click);
+        click.extend(38i16.to_be_bytes());
+        put_item_stack(None, &mut click);
+        put_item_stack(ItemStack::new(crate::game::ItemKind::Glass, 64), &mut click);
+        let packet = InventoryClickPacket::decode(&mut Reader::new(&click)).unwrap();
+        assert_eq!(packet.window, 0);
+        assert_eq!(packet.state_id, 7);
+        assert_eq!(
+            packet.click,
+            InventoryClick {
+                slot: 38,
+                button: 0,
+                mode: 0
+            }
+        );
     }
 }

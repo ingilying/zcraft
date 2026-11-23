@@ -1,13 +1,14 @@
-//! Server-authoritative interactions for the fixed creative hotbar.
+//! Server-authoritative inventory, item use, placement, and mining.
 #[cfg(test)]
 #[path = "blocks_tests.rs"]
 mod tests;
 use super::{Context, Outcome, play};
 use crate::{
+    game::{Hand, ItemUse},
     players::Reservation,
     protocol::{
         Clientbound,
-        packets::{play::HeldItemSlot, play_blocks::*, play_common::IgnoredInventoryClick},
+        packets::{play::HeldItemSlot, play_blocks::*},
     },
     world::{self, BlockPos, BlockWorld, Snapshot},
 };
@@ -17,7 +18,6 @@ use std::{collections::HashMap, io, sync::Arc};
 pub(super) struct CreativeSession {
     world: Arc<BlockWorld>,
     pending_chunks: HashMap<[i32; 2], Snapshot>,
-    selected: u8,
 }
 
 impl CreativeSession {
@@ -25,7 +25,6 @@ impl CreativeSession {
         Self {
             world,
             pending_chunks: HashMap::new(),
-            selected: 0,
         }
     }
 
@@ -130,9 +129,14 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
     let mut blocks = creative.world.lock();
     let (positions, edit) = match action {
         Action::Dig { pos, face, start } => {
-            let edit = if start && face < 6 && reachable(pos) && !matches!(blocks.get(pos), 0 | 79)
+            let current = blocks.get(pos);
+            let edit = if start
+                && face < 6
+                && reachable(pos)
+                && crate::game::block_by_state(current)
+                    .is_some_and(|block| block.hardness.is_some())
             {
-                Some((pos, 0))
+                Some((pos, crate::game::BlockKind::Air.state()))
             } else {
                 None
             };
@@ -146,15 +150,20 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
         } => {
             let place = support.on_face(face);
             let edit = place.and_then(|pos| {
-                let &(_, material) = world::HOTBAR.get(usize::from(creative.selected))?;
-                (hand == 0
-                    && hit.iter().all(|f| (0.0..=1.0).contains(f))
+                let hand = Hand::from_wire(hand)?;
+                let stack = session.inventory.hand(hand)?;
+                let ItemUse::Place(kind) = stack.definition().use_action else {
+                    return None;
+                };
+                let support_block = crate::game::block_by_state(blocks.get(support))?;
+                let target_block = crate::game::block_by_state(blocks.get(pos))?;
+                (hit.iter().all(|f| (0.0..=1.0).contains(f))
                     && reachable(support)
                     && reachable(pos)
-                    && blocks.get(support) != 0
-                    && blocks.get(pos) == 0
-                    && !intersects_player(state.position, pos))
-                .then_some((pos, material))
+                    && !support_block.replaceable
+                    && target_block.replaceable
+                    && (!kind.definition().collision || !intersects_player(state.position, pos)))
+                .then_some((pos, kind.state()))
             });
             ([Some(support), place], edit)
         }
@@ -193,18 +202,31 @@ fn reply(replies: Vec<Clientbound>) -> Outcome {
 }
 
 pub async fn handle_dig(ctx: &mut Context<'_>, p: PlayerDigging) -> io::Result<Outcome> {
-    if !matches!(p.action, 0..=2) {
-        return inventory(ctx).await;
+    match p.action {
+        0..=2 => interact(
+            ctx,
+            Action::Dig {
+                pos: p.pos,
+                face: p.face,
+                start: p.action == 0,
+            },
+            p.sequence,
+        ),
+        3 => {
+            ctx.session.inventory.drop_hand(Hand::Main, true);
+            inventory(ctx)
+        }
+        4 => {
+            ctx.session.inventory.drop_hand(Hand::Main, false);
+            inventory(ctx)
+        }
+        5 => Ok(Outcome::empty()), // Release use-item; no continuous actions exist yet.
+        6 => {
+            ctx.session.inventory.swap_hands();
+            inventory(ctx)
+        }
+        _ => inventory(ctx),
     }
-    interact(
-        ctx,
-        Action::Dig {
-            pos: p.pos,
-            face: p.face,
-            start: p.action == 0,
-        },
-        p.sequence,
-    )
 }
 
 pub async fn handle_place(ctx: &mut Context<'_>, p: BlockPlace) -> io::Result<Outcome> {
@@ -221,38 +243,58 @@ pub async fn handle_place(ctx: &mut Context<'_>, p: BlockPlace) -> io::Result<Ou
 }
 
 pub async fn handle_use_item(ctx: &mut Context<'_>, p: UseItem) -> io::Result<Outcome> {
+    let _action = Hand::from_wire(p.hand)
+        .and_then(|hand| ctx.session.inventory.hand(hand))
+        .map(|stack| stack.definition().use_action)
+        .unwrap_or(ItemUse::None);
     if let Some(slot) = &ctx.session.reservation
         && ctx.server.play.game_mode == crate::config::GameMode::Creative
     {
-        // Acknowledge in the same FIFO as preceding edits.
-        let ack = Clientbound::from(BlockAck(p.0)).encode()?.into();
+        // Future food/tools/projectiles dispatch through ItemUse here. Even a
+        // no-op use is acknowledged in the same FIFO as block predictions.
+        let ack = Clientbound::from(BlockAck(p.sequence)).encode()?.into();
         slot.correct_blocks(Vec::new(), ack);
         return Ok(Outcome::empty());
     }
-    Ok(reply(vec![BlockAck(p.0).into()]))
+    Ok(reply(vec![BlockAck(p.sequence).into()]))
 }
 
 pub async fn handle_slot(ctx: &mut Context<'_>, p: HeldItemSlot) -> io::Result<Outcome> {
-    if let Some(state) = &mut play(ctx.session)?.creative {
-        state.selected = p.slot as u8;
-    }
+    play(ctx.session)?;
+    ctx.session.inventory.select(p.slot as u8);
     Ok(Outcome::empty())
 }
 
-async fn inventory(ctx: &mut Context<'_>) -> io::Result<Outcome> {
+fn inventory(ctx: &mut Context<'_>) -> io::Result<Outcome> {
     if play(ctx.session)?.creative.is_some() {
-        Ok(reply(vec![CreativeHotbar.into()]))
+        Ok(reply(vec![
+            InventoryContent(ctx.session.inventory.clone()).into(),
+        ]))
     } else {
         Ok(Outcome::empty())
     }
 }
 
-pub async fn handle_creative_slot(ctx: &mut Context<'_>, _: CreativeSlot) -> io::Result<Outcome> {
-    inventory(ctx).await
+pub async fn handle_creative_slot(ctx: &mut Context<'_>, p: CreativeSlot) -> io::Result<Outcome> {
+    if play(ctx.session)?.creative.is_none() {
+        return Ok(Outcome::empty());
+    }
+    if let Some(item) = p.item.supported() {
+        ctx.session.inventory.set_creative(p.slot, item);
+    }
+    inventory(ctx)
 }
 pub async fn handle_inventory_click(
     ctx: &mut Context<'_>,
-    _: IgnoredInventoryClick,
+    p: InventoryClickPacket,
 ) -> io::Result<Outcome> {
-    inventory(ctx).await
+    if play(ctx.session)?.creative.is_none() {
+        return Ok(Outcome::empty());
+    }
+    if p.window == 0 && p.state_id == ctx.session.inventory.state_id() {
+        let _ = ctx.session.inventory.click(p.click);
+    }
+    // Full authoritative state keeps unsupported modes and stale client state
+    // simple and makes adding containers later independent of player storage.
+    inventory(ctx)
 }

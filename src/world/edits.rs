@@ -6,7 +6,6 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-pub const HOTBAR: [(i32, i32); 3] = [(1, 1), (28, 10), (188, 519)]; // item ID, default state
 pub(crate) const MAX_EDITS: usize = 65_536;
 const MAX_CHUNK_EDITS: usize = 256;
 
@@ -61,11 +60,12 @@ impl BlockWorld {
 }
 
 fn base(y: i32) -> i32 {
+    use crate::game::BlockKind::*;
     match y {
-        60 => 79,
-        61 | 62 => 10,
-        63 => 9,
-        _ => 0,
+        60 => Bedrock.state(),
+        61 | 62 => Dirt.state(),
+        63 => GrassBlock.state(),
+        _ => Air.state(),
     }
 }
 
@@ -169,7 +169,9 @@ fn heights(edits: &Edits, qualifies: impl Fn(i32) -> bool) -> [u16; 256] {
 
 pub(crate) fn sky_heights(edits: &Snapshot) -> [u16; 256] {
     match edits {
-        Some(edits) => heights(edits, |s| s != 0 && s != 519),
+        Some(edits) => heights(edits, |state| {
+            crate::game::block_by_state(state).is_some_and(|block| block.blocks_skylight)
+        }),
         None => [(SURFACE_Y + 1 - MIN_Y) as u16; 256],
     }
 }
@@ -268,7 +270,9 @@ pub(crate) fn edited_payload(edits: &Arc<Edits>) -> Arc<[u8]> {
     put_varint(sections.len() as i32, &mut out);
     out.extend(sections);
     put_varint(0, &mut out);
-    out.extend_from_slice(&light_payload(&heights(edits, |s| s != 0 && s != 519)));
+    out.extend_from_slice(&light_payload(&heights(edits, |state| {
+        crate::game::block_by_state(state).is_some_and(|block| block.blocks_skylight)
+    })));
     out.into()
 }
 

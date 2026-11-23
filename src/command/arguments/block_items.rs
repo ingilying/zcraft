@@ -1,5 +1,5 @@
 //! Registry syntax with an explicit resolver for this server's existing flat
-//! world states and fixed creative hotbar. Not a complete vanilla registry.
+//! world states and registered inventory items. Not a complete vanilla registry.
 use super::{ResourceLocation, scalar};
 use crate::command::{
     ArgumentKind, ArgumentParser, ArgumentValue, CommandError, CommandNode, StringReader,
@@ -26,7 +26,7 @@ impl fmt::Display for RegistryValueError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::UnsupportedBlock => "Block is unavailable in the current world implementation.",
-            Self::UnsupportedItem => "Item is unavailable in the fixed creative inventory.",
+            Self::UnsupportedItem => "Item is unavailable in the current item registry.",
             Self::UnsupportedProperty => {
                 "Block property/state is unavailable in the current world implementation."
             }
@@ -40,15 +40,9 @@ impl BlockStateSpec {
         if self.name.namespace != "minecraft" {
             return Err(RegistryValueError::UnsupportedBlock);
         }
-        let id = match self.name.path.as_str() {
-            "air" => 0,
-            "stone" => 1,
-            "bedrock" => 79,
-            "dirt" => 10,
-            "grass_block" => 9,
-            "glass" => 519,
-            _ => return Err(RegistryValueError::UnsupportedBlock),
-        };
+        let id = crate::game::block_by_name(&self.name.path)
+            .ok_or(RegistryValueError::UnsupportedBlock)?
+            .state;
         if !self.properties.is_empty()
             && !(self.name.path == "grass_block"
                 && self.properties.len() == 1
@@ -60,17 +54,14 @@ impl BlockStateSpec {
     }
 }
 impl ItemSpec {
-    /// Actual existing hotbar item IDs; not arbitrary vanilla inventory support.
+    /// Actual registered item IDs; not arbitrary vanilla inventory support.
     pub fn resolve_existing(&self) -> Result<i32, RegistryValueError> {
         if self.name.namespace != "minecraft" {
             return Err(RegistryValueError::UnsupportedItem);
         }
-        match self.name.path.as_str() {
-            "stone" => Ok(1),
-            "dirt" => Ok(28),
-            "glass" => Ok(188),
-            _ => Err(RegistryValueError::UnsupportedItem),
-        }
+        crate::game::item_by_name(&self.name.path)
+            .map(|item| item.protocol_id)
+            .ok_or(RegistryValueError::UnsupportedItem)
     }
 }
 #[derive(Debug, Clone, Copy)]
@@ -203,11 +194,13 @@ fn suggest(ctx: &SuggestionContext<'_>, names: &[&str]) -> Vec<Suggestion> {
         .collect()
 }
 fn suggest_blocks(ctx: &SuggestionContext<'_>) -> Vec<Suggestion> {
-    suggest(
-        ctx,
-        &["air", "stone", "bedrock", "dirt", "grass_block", "glass"],
-    )
+    let names: Vec<_> = crate::game::blocks()
+        .iter()
+        .map(|block| block.name)
+        .collect();
+    suggest(ctx, &names)
 }
 fn suggest_items(ctx: &SuggestionContext<'_>) -> Vec<Suggestion> {
-    suggest(ctx, &["stone", "dirt", "glass"])
+    let names: Vec<_> = crate::game::items().iter().map(|item| item.name).collect();
+    suggest(ctx, &names)
 }

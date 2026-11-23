@@ -19,7 +19,7 @@
 //!   arrays follow set bits in ascending order, with 2048 bytes per nibble array.
 
 mod edits;
-pub use edits::{BlockPos, HOTBAR};
+pub use edits::BlockPos;
 pub(crate) use edits::{
     BlockWorld, Snapshot, changed_blocks, edited_payload, light_payload, sky_heights,
 };
@@ -54,7 +54,12 @@ const SECTION_COUNT: usize = (HEIGHT / 16) as usize;
 const LIGHT_SECTION_COUNT: usize = SECTION_COUNT + 2;
 const SURFACE_Y: i32 = 63;
 const GROUND_SECTION: usize = ((SURFACE_Y - MIN_Y) / 16) as usize;
-const BLOCK_PALETTE: [i32; 4] = [0, 79, 10, 9];
+const BLOCK_PALETTE: [i32; 4] = [
+    crate::game::BlockKind::Air.state(),
+    crate::game::BlockKind::Bedrock.state(),
+    crate::game::BlockKind::Dirt.state(),
+    crate::game::BlockKind::GrassBlock.state(),
+];
 const PLAINS_BIOME_ID: i32 = 0;
 const LIGHT_BYTES: usize = 2048;
 const ALL_LIGHT_SECTIONS: u64 = (1 << LIGHT_SECTION_COUNT) - 1;

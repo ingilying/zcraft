@@ -24,6 +24,8 @@ pub struct Session {
     pub(crate) loaded_resource_pack: Option<(uuid::Uuid, String)>,
     pub client_information: Option<crate::protocol::packets::common::ClientInformation>,
     pub play: Option<play::PlaySession>,
+    /// Authoritative player inventory survives Play reconfiguration on this connection.
+    pub(crate) inventory: crate::game::Inventory,
     pub(crate) entity_id: Option<i32>,
     chat_rate: play::chat::ChatRate,
     next_completion: Option<tokio::time::Instant>,
@@ -59,6 +61,7 @@ impl Default for Session {
             loaded_resource_pack: None,
             client_information: None,
             play: None,
+            inventory: crate::game::Inventory::default(),
             entity_id: None,
             chat_rate: play::chat::ChatRate::default(),
             next_completion: None,

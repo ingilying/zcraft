@@ -20,8 +20,7 @@ ignored!(
     IgnoredClientCommand,
     IgnoredCloseWindow,
     IgnoredAdvancementTab,
-    IgnoredSpectate,
-    IgnoredInventoryClick
+    IgnoredSpectate
 );
 
 #[derive(Debug, PartialEq, Eq)]

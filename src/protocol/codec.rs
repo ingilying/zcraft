@@ -90,8 +90,20 @@ impl<'a> Reader<'a> {
         Ok(self.take(len as usize)?.to_vec())
     }
 
+    pub fn u8(&mut self) -> io::Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    pub fn i8(&mut self) -> io::Result<i8> {
+        Ok(self.u8()? as i8)
+    }
+
     pub fn u16(&mut self) -> io::Result<u16> {
         Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
+    pub fn i16(&mut self) -> io::Result<i16> {
+        Ok(i16::from_be_bytes(self.take(2)?.try_into().unwrap()))
     }
 
     pub fn i64(&mut self) -> io::Result<i64> {

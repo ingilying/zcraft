@@ -3,6 +3,7 @@ pub mod command;
 pub mod config;
 pub mod context;
 pub mod eula;
+pub mod game;
 pub mod handler;
 pub mod identity;
 pub mod network;

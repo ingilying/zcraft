@@ -1,4 +1,4 @@
-//! Minimal flat world with spectator and fixed-hotbar creative modes.
+//! Minimal flat world with spectator and server-authoritative creative modes.
 pub(crate) mod blocks;
 pub(crate) mod chat;
 mod chunks;
@@ -12,7 +12,7 @@ use crate::{
         Clientbound, invalid,
         packets::{
             play::*,
-            play_blocks::{CreativeHotbar, SelectedSlot},
+            play_blocks::{InventoryContent, SelectedSlot},
             play_chat::DeclareCommands,
             play_common::*,
             play_entities::EntityPose,
@@ -175,7 +175,10 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         DeclareCommands::new(ctx.server.play.commands(), &command_source).into(),
     ];
     if game_mode == GameMode::Creative {
-        replies.extend([Clientbound::from(CreativeHotbar), SelectedSlot(0).into()]);
+        replies.extend([
+            Clientbound::from(InventoryContent(ctx.session.inventory.clone())),
+            SelectedSlot(ctx.session.inventory.selected()).into(),
+        ]);
     }
     replies.extend(first_batch);
     // The nearest chunks (including spawn) precede the initial teleport.
