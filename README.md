@@ -14,6 +14,11 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/ingilying/zcraft/actions/workflows/ci.yml"><img src="https://github.com/ingilying/zcraft/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/ingilying/zcraft/releases"><img src="https://img.shields.io/github/v/release/ingilying/zcraft?display_name=tag&sort=semver" alt="Release"></a>
+</p>
+
+<p align="center">
   <a href="#功能状态">功能状态</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="#配置">配置</a> ·
@@ -57,6 +62,12 @@ ZCraft 探索以 Rust 实现 Minecraft 服务端，将网络传输、协议编�
 尚未实现多版本协议映射。
 
 ## 快速开始
+
+### 预编译产物
+
+`main` 分支的每次推送都会构建 Linux x86_64/ARM64、Windows x86_64、macOS Intel/Apple Silicon 产物，可在对应的 [Actions 运行记录](https://github.com/ingilying/zcraft/actions/workflows/ci.yml)中下载，保留 14 天。推送 `v*` 标签时，同一批产物及 `SHA256SUMS` 会发布到 [GitHub Releases](https://github.com/ingilying/zcraft/releases)。
+
+下载后解压并运行 `zcraft`（Windows 为 `zcraft.exe`）。首次运行与源码构建相同，仍需阅读并手动接受 Minecraft EULA。发布包不包含 Mojang 服务端 JAR，也不需要安装 Java。
 
 ### 环境要求
 
