@@ -30,14 +30,57 @@ impl ServerContext {
         self.play.commands().run(
             input,
             source,
-            &mut self.players().command_host(source),
+            &mut ServerCommandHost {
+                server: self,
+                player: self.players().command_host(source),
+            },
             crate::command::ExecutionLimits::default(),
         )
+    }
+
+    /// Snapshot currently ready entities for command evaluation. The current
+    /// world contains players only; returned values do not retain registry locks.
+    pub fn command_entities(&self) -> Vec<crate::command::arguments::EntitySnapshot> {
+        self.players().command_entities(self.play.game_mode())
     }
 
     /// Shared admission, presence, and broadcast service.
     pub fn players(&self) -> &crate::players::Players {
         self.status.players()
+    }
+}
+
+struct ServerCommandHost<'a, H> {
+    server: &'a ServerContext,
+    player: H,
+}
+
+impl<H: crate::command::CommandHost> crate::command::CommandHost for ServerCommandHost<'_, H> {
+    fn list_players(&mut self) -> std::io::Result<crate::command::CommandResult> {
+        self.player.list_players()
+    }
+    fn action(
+        &mut self,
+        player: uuid::Uuid,
+        text: &str,
+    ) -> std::io::Result<crate::command::CommandResult> {
+        self.player.action(player, text)
+    }
+    fn whisper(
+        &mut self,
+        player: uuid::Uuid,
+        target: &str,
+        text: &str,
+    ) -> std::io::Result<crate::command::CommandResult> {
+        self.player.whisper(player, target, text)
+    }
+    fn command_active(&self, source: &crate::command::SourceStack) -> bool {
+        self.player.command_active(source)
+    }
+    fn command_entities(
+        &mut self,
+    ) -> std::io::Result<Vec<crate::command::arguments::EntitySnapshot>> {
+        Ok(self.server.command_entities())
     }
 }
 

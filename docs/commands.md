@@ -7,6 +7,7 @@
 - `src/command/parse.rs`：UTF-16 reader、内建参数、自定义解析器接口。
 - `src/command/source.rs`、`runtime.rs`：来源变换、反馈回调、有界任务队列与执行帧。
 - `src/command/builtins.rs`：保留 `/help`、`/list`、`/me`、`/msg`、`/tell`，未新增内置命令。
+- `src/command/arguments/`：已完成的 Minecraft 参数、坐标求值和现有世界查询适配，详见 [Minecraft 命令参数](command-arguments.md)。
 - `src/protocol/packets/play_chat.rs`：从同一注册表生成客户端命令树。
 
 核心语义参考官方 [Brigadier](https://github.com/Mojang/brigadier) 1.3.10 源码。相关 MIT 许可见 [第三方许可](third-party/brigadier-LICENSE)。
@@ -67,7 +68,7 @@ fn custom_play_service() -> Result<PlayService, Box<dyn std::error::Error>> {
 
 每个就绪 Play 连接每 200 ms 最多处理一次补全（超频直接丢弃），与聊天限频独立；核心输入上限为 4096 字节，返回最多 128 项，单项文本和提示各最多 1024 字节。连接内等待上限为 100 ms，超时取消本次补全并返回空结果；不启动后台任务，重新配置期间不处理补全。
 
-尚未完成：Minecraft 来源栈全部方法、跨 tick/命令方块与函数调度、48 种 Minecraft 专用参数及依赖世界的求值。Rust 字符串不保留未配对代理项；极端浮点错误的 Java 数字显示细节未完整移植。当前差分覆盖不是对所有输入完全兼容的证明。
+尚未完成：Minecraft 来源栈全部方法、跨 tick/命令方块与函数调度，以及其余 Minecraft 专用参数。当前已实现 12 种纯语法类型、实体选择器和现有方块/物品子集；未实现的记分板、NBT、谓词、标签及物品组件等依赖能力会明确报错。Rust 字符串不保留未配对代理项；极端浮点错误的 Java 数字显示细节未完整移植。当前差分覆盖不是对所有输入完全兼容的证明。
 
 ## 验证
 

@@ -12,6 +12,8 @@ pub struct EntityPose {
     pub(crate) position: [u64; 3],
     pub yaw: u8,
     pub pitch: u8,
+    // Preserve authoritative angles for selectors; wire angles are quantized.
+    pub(crate) rotation: [u32; 2],
     pub on_ground: bool,
 }
 
@@ -25,6 +27,7 @@ impl EntityPose {
             position: position.map(f64::to_bits),
             yaw: angle(yaw),
             pitch: angle(pitch),
+            rotation: [yaw.to_bits(), pitch.to_bits()],
             on_ground,
         }
     }

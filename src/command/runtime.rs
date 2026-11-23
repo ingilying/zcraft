@@ -315,6 +315,15 @@ impl CommandHost for RuntimeHost<'_> {
         }
         self.host.whisper(player, target, text)
     }
+    fn command_entities(&mut self) -> io::Result<Vec<arguments::EntitySnapshot>> {
+        if !self.host.command_active(self.source) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Command source is no longer active.",
+            ));
+        }
+        self.host.command_entities()
+    }
     fn command_active(&self, source: &SourceStack) -> bool {
         self.host.command_active(source)
     }

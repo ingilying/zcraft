@@ -1,5 +1,6 @@
 //! Authenticated connection reservations and bounded Play packet fanout.
 mod chat;
+mod query;
 use crate::{
     protocol::{Clientbound, invalid, packets::play_entities::*},
     world::chunk_at,

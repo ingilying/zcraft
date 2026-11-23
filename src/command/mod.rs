@@ -1,5 +1,6 @@
 //! Transport-independent command registration, parsing and execution.
 //! Sources are trusted server inputs, never data accepted from a client packet.
+pub mod arguments;
 mod builtins;
 mod parse;
 mod runtime;
@@ -81,6 +82,14 @@ pub trait CommandHost {
     fn list_players(&mut self) -> io::Result<CommandResult>;
     fn action(&mut self, player: Uuid, text: &str) -> io::Result<CommandResult>;
     fn whisper(&mut self, player: Uuid, target: &str, text: &str) -> io::Result<CommandResult>;
+    /// Owned snapshots for entity argument evaluation. Hosts without a world
+    /// explicitly report the missing capability rather than returning fake data.
+    fn command_entities(&mut self) -> io::Result<Vec<arguments::EntitySnapshot>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Entity queries are unavailable.",
+        ))
+    }
     /// Optional liveness/policy check before each runtime step and feedback.
     fn command_active(&self, _source: &SourceStack) -> bool {
         true
