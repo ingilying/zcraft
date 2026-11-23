@@ -68,7 +68,10 @@ async function run () {
     assert.equal((await p.expect('abilities')).flags, 0x0d)
     const inventory = await p.expect('window_items')
     assert.equal(inventory.items.length, 46)
-    assert.deepEqual(inventory.items.slice(36, 39).map(item => item.itemId), ['stone', 'dirt', 'glass'].map(n => md.itemsByName[n].id))
+    assert.deepEqual(inventory.items.slice(36, 45).map(item => item.itemId), [
+      'stone', 'dirt', 'glass', 'wooden_pickaxe', 'stone_pickaxe', 'iron_pickaxe',
+      'wooden_shovel', 'stone_shovel', 'iron_shovel'
+    ].map(n => md.itemsByName[n].id))
     await p.expect('position')
   }
   const support = { x: 10, y: 63, z: 8 }
@@ -99,9 +102,15 @@ async function run () {
   assert.equal(skylight({ ...target, y: 65 }), 15)
   assert.equal(skylight({ ...target, x: 11 }), 15)
 
-  cursorB = b.events.length
+  // A block item is not a tool. Wooden pickaxe meets stone's requirement.
+  cursorA = a.events.length
   dig(a, target, 2)
+  await change(a, target, stone, cursorA)
   await ack(a, 2)
+  slot(a, 3)
+  cursorB = b.events.length
+  dig(a, target, 3)
+  await ack(a, 3)
   await change(b, target, 0, cursorB)
   move(b, 160.5, -160.5)
   await b.expect('unload_chunk', p => p.chunkX === 0 && p.chunkZ === 0, cursorB)
@@ -110,24 +119,44 @@ async function run () {
   const corrected = await a.expect('window_items', () => true, cursorA)
   assert.equal(corrected.items[38].itemId, md.itemsByName.glass.id)
   slot(a, 2)
-  place(a, support, 3)
+  place(a, support, 4)
   await change(a, target, glass, cursorA)
-  await ack(a, 3)
+  await ack(a, 4)
+  // Correct kind but insufficient level is denied; stone-tier pickaxe succeeds.
+  slot(a, 3)
+  cursorA = a.events.length
+  dig(a, target, 5)
+  await change(a, target, glass, cursorA)
+  await ack(a, 5)
+  slot(a, 4)
+  dig(a, target, 6)
+  await change(a, target, 0, cursorA)
+  await ack(a, 6)
+  slot(a, 2)
+  place(a, support, 7)
+  await change(a, target, glass, cursorA)
+  await ack(a, 7)
 
-  // Server-authoritative storage: move glass to another hotbar slot. Client
-  // changedSlots/cursor reports are advisory and the server returns full state.
+  // Server-authoritative storage: move glass through the main inventory and
+  // back. Client changedSlots/cursor reports remain advisory.
   cursorA = a.events.length
   click(a, corrected.stateId, 38, stack(md.itemsByName.glass.id), emptyStack)
   const carrying = await a.expect('window_items', p => p.carriedItem.itemId === md.itemsByName.glass.id && p.items[38].itemCount === 0, cursorA)
   cursorA = a.events.length
-  click(a, carrying.stateId, 39, emptyStack, stack(md.itemsByName.glass.id))
-  const stored = await a.expect('window_items', p => p.carriedItem.itemCount === 0 && p.items[39].itemId === md.itemsByName.glass.id, cursorA)
-  assert(stored.stateId > carrying.stateId)
-  slot(a, 3)
+  click(a, carrying.stateId, 9, emptyStack, stack(md.itemsByName.glass.id))
+  const stored = await a.expect('window_items', p => p.carriedItem.itemCount === 0 && p.items[9].itemId === md.itemsByName.glass.id, cursorA)
   cursorA = a.events.length
-  place(a, { ...support, x: 12 }, 7)
+  click(a, stored.stateId, 9, stack(md.itemsByName.glass.id), emptyStack)
+  const carryingAgain = await a.expect('window_items', p => p.carriedItem.itemId === md.itemsByName.glass.id && p.items[9].itemCount === 0, cursorA)
+  cursorA = a.events.length
+  click(a, carryingAgain.stateId, 38, emptyStack, stack(md.itemsByName.glass.id))
+  const restored = await a.expect('window_items', p => p.carriedItem.itemCount === 0 && p.items[38].itemId === md.itemsByName.glass.id, cursorA)
+  assert(restored.stateId > carrying.stateId)
+  slot(a, 2)
+  cursorA = a.events.length
+  place(a, { ...support, x: 12 }, 8)
   await change(a, { ...target, x: 12 }, glass, cursorA)
-  await ack(a, 7)
+  await ack(a, 8)
 
   cursorB = b.events.length
   move(b, 8.5, 8.5)
@@ -136,21 +165,32 @@ async function run () {
   assert.equal(reloaded.getSkyLight(target), 15)
   assert(!b.events.slice(cursorB).some(([n, p]) => n === 'block_change' && same(p.location, target)), 'out-of-range observer received mutation')
 
+  const mineable = { x: 9, y: 63, z: 8 }
+  // Pickaxe mismatches grass' shovel requirement; wooden shovel is sufficient.
+  slot(a, 4)
+  cursorA = a.events.length
+  dig(a, mineable, 9)
+  await change(a, mineable, md.blocksByName.grass_block.defaultState, cursorA)
+  await ack(a, 9)
+  slot(a, 6)
+  dig(a, mineable, 10)
+  await change(a, mineable, 0, cursorA)
+  await ack(a, 10)
   const remote = { x: 15, y: 63, z: 15 }
   cursorA = a.events.length
-  dig(a, remote, 4)
+  dig(a, remote, 11)
   await change(a, remote, md.blocksByName.grass_block.defaultState, cursorA)
-  await ack(a, 4)
+  await ack(a, 11)
   cursorA = a.events.length
-  place(a, { ...support, x: 11 }, 5, 1)
+  place(a, { ...support, x: 11 }, 12, 1)
   await change(a, { ...target, x: 11 }, 0, cursorA)
-  await ack(a, 5)
+  await ack(a, 12)
   cursorB = b.events.length
   slot(a, 1)
-  place(a, { ...support, x: 11 }, 6)
+  place(a, { ...support, x: 11 }, 13)
   await change(b, { ...target, x: 11 }, dirt, cursorB)
-  await ack(a, 6)
-  console.log('PASS: authoritative inventory storage, item-driven placement, ordered mining/placement acknowledgements, nearby sync, light, denial, and edited chunk reload')
+  await ack(a, 13)
+  console.log('PASS: block/tool categories, tool-kind and mining-level gates, authoritative inventory, placement, sync, light, denial, and reload')
 }
 
 const timeout = setTimeout(() => {

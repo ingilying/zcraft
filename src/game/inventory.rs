@@ -31,6 +31,12 @@ impl Default for Inventory {
         slots[36] = ItemStack::new(ItemKind::Stone, 64);
         slots[37] = ItemStack::new(ItemKind::Dirt, 64);
         slots[38] = ItemStack::new(ItemKind::Glass, 64);
+        slots[39] = ItemStack::new(ItemKind::WoodenPickaxe, 1);
+        slots[40] = ItemStack::new(ItemKind::StonePickaxe, 1);
+        slots[41] = ItemStack::new(ItemKind::IronPickaxe, 1);
+        slots[42] = ItemStack::new(ItemKind::WoodenShovel, 1);
+        slots[43] = ItemStack::new(ItemKind::StoneShovel, 1);
+        slots[44] = ItemStack::new(ItemKind::IronShovel, 1);
         Self {
             slots,
             carried: None,
@@ -321,22 +327,22 @@ mod tests {
         assert_eq!(i.carried.unwrap().count, 32);
         assert_eq!(
             i.click(InventoryClick {
-                slot: 39,
+                slot: 9,
                 button: 1,
                 mode: 0
             }),
             ClickResult::Changed
         );
-        assert_eq!(i.slots[39].unwrap().count, 1);
+        assert_eq!(i.slots[9].unwrap().count, 1);
         assert_eq!(
             i.click(InventoryClick {
-                slot: 39,
+                slot: 9,
                 button: 0,
                 mode: 0
             }),
             ClickResult::Changed
         );
-        assert_eq!(i.slots[39].unwrap().count, 32);
+        assert_eq!(i.slots[9].unwrap().count, 32);
         let before = i.clone();
         assert_eq!(
             i.click(InventoryClick {

@@ -52,7 +52,7 @@ ZCRAFT_TEST_SERVER_JAR=target/zcraft-data/1.21.1/server.jar \
 `BlockArgument`（协议 ID 12）解析资源 ID 与方块属性；`ItemArgument`（协议 ID 14）解析物品资源 ID。求值只接受服务器现有的可信子集：
 
 - 方块状态：air、stone、bedrock、dirt、grass_block（`snowy=false`）、glass；
-- 当前物品注册：stone、dirt、glass。
+- 当前物品注册：stone、dirt、glass，以及木/石/铁等级的 pickaxe 和 shovel。
 
 返回值分别是实际协议 block-state ID 和 item registry ID。未知方块、物品、属性或状态不会映射为占位值。方块实体 NBT、物品组件、组件移除、旧式物品 NBT 和标签引用尚未实现，解析时明确报错。
 

@@ -229,7 +229,13 @@ fn block_and_item_syntax_resolve_only_existing_capabilities() {
             .resolve_existing()
             .is_err()
     );
-    for (name, id) in [("stone", 1), ("dirt", 28), ("glass", 188)] {
+    for (name, id) in [
+        ("stone", 1),
+        ("dirt", 28),
+        ("glass", 188),
+        ("wooden_pickaxe", 820),
+        ("iron_shovel", 834),
+    ] {
         assert_eq!(
             typed::<ItemSpec>(&ItemArgument, name)
                 .resolve_existing()

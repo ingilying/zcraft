@@ -4,7 +4,7 @@
 mod tests;
 use super::{Context, Outcome, play};
 use crate::{
-    game::{Hand, ItemUse},
+    game::Hand,
     players::Reservation,
     protocol::{
         Clientbound,
@@ -133,9 +133,13 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
             let edit = if start
                 && face < 6
                 && reachable(pos)
-                && crate::game::block_by_state(current)
-                    .is_some_and(|block| block.hardness.is_some())
-            {
+                && crate::game::block_by_state(current).is_some_and(|block| {
+                    block.hardness.is_some()
+                        && session
+                            .inventory
+                            .hand(Hand::Main)
+                            .is_some_and(|tool| tool.definition().can_mine(block))
+                }) {
                 Some((pos, crate::game::BlockKind::Air.state()))
             } else {
                 None
@@ -152,9 +156,7 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
             let edit = place.and_then(|pos| {
                 let hand = Hand::from_wire(hand)?;
                 let stack = session.inventory.hand(hand)?;
-                let ItemUse::Place(kind) = stack.definition().use_action else {
-                    return None;
-                };
+                let kind = stack.definition().placed_block()?;
                 let support_block = crate::game::block_by_state(blocks.get(support))?;
                 let target_block = crate::game::block_by_state(blocks.get(pos))?;
                 (hit.iter().all(|f| (0.0..=1.0).contains(f))
@@ -243,14 +245,11 @@ pub async fn handle_place(ctx: &mut Context<'_>, p: BlockPlace) -> io::Result<Ou
 }
 
 pub async fn handle_use_item(ctx: &mut Context<'_>, p: UseItem) -> io::Result<Outcome> {
-    let _action = Hand::from_wire(p.hand)
-        .and_then(|hand| ctx.session.inventory.hand(hand))
-        .map(|stack| stack.definition().use_action)
-        .unwrap_or(ItemUse::None);
+    let _held = Hand::from_wire(p.hand).and_then(|hand| ctx.session.inventory.hand(hand));
     if let Some(slot) = &ctx.session.reservation
         && ctx.server.play.game_mode == crate::config::GameMode::Creative
     {
-        // Future food/tools/projectiles dispatch through ItemUse here. Even a
+        // Future food/tools/projectiles dispatch through item categories here. Even a
         // no-op use is acknowledged in the same FIFO as block predictions.
         let ack = Clientbound::from(BlockAck(p.sequence)).encode()?.into();
         slot.correct_blocks(Vec::new(), ack);

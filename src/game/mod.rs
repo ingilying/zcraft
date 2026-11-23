@@ -4,8 +4,12 @@ mod blocks;
 mod inventory;
 mod items;
 
-pub use blocks::{BlockDefinition, BlockKind, block_by_name, block_by_state, blocks};
+pub use blocks::{
+    BlockDefinition, BlockKind, MiningLevel, MiningRequirement, ToolKind, block_by_name,
+    block_by_state, blocks,
+};
 pub use inventory::{ClickResult, Inventory, InventoryClick, SLOT_COUNT};
 pub use items::{
-    Hand, ItemDefinition, ItemKind, ItemStack, ItemUse, item_by_id, item_by_name, items,
+    BlockItem, Hand, ItemCategory, ItemDefinition, ItemKind, ItemStack, ToolItem, item_by_id,
+    item_by_name, items,
 };

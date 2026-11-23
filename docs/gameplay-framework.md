@@ -6,11 +6,11 @@
 
 `src/game/` 是玩法层，不依赖网络包：
 
-- `blocks.rs`：稳定的 `BlockKind` 与 `BlockDefinition`。定义资源名、全局 block-state ID、硬度、可替换性、碰撞和遮挡天光属性。
-- `items.rs`：`ItemKind`、`ItemDefinition`、`ItemStack` 与 `ItemUse`。定义物品协议 ID、最大堆叠数和使用行为。
+- `blocks.rs`：稳定的 `BlockKind` 与 `BlockDefinition`。定义资源名、全局 block-state ID、硬度、所需工具种类/挖掘等级、可替换性、碰撞和遮挡天光属性。
+- `items.rs`：`ItemKind`、`ItemDefinition`、`ItemStack` 与 `ItemCategory`。方块物品携带 `BlockItem`，工具物品携带统一的 `ToolItem { kind, level }`。
 - `inventory.rs`：46 格玩家容器、光标堆叠、主手选择、双手查询、状态 ID，以及服务端权威的点击状态机。
 
-当前注册的物品是 stone、dirt、glass；当前方块定义还包括地形所需的 air、grass_block、bedrock。增加简单方块物品时，通常只需增加方块定义、物品定义和 `ItemUse::Place` 映射。需要朝向、含水或方块实体的内容，后续可在 `ItemUse` 的放置上下文分支扩展，不需要修改协议解码。
+当前方块物品是 stone、dirt、glass；工具包括木/石/铁等级的镐和锹；方块定义还包括地形所需的 air、grass_block、bedrock。增加简单方块物品时，只需增加方块定义和 `ItemCategory::Block` 注册，自动继承统一放置行为。增加工具时注册工具种类与等级，自动继承统一挖掘判定。需要朝向、含水或方块实体的内容，后续可扩展 `BlockItem` 的放置上下文，不需要修改协议解码。
 
 ## 背包
 
@@ -31,11 +31,11 @@
 
 ## 放置、使用与挖掘
 
-放置从实际主手/副手堆叠读取 `ItemUse`，而不是按快捷栏位置硬编码方块。处理器统一验证手、命中坐标、距离、已发送区块、支撑方块、目标可替换性和玩家碰撞，再提交稀疏世界编辑。
+放置从实际主手/副手的 `ItemCategory::Block` 取得目标方块，而不是按快捷栏位置或具体物品 ID 硬编码。所有方块物品统一验证手、命中坐标、距离、已发送区块、支撑方块、目标可替换性和玩家碰撞，再提交稀疏世界编辑。工具物品不会进入放置路径。
 
-当前 `Use Item` 没有可用的空中使用行为，但已经通过同一个 `ItemUse` 分派点和预测序列确认；后续食物、工具、投射物等可增加行为枚举和对应执行器。
+当前 `Use Item` 没有可用的空中使用行为，但已经保留统一类别分派点和预测序列确认；后续食物、投射物等可增加新的物品类别和对应执行器。
 
-创造模式挖掘在 START 动作立即完成。是否可破坏来自 `BlockDefinition::hardness`；bedrock 使用 `None`，不会被破坏。硬度数据已经保留，后续加入生存模式时可在会话中增加挖掘进度，而无需改变世界存储格式。
+创造模式挖掘在 START 动作立即完成，但不绕过工具规则。方块通过 `MiningRequirement { tool, level }` 声明所需工具；主手必须是同一种 `ToolKind`，且 `MiningLevel` 大于等于最低等级。stone 需要木级镐，glass 需要石级镐，dirt/grass_block 需要木级锹；种类不匹配、等级不足、空手和方块物品都会失败。bedrock 的硬度和挖掘要求均为空，始终不可破坏。硬度数据继续为后续生存挖掘进度保留。
 
 所有成功和拒绝的方块操作继续遵守现有的预测序列确认、观察者广播、区块重载重放、稀疏编辑上限及天光重算规则。
 
@@ -43,4 +43,4 @@
 
 `src/protocol/packets/play_blocks.rs` 负责 Slot、Container Click、Set Creative Slot、Window Items 和 Set Slot 的协议 767 编解码。玩法层只接触 `ItemStack`、`InventoryClick` 等结构，不接触数字包 ID。
 
-当前不支持：持久化存档、箱子等额外容器、合成、盔甲规则、生存消耗/掉落、工具速度、方块掉落、物品耐久、附魔、NBT/数据组件和复杂方块状态。它们应沿现有注册定义、库存状态机和行为分派扩展，而不是在包处理器中添加物品 ID 特判。
+当前不支持：持久化存档、箱子等额外容器、合成、盔甲规则、生存消耗/掉落、按硬度计算挖掘时间、工具速度、方块掉落、物品耐久、附魔、NBT/数据组件和复杂方块状态。它们应沿现有注册定义、库存状态机和行为分派扩展，而不是在包处理器中添加物品 ID 特判。
