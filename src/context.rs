@@ -19,9 +19,9 @@ impl ServerContext {
         let world = if let Some(dir) = &config.world_dir {
             std::sync::Arc::new(crate::world::World::open(dir, config.flat.clone())?)
         } else if let Some(flat) = &config.flat {
-            std::sync::Arc::new(crate::world::World::with_generator(
+            std::sync::Arc::new(crate::world::World::with_generator(std::sync::Arc::new(
                 crate::world::FlatGenerator::from_config(flat.clone())?,
-            ))
+            )))
         } else {
             std::sync::Arc::new(crate::world::World::new())
         };

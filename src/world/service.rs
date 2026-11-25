@@ -1,13 +1,13 @@
-//! Unified world domain service: Superflat generator, sparse block edits,
+//! Unified world domain service: pluggable `ChunkGenerator`, lazy LRU `ChunkStore`,
 //! cached per-chunk lighting, 20 TPS clock/weather cycle, and Anvil persistence.
 use super::{
-    AnvilStorage, BlockPos, BlockWorld, FlatGenerator, FlatGeneratorConfig, SavedPlayer, Snapshot,
-    TickEvents, TimeSnapshot, WeatherEvent, WeatherSnapshot, WorldClock, affected_light_chunks,
-    changed_blocks, chunk_payload_with_light, has_any_edits,
+    AnvilStorage, BlockPos, Chunk, ChunkGenerator, ChunkStore, FlatGenerator, FlatGeneratorConfig,
+    SavedPlayer, TickEvents, TimeSnapshot, WeatherEvent, WeatherSnapshot, WorldClock,
+    affected_light_chunks,
 };
 use crate::game::{Inventory, Player};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     io,
     path::Path,
     sync::{Arc, Mutex},
@@ -33,19 +33,20 @@ pub struct SaveSummary {
 /// mutations that occur while the chunk is being written to the socket.
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedChunk {
-    pub snapshot: Snapshot,
+    pub snapshot: Arc<Chunk>,
     pub light: Arc<[u8]>,
-    pub payload: Option<Arc<[u8]>>,
+    pub payload: Arc<[u8]>,
 }
 
 #[derive(Debug)]
 pub struct World {
-    generator: Arc<FlatGenerator>,
+    generator: Arc<dyn ChunkGenerator>,
     storage: Option<AnvilStorage>,
-    blocks: Arc<BlockWorld>,
+    store: Mutex<ChunkStore>,
     clock: Mutex<WorldClock>,
     save_lock: Mutex<()>,
     spawn: [f64; 3],
+    placeholder_terrain: Arc<[u8]>,
 }
 
 impl Default for World {
@@ -56,29 +57,30 @@ impl Default for World {
 
 impl World {
     pub fn new() -> Self {
-        Self::with_generator(FlatGenerator::default())
+        Self::with_generator(Arc::new(FlatGenerator::default()))
     }
 
-    pub fn with_generator(generator: FlatGenerator) -> Self {
+    pub fn with_generator(generator: Arc<dyn ChunkGenerator>) -> Self {
         let spawn = generator.spawn_position();
-        let generator = Arc::new(generator);
-        let blocks = Arc::new(BlockWorld::with_generator(
-            generator.clone(),
-            HashMap::new(),
-            false,
-        ));
+        let placeholder_terrain = generator
+            .default_terrain_payload()
+            .cloned()
+            .unwrap_or_else(|| Arc::from([]));
+        let store = Mutex::new(ChunkStore::new(generator.clone(), None));
         Self {
             generator,
             storage: None,
-            blocks,
+            store,
             clock: Mutex::new(WorldClock::new()),
             save_lock: Mutex::new(()),
             spawn,
+            placeholder_terrain,
         }
     }
 
     /// Open (or initialize) a persisted Anvil world directory.
     /// Existing `level.dat` generator settings take precedence over `flat_config`.
+    /// Chunks are loaded lazily from `region/*.mca` on demand (O(1) startup).
     pub fn open(
         dir: impl AsRef<Path>,
         flat_config: Option<FlatGeneratorConfig>,
@@ -91,41 +93,49 @@ impl World {
             .and_then(|l| l.flat.clone())
             .or(flat_config)
             .unwrap_or_default();
-        let generator = Arc::new(FlatGenerator::from_config(effective_flat)?);
+        let flat_gen = FlatGenerator::from_config(effective_flat)?;
         let spawn = loaded
             .as_ref()
             .and_then(|l| l.spawn)
-            .unwrap_or_else(|| generator.spawn_position());
+            .unwrap_or_else(|| flat_gen.spawn_position());
         let clock = loaded
             .as_ref()
             .map_or_else(WorldClock::new, |l| WorldClock::from_persisted(l.clock));
 
-        let initial_chunks = storage.load_all_chunks(&generator)?;
         if loaded.is_none() {
-            storage.save_level(clock.persisted_state(), &generator, spawn)?;
+            storage.save_level(clock.persisted_state(), Some(flat_gen.config()), spawn)?;
         }
 
-        let blocks = Arc::new(BlockWorld::with_generator(
-            generator.clone(),
-            initial_chunks,
-            true,
-        ));
+        let generator: Arc<dyn ChunkGenerator> = Arc::new(flat_gen);
+        let placeholder_terrain = generator
+            .default_terrain_payload()
+            .cloned()
+            .unwrap_or_else(|| Arc::from([]));
+        let store = Mutex::new(ChunkStore::new(generator.clone(), Some(storage.clone())));
+
         Ok(Self {
             generator,
             storage: Some(storage),
-            blocks,
+            store,
             clock: Mutex::new(clock),
             save_lock: Mutex::new(()),
             spawn,
+            placeholder_terrain,
         })
     }
 
-    pub fn generator(&self) -> &Arc<FlatGenerator> {
+    pub fn generator(&self) -> &Arc<dyn ChunkGenerator> {
         &self.generator
     }
 
+    pub fn flat_config(&self) -> Option<&FlatGeneratorConfig> {
+        self.generator.flat_config()
+    }
+
+    /// Placeholder terrain buffer used by `ChunkStream::pump` before
+    /// `prepare_chunk` fills in the authoritative per-chunk payload.
     pub fn terrain(&self) -> &Arc<[u8]> {
-        self.generator.terrain_payload()
+        &self.placeholder_terrain
     }
 
     pub fn spawn_position(&self) -> [f64; 3] {
@@ -137,7 +147,10 @@ impl World {
     }
 
     pub fn block_at(&self, pos: BlockPos) -> i32 {
-        self.blocks.lock().get(pos)
+        self.store
+            .lock()
+            .expect("chunk store poisoned")
+            .get_block(pos)
     }
 
     /// Persist `level.dat` and all dirty chunks to Anvil `region/*.mca`.
@@ -156,12 +169,16 @@ impl World {
             .lock()
             .expect("world clock poisoned")
             .persisted_state();
-        let dirty = self.blocks.lock().drain_dirty();
+        let dirty = self
+            .store
+            .lock()
+            .expect("chunk store poisoned")
+            .drain_dirty();
         let dirty_coords: Vec<[i32; 2]> = dirty.iter().map(|(c, _)| *c).collect();
 
         let write_result = (|| -> io::Result<usize> {
-            storage.save_level(clock_state, &self.generator, self.spawn)?;
-            storage.save_chunks(&dirty, &self.generator)
+            storage.save_level(clock_state, self.generator.flat_config(), self.spawn)?;
+            storage.save_chunks(&dirty)
         })();
 
         match write_result {
@@ -170,7 +187,10 @@ impl World {
                 chunks_saved,
             }),
             Err(error) => {
-                self.blocks.lock().mark_dirty(dirty_coords);
+                self.store
+                    .lock()
+                    .expect("chunk store poisoned")
+                    .mark_dirty(dirty_coords);
                 Err(error)
             }
         }
@@ -190,13 +210,13 @@ impl World {
         }
     }
 
-    /// Prepare a chunk payload and light snapshot using the per-chunk light cache.
+    /// Prepare a chunk payload and light snapshot using the lazy chunk store
+    /// and per-chunk light cache.
     pub(crate) fn prepare_chunk(&self, chunk: [i32; 2]) -> PreparedChunk {
-        let mut blocks = self.blocks.lock();
-        let neighborhood = blocks.neighborhood(chunk);
-        let light = blocks.light_for(chunk, &neighborhood);
-        let payload = has_any_edits(&neighborhood)
-            .then(|| chunk_payload_with_light(&neighborhood, &light, blocks.generator()));
+        let mut store = self.store.lock().expect("chunk store poisoned");
+        let neighborhood = store.neighborhood(chunk);
+        let light = store.light_for(chunk, &neighborhood);
+        let payload = store.payload_for(&neighborhood, &light);
         PreparedChunk {
             snapshot: neighborhood[1][1].clone(),
             light,
@@ -210,14 +230,19 @@ impl World {
     pub(crate) fn reconcile_and_subscribe<R>(
         &self,
         chunk: [i32; 2],
-        old_snapshot: &Snapshot,
+        old_snapshot: &Arc<Chunk>,
         old_light: &Arc<[u8]>,
         on_reconciled: impl FnOnce(Vec<(BlockPos, i32)>, Option<Arc<[u8]>>) -> io::Result<R>,
     ) -> io::Result<R> {
-        let mut blocks = self.blocks.lock();
-        let neighborhood = blocks.neighborhood(chunk);
-        let changes = changed_blocks(chunk, old_snapshot, &neighborhood[1][1], blocks.generator());
-        let new_light = blocks.light_for(chunk, &neighborhood);
+        let mut store = self.store.lock().expect("chunk store poisoned");
+        let neighborhood = store.neighborhood(chunk);
+        let current = &neighborhood[1][1];
+        let changes = if Arc::ptr_eq(old_snapshot, current) {
+            Vec::new()
+        } else {
+            current.diff_blocks(chunk, old_snapshot)
+        };
+        let new_light = store.light_for(chunk, &neighborhood);
         let light_update = (new_light != *old_light).then_some(new_light);
         on_reconciled(changes, light_update)
     }
@@ -228,18 +253,18 @@ impl World {
         if !pos.valid() {
             return None;
         }
-        let mut blocks = self.blocks.lock();
+        let mut store = self.store.lock().expect("chunk store poisoned");
         let affected = affected_light_chunks(pos);
         let old_lights: Vec<_> = affected
             .iter()
-            .map(|&nc| (nc, blocks.cached_or_current_light(nc)))
+            .map(|&nc| (nc, store.cached_or_current_light(nc)))
             .collect();
-        if !blocks.set(pos, state) {
+        if !store.set_block(pos, state) {
             return None;
         }
         let mut light_changes = Vec::new();
         for (nc, old_light) in old_lights {
-            let new_light = blocks.recompute_light(nc);
+            let new_light = store.recompute_light(nc);
             if new_light != old_light {
                 light_changes.push((nc, new_light));
             }
@@ -279,7 +304,7 @@ impl World {
             return Err(crate::protocol::invalid("fill volume exceeds 4096 blocks"));
         }
 
-        let mut blocks = self.blocks.lock();
+        let mut store = self.store.lock().expect("chunk store poisoned");
         let mut light_chunks = BTreeSet::new();
         for x in min_x..=max_x {
             for z in min_z..=max_z {
@@ -290,7 +315,7 @@ impl World {
         }
         let old_lights: Vec<_> = light_chunks
             .iter()
-            .map(|&nc| (nc, blocks.cached_or_current_light(nc)))
+            .map(|&nc| (nc, store.cached_or_current_light(nc)))
             .collect();
 
         let mut block_changes = Vec::new();
@@ -298,10 +323,7 @@ impl World {
             for z in min_z..=max_z {
                 for x in min_x..=max_x {
                     let pos = BlockPos([x, y, z]);
-                    if blocks.get(pos) == state {
-                        continue;
-                    }
-                    if blocks.set(pos, state) {
+                    if store.set_block(pos, state) {
                         block_changes.push((pos, state));
                     }
                 }
@@ -310,7 +332,7 @@ impl World {
         let mut light_changes = Vec::new();
         if !block_changes.is_empty() {
             for (nc, old_light) in old_lights {
-                let new_light = blocks.recompute_light(nc);
+                let new_light = store.recompute_light(nc);
                 if new_light != old_light {
                     light_changes.push((nc, new_light));
                 }

@@ -1,12 +1,11 @@
 //! Vanilla Minecraft Java 1.21.1 (DataVersion 3955) Anvil persistence:
-//! - `level.dat`: GZip-compressed NBT world metadata & flat generator settings
-//! - `region/r.<rx>.<rz>.mca`: 32x32 chunk region files (Zlib-compressed NBT)
+//! - `level.dat`: GZip-compressed NBT world metadata & generator settings
+//! - `region/r.<rx>.<rz>.mca`: 32x32 chunk region files (lazy single-chunk load & atomic batch save)
 //! - `playerdata/<uuid>.dat`: GZip-compressed NBT per-player state & inventory
 use super::{
-    MIN_Y, SECTION_COUNT,
+    BiomeStorage, BlockStorage, Chunk, ChunkSection, MIN_Y, PLAINS_BIOME_ID, SECTION_COUNT,
     clock::PersistedClock,
-    edits::Edits,
-    generator::{FlatGenerator, FlatGeneratorConfig, FlatLayerConfig},
+    generator::{FlatGeneratorConfig, FlatLayerConfig},
     nbt::{
         Compound, Tag, read_gzip_nbt, read_named_nbt, write_bytes_atomic, write_gzip_nbt_atomic,
         write_named_nbt,
@@ -15,6 +14,7 @@ use super::{
 use crate::{
     config::GameMode,
     game::{Inventory, ItemStack, Player, SLOT_COUNT, item_by_id, item_by_name, registry},
+    registry_data::{biome_id, biome_name},
 };
 use flate2::{
     Compression,
@@ -22,10 +22,11 @@ use flate2::{
     write::ZlibEncoder,
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
@@ -136,7 +137,7 @@ impl AnvilStorage {
     pub fn save_level(
         &self,
         clock: PersistedClock,
-        generator: &FlatGenerator,
+        flat: Option<&FlatGeneratorConfig>,
         spawn: [f64; 3],
     ) -> io::Result<()> {
         let level_name = self
@@ -145,39 +146,6 @@ impl AnvilStorage {
             .and_then(|n| n.to_str())
             .unwrap_or("world")
             .to_string();
-
-        let mut layers = Vec::with_capacity(generator.config().layers.len());
-        for layer in &generator.config().layers {
-            let mut lc = Compound::new();
-            lc.insert("block".into(), Tag::String(layer.block.clone()));
-            lc.insert("height".into(), Tag::Int(i32::from(layer.height)));
-            layers.push(Tag::Compound(lc));
-        }
-
-        let mut settings = Compound::new();
-        settings.insert(
-            "biome".into(),
-            Tag::String(generator.config().biome.clone()),
-        );
-        settings.insert("layers".into(), Tag::List(layers));
-        settings.insert("zcraft_base_y".into(), Tag::Int(generator.config().base_y));
-
-        let mut gen_compound = Compound::new();
-        gen_compound.insert("type".into(), Tag::String("minecraft:flat".into()));
-        gen_compound.insert("settings".into(), Tag::Compound(settings));
-
-        let mut overworld = Compound::new();
-        overworld.insert("type".into(), Tag::String("minecraft:overworld".into()));
-        overworld.insert("generator".into(), Tag::Compound(gen_compound));
-
-        let mut dimensions = Compound::new();
-        dimensions.insert("minecraft:overworld".into(), Tag::Compound(overworld));
-
-        let mut world_gen = Compound::new();
-        world_gen.insert("bonus_chest".into(), Tag::Byte(0));
-        world_gen.insert("generate_features".into(), Tag::Byte(0));
-        world_gen.insert("seed".into(), Tag::Long(0));
-        world_gen.insert("dimensions".into(), Tag::Compound(dimensions));
 
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -198,60 +166,104 @@ impl AnvilStorage {
         data.insert("SpawnZ".into(), Tag::Int(spawn[2].floor() as i32));
         data.insert("LastPlayed".into(), Tag::Long(now_ms));
         data.insert("initialized".into(), Tag::Byte(1));
-        data.insert("WorldGenSettings".into(), Tag::Compound(world_gen));
+
+        if let Some(flat_cfg) = flat {
+            let mut layers = Vec::with_capacity(flat_cfg.layers.len());
+            for layer in &flat_cfg.layers {
+                let mut lc = Compound::new();
+                lc.insert("block".into(), Tag::String(layer.block.clone()));
+                lc.insert("height".into(), Tag::Int(i32::from(layer.height)));
+                layers.push(Tag::Compound(lc));
+            }
+            let mut settings = Compound::new();
+            settings.insert("biome".into(), Tag::String(flat_cfg.biome.clone()));
+            settings.insert("layers".into(), Tag::List(layers));
+            settings.insert("zcraft_base_y".into(), Tag::Int(flat_cfg.base_y));
+
+            let mut gen_compound = Compound::new();
+            gen_compound.insert("type".into(), Tag::String("minecraft:flat".into()));
+            gen_compound.insert("settings".into(), Tag::Compound(settings));
+
+            let mut overworld = Compound::new();
+            overworld.insert("type".into(), Tag::String("minecraft:overworld".into()));
+            overworld.insert("generator".into(), Tag::Compound(gen_compound));
+
+            let mut dimensions = Compound::new();
+            dimensions.insert("minecraft:overworld".into(), Tag::Compound(overworld));
+
+            let mut world_gen = Compound::new();
+            world_gen.insert("bonus_chest".into(), Tag::Byte(0));
+            world_gen.insert("generate_features".into(), Tag::Byte(0));
+            world_gen.insert("seed".into(), Tag::Long(0));
+            world_gen.insert("dimensions".into(), Tag::Compound(dimensions));
+            data.insert("WorldGenSettings".into(), Tag::Compound(world_gen));
+        }
 
         let mut root = Compound::new();
         root.insert("Data".into(), Tag::Compound(data));
         write_gzip_nbt_atomic(&self.level_dat_path(), "", &root)
     }
 
-    /// Load all persisted chunk edits across all `region/r.<rx>.<rz>.mca` files.
-    pub fn load_all_chunks(
-        &self,
-        generator: &FlatGenerator,
-    ) -> io::Result<HashMap<[i32; 2], Edits>> {
-        let dir = self.region_dir();
-        if !dir.exists() {
-            return Ok(HashMap::new());
+    /// Lazily load a single chunk from its `region/r.<rx>.<rz>.mca` file.
+    /// Returns `Ok(None)` if the region file or chunk slot does not exist.
+    pub fn load_chunk(&self, cx: i32, cz: i32) -> io::Result<Option<Chunk>> {
+        let rx = cx.div_euclid(32);
+        let rz = cz.div_euclid(32);
+        let path = self.region_path(rx, rz);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if bytes.is_empty() {
+            return Ok(None);
         }
-        let mut loaded = HashMap::new();
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !name.starts_with("r.") || !name.ends_with(".mca") {
-                continue;
-            }
-            let raw = fs::read(&path)?;
-            for (chunk_coords, edits) in decode_region_chunks(&raw, generator)? {
-                if !edits.is_empty() {
-                    loaded.insert(chunk_coords, edits);
-                }
-            }
+        if bytes.len() < HEADER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated Anvil region header",
+            ));
         }
-        Ok(loaded)
+        let slot = region_slot(cx, cz);
+        let loc = u32::from_be_bytes(bytes[slot * 4..slot * 4 + 4].try_into().unwrap());
+        let offset = (loc >> 8) as usize;
+        let sectors = (loc & 0xff) as usize;
+        if offset == 0 || sectors == 0 {
+            return Ok(None);
+        }
+        let start = offset * SECTOR_BYTES;
+        let end_sector = start + sectors * SECTOR_BYTES;
+        if offset < 2 || end_sector > bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Anvil chunk sector out of bounds",
+            ));
+        }
+        let length = u32::from_be_bytes(bytes[start..start + 4].try_into().unwrap()) as usize;
+        if length == 0 || start + 4 + length > end_sector {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Anvil chunk length",
+            ));
+        }
+        let payload = &bytes[start + 4..start + 4 + length];
+        let chunk = decode_chunk_anvil(payload)?;
+        Ok(Some(chunk))
     }
 
     /// Save a batch of dirty chunks grouped by region file (`r.<rx>.<rz>.mca`).
-    /// Chunks with `None` edits are still updated (re-written as flat or cleared).
-    pub fn save_chunks(
-        &self,
-        chunks: &[([i32; 2], Option<Edits>)],
-        generator: &FlatGenerator,
-    ) -> io::Result<usize> {
+    pub fn save_chunks(&self, chunks: &[([i32; 2], Arc<Chunk>)]) -> io::Result<usize> {
         if chunks.is_empty() {
             return Ok(0);
         }
-        type RegionUpdate<'a> = ([i32; 2], Option<&'a Edits>);
+        type RegionUpdate<'a> = ([i32; 2], &'a Chunk);
         let mut by_region: BTreeMap<[i32; 2], Vec<RegionUpdate<'_>>> = BTreeMap::new();
-        for (coords, edits) in chunks {
+        for (coords, chunk) in chunks {
             let region = [coords[0].div_euclid(32), coords[1].div_euclid(32)];
             by_region
                 .entry(region)
                 .or_default()
-                .push((*coords, edits.as_ref()));
+                .push((*coords, chunk.as_ref()));
         }
         let now_sec = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -264,9 +276,9 @@ impl AnvilStorage {
             } else {
                 RegionFile::default()
             };
-            for ([cx, cz], edits) in updates {
+            for ([cx, cz], chunk) in updates {
                 let slot = region_slot(cx, cz);
-                let payload = encode_chunk_anvil(cx, cz, edits, generator)?;
+                let payload = encode_chunk_anvil(cx, cz, chunk)?;
                 region.chunks[slot] = Some((payload, now_sec));
                 saved += 1;
             }
@@ -469,7 +481,6 @@ fn region_slot(cx: i32, cz: i32) -> usize {
 type RegionSlot = Option<(Vec<u8>, u32)>;
 
 struct RegionFile {
-    /// Each slot holds `(raw_chunk_payload_with_compression_byte, timestamp_secs)`.
     chunks: Box<[RegionSlot; REGION_CHUNKS]>,
 }
 
@@ -557,84 +568,109 @@ impl RegionFile {
     }
 }
 
-fn encode_chunk_anvil(
-    cx: i32,
-    cz: i32,
-    edits: Option<&Edits>,
-    generator: &FlatGenerator,
-) -> io::Result<Vec<u8>> {
+fn state_to_nbt(state_id: i32) -> Tag {
     let reg = registry();
+    let mut entry = Compound::new();
+    if let Some((_, block_def, state_def)) = reg.state_by_id(state_id) {
+        entry.insert("Name".into(), Tag::String(block_def.name.clone()));
+        if !state_def.properties.is_empty() {
+            let mut props = Compound::new();
+            for (k, v) in &state_def.properties {
+                props.insert(k.clone(), Tag::String(v.clone()));
+            }
+            entry.insert("Properties".into(), Tag::Compound(props));
+        }
+    } else {
+        entry.insert("Name".into(), Tag::String("minecraft:air".into()));
+    }
+    Tag::Compound(entry)
+}
+
+fn pack_long_array(indices: &[u64], bits: usize) -> Vec<i64> {
+    let per_long = 64 / bits;
+    let mut longs = Vec::with_capacity(indices.len().div_ceil(per_long));
+    for chunk in indices.chunks(per_long) {
+        let mut packed = 0u64;
+        for (i, &entry) in chunk.iter().enumerate() {
+            packed |= entry << (i * bits);
+        }
+        longs.push(packed as i64);
+    }
+    longs
+}
+
+fn encode_chunk_anvil(cx: i32, cz: i32, chunk: &Chunk) -> io::Result<Vec<u8>> {
     let mut sections = Vec::with_capacity(SECTION_COUNT);
 
-    for section in 0..SECTION_COUNT {
-        let offset = (section * 4096) as u32;
-        let mut states = [0i32; 4096];
-        for (ly, layer) in states.as_chunks_mut::<256>().0.iter_mut().enumerate() {
-            layer.fill(generator.base_state(MIN_Y + (section * 16 + ly) as i32));
-        }
-        if let Some(edits) = edits {
-            for (&idx, &state) in edits.range(offset..offset + 4096) {
-                states[(idx - offset) as usize] = state;
-            }
-        }
-
-        let mut palette_ids = Vec::new();
-        let mut indices = [0u64; 4096];
-        for (i, &state) in states.iter().enumerate() {
-            indices[i] = palette_ids
-                .iter()
-                .position(|&s| s == state)
-                .unwrap_or_else(|| {
-                    palette_ids.push(state);
-                    palette_ids.len() - 1
-                }) as u64;
-        }
-
-        let mut palette_tags = Vec::with_capacity(palette_ids.len());
-        for state_id in palette_ids {
-            let mut entry = Compound::new();
-            if let Some((_, block_def, state_def)) = reg.state_by_id(state_id) {
-                entry.insert("Name".into(), Tag::String(block_def.name.clone()));
-                if !state_def.properties.is_empty() {
-                    let mut props = Compound::new();
-                    for (k, v) in &state_def.properties {
-                        props.insert(k.clone(), Tag::String(v.clone()));
-                    }
-                    entry.insert("Properties".into(), Tag::Compound(props));
-                }
-            } else {
-                entry.insert("Name".into(), Tag::String("minecraft:air".into()));
-            }
-            palette_tags.push(Tag::Compound(entry));
-        }
-
+    for (sec_idx, section) in chunk.sections().iter().enumerate() {
         let mut block_states = Compound::new();
-        let palette_len = palette_tags.len();
-        block_states.insert("palette".into(), Tag::List(palette_tags));
-        if palette_len > 1 {
-            let bits = ((palette_len - 1).ilog2() as usize + 1).max(4);
-            let per_long = 64 / bits;
-            let mut longs = Vec::with_capacity(4096usize.div_ceil(per_long));
-            for chunk in indices.chunks(per_long) {
-                let mut packed = 0u64;
-                for (i, &entry) in chunk.iter().enumerate() {
-                    packed |= entry << (i * bits);
-                }
-                longs.push(packed as i64);
+        match section.blocks() {
+            BlockStorage::Single(state) => {
+                block_states.insert("palette".into(), Tag::List(vec![state_to_nbt(*state)]));
             }
-            block_states.insert("data".into(), Tag::LongArray(longs));
+            BlockStorage::Dense(states) => {
+                let mut palette_ids = Vec::new();
+                let mut indices = [0u64; 4096];
+                for (i, &state) in states.iter().enumerate() {
+                    indices[i] = palette_ids
+                        .iter()
+                        .position(|&s| s == state)
+                        .unwrap_or_else(|| {
+                            palette_ids.push(state);
+                            palette_ids.len() - 1
+                        }) as u64;
+                }
+                let palette_tags: Vec<Tag> = palette_ids.into_iter().map(state_to_nbt).collect();
+                let palette_len = palette_tags.len();
+                block_states.insert("palette".into(), Tag::List(palette_tags));
+                if palette_len > 1 {
+                    let bits = ((palette_len - 1).ilog2() as usize + 1).max(4);
+                    block_states.insert(
+                        "data".into(),
+                        Tag::LongArray(pack_long_array(&indices, bits)),
+                    );
+                }
+            }
         }
 
         let mut biomes = Compound::new();
-        biomes.insert(
-            "palette".into(),
-            Tag::List(vec![Tag::String(generator.config().biome.clone())]),
-        );
+        match section.biomes() {
+            BiomeStorage::Single(id) => {
+                let name = biome_name(*id).unwrap_or("minecraft:plains").to_string();
+                biomes.insert("palette".into(), Tag::List(vec![Tag::String(name)]));
+            }
+            BiomeStorage::Dense(cells) => {
+                let mut palette_ids = Vec::new();
+                let mut indices = [0u64; 64];
+                for (i, &id) in cells.iter().enumerate() {
+                    indices[i] = palette_ids
+                        .iter()
+                        .position(|&b| b == id)
+                        .unwrap_or_else(|| {
+                            palette_ids.push(id);
+                            palette_ids.len() - 1
+                        }) as u64;
+                }
+                let palette_tags: Vec<Tag> = palette_ids
+                    .into_iter()
+                    .map(|id| Tag::String(biome_name(id).unwrap_or("minecraft:plains").to_string()))
+                    .collect();
+                let palette_len = palette_tags.len();
+                biomes.insert("palette".into(), Tag::List(palette_tags));
+                if palette_len > 1 {
+                    let bits = ((palette_len - 1).ilog2() as usize + 1).max(1);
+                    biomes.insert(
+                        "data".into(),
+                        Tag::LongArray(pack_long_array(&indices, bits)),
+                    );
+                }
+            }
+        }
 
         let mut sec_map = Compound::new();
         sec_map.insert(
             "Y".into(),
-            Tag::Byte((LOWEST_SECTION_Y + section as i32) as i8),
+            Tag::Byte((LOWEST_SECTION_Y + sec_idx as i32) as i8),
         );
         sec_map.insert("block_states".into(), Tag::Compound(block_states));
         sec_map.insert("biomes".into(), Tag::Compound(biomes));
@@ -658,65 +694,86 @@ fn encode_chunk_anvil(
     let compressed = encoder.finish()?;
 
     let mut out = Vec::with_capacity(1 + compressed.len());
-    out.push(2); // Compression type 2 = Zlib (vanilla Anvil default).
+    out.push(2); // Compression type 2 = Zlib.
     out.extend_from_slice(&compressed);
     Ok(out)
 }
 
-fn decode_region_chunks(
-    bytes: &[u8],
-    generator: &FlatGenerator,
-) -> io::Result<Vec<([i32; 2], Edits)>> {
-    let region = RegionFile::parse(bytes)?;
-    let mut out = Vec::new();
-    for entry in region.chunks.iter().flatten() {
-        let (payload, _) = entry;
-        if payload.is_empty() {
-            continue;
-        }
-        let compression = payload[0];
-        let body = &payload[1..];
-        let nbt_bytes = match compression {
-            1 => {
-                let mut dec = GzDecoder::new(body);
-                let mut buf = Vec::new();
-                dec.read_to_end(&mut buf)?;
-                buf
-            }
-            2 => {
-                let mut dec = ZlibDecoder::new(body);
-                let mut buf = Vec::new();
-                dec.read_to_end(&mut buf)?;
-                buf
-            }
-            3 => body.to_vec(),
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unsupported Anvil compression type {other}"),
-                ));
-            }
-        };
-        let (_, root) = read_named_nbt(&nbt_bytes)?;
-        let Some(cx) = root.get("xPos").and_then(Tag::as_int) else {
-            continue;
-        };
-        let Some(cz) = root.get("zPos").and_then(Tag::as_int) else {
-            continue;
-        };
-        let edits = decode_chunk_sections(&root, generator);
-        out.push(([cx, cz], edits));
+fn decode_chunk_anvil(payload: &[u8]) -> io::Result<Chunk> {
+    if payload.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty Anvil chunk payload",
+        ));
     }
-    Ok(out)
+    let compression = payload[0];
+    let body = &payload[1..];
+    let nbt_bytes = match compression {
+        1 => {
+            let mut dec = GzDecoder::new(body);
+            let mut buf = Vec::new();
+            dec.read_to_end(&mut buf)?;
+            buf
+        }
+        2 => {
+            let mut dec = ZlibDecoder::new(body);
+            let mut buf = Vec::new();
+            dec.read_to_end(&mut buf)?;
+            buf
+        }
+        3 => body.to_vec(),
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported Anvil compression type {other}"),
+            ));
+        }
+    };
+    let (_, root) = read_named_nbt(&nbt_bytes)?;
+    Ok(decode_chunk_sections(&root))
 }
 
-fn decode_chunk_sections(root: &Compound, generator: &FlatGenerator) -> Edits {
-    let reg = registry();
-    let mut edits = Edits::new();
-    let Some(sections) = root.get("sections").and_then(Tag::as_list) else {
-        return edits;
+fn decode_biomes(sec_map: &Compound) -> BiomeStorage {
+    let Some(biomes_map) = sec_map.get("biomes").and_then(Tag::as_compound) else {
+        return BiomeStorage::Single(PLAINS_BIOME_ID);
     };
-    for sec_tag in sections {
+    let Some(palette_tags) = biomes_map.get("palette").and_then(Tag::as_list) else {
+        return BiomeStorage::Single(PLAINS_BIOME_ID);
+    };
+    if palette_tags.is_empty() {
+        return BiomeStorage::Single(PLAINS_BIOME_ID);
+    }
+    let palette: Vec<i32> = palette_tags
+        .iter()
+        .map(|t| t.as_str().and_then(biome_id).unwrap_or(PLAINS_BIOME_ID))
+        .collect();
+    if palette.len() == 1 {
+        return BiomeStorage::Single(palette[0]);
+    }
+    let Some(longs) = biomes_map.get("data").and_then(Tag::as_long_array) else {
+        return BiomeStorage::Single(palette[0]);
+    };
+    let bits = ((palette.len() - 1).ilog2() as usize + 1).max(1);
+    let per_long = 64 / bits;
+    let mask = (1u64 << bits) - 1;
+    let mut cells = Box::new([PLAINS_BIOME_ID; 64]);
+    for (i, cell) in cells.iter_mut().enumerate() {
+        let raw = longs.get(i / per_long).copied().unwrap_or(0) as u64;
+        let pal_idx = ((raw >> ((i % per_long) * bits)) & mask) as usize;
+        *cell = palette.get(pal_idx).copied().unwrap_or(PLAINS_BIOME_ID);
+    }
+    BiomeStorage::Dense(cells)
+}
+
+fn decode_chunk_sections(root: &Compound) -> Chunk {
+    let reg = registry();
+    let mut sections: Box<[ChunkSection; SECTION_COUNT]> = Box::new(std::array::from_fn(|_| {
+        ChunkSection::empty(PLAINS_BIOME_ID)
+    }));
+    let Some(raw_sections) = root.get("sections").and_then(Tag::as_list) else {
+        return Chunk::from_sections(sections);
+    };
+    for sec_tag in raw_sections {
         let Some(sec_map) = sec_tag.as_compound() else {
             continue;
         };
@@ -728,7 +785,10 @@ fn decode_chunk_sections(root: &Compound, generator: &FlatGenerator) -> Edits {
             continue;
         }
         let sec_idx = sec_idx as usize;
+        let biomes = decode_biomes(sec_map);
+
         let Some(block_states) = sec_map.get("block_states").and_then(Tag::as_compound) else {
+            sections[sec_idx] = ChunkSection::from_dense(Box::new([0; 4096]), biomes);
             continue;
         };
         let Some(palette_tags) = block_states.get("palette").and_then(Tag::as_list) else {
@@ -758,18 +818,12 @@ fn decode_chunk_sections(root: &Compound, generator: &FlatGenerator) -> Edits {
             palette.push(state);
         }
 
-        let offset = (sec_idx * 4096) as u32;
         if palette.len() == 1 {
-            let state = palette[0];
-            for ly in 0..16 {
-                let world_y = MIN_Y + (sec_idx * 16 + ly) as i32;
-                if state != generator.base_state(world_y) {
-                    let layer_start = offset + (ly * 256) as u32;
-                    for col in 0..256u32 {
-                        edits.insert(layer_start + col, state);
-                    }
-                }
+            let mut sec = ChunkSection::filled(palette[0], PLAINS_BIOME_ID);
+            if !matches!(biomes, BiomeStorage::Single(PLAINS_BIOME_ID)) {
+                sec = ChunkSection::from_dense(Box::new([palette[0]; 4096]), biomes);
             }
+            sections[sec_idx] = sec;
             continue;
         }
 
@@ -779,29 +833,24 @@ fn decode_chunk_sections(root: &Compound, generator: &FlatGenerator) -> Edits {
         let bits = ((palette.len() - 1).ilog2() as usize + 1).max(4);
         let per_long = 64 / bits;
         let mask = (1u64 << bits) - 1;
-        for i in 0..4096usize {
-            let long_idx = i / per_long;
-            let bit_off = (i % per_long) * bits;
-            let raw = longs.get(long_idx).copied().unwrap_or(0) as u64;
-            let pal_idx = ((raw >> bit_off) & mask) as usize;
-            let state = palette
+        let mut blocks = Box::new([crate::game::AIR_STATE; 4096]);
+        for (i, slot) in blocks.iter_mut().enumerate() {
+            let raw = longs.get(i / per_long).copied().unwrap_or(0) as u64;
+            let pal_idx = ((raw >> ((i % per_long) * bits)) & mask) as usize;
+            *slot = palette
                 .get(pal_idx)
                 .copied()
                 .unwrap_or(crate::game::AIR_STATE);
-            let ly = i / 256;
-            let world_y = MIN_Y + (sec_idx * 16 + ly) as i32;
-            if state != generator.base_state(world_y) {
-                edits.insert(offset + i as u32, state);
-            }
         }
+        sections[sec_idx] = ChunkSection::from_dense(blocks, biomes);
     }
-    edits
+    Chunk::from_sections(sections)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::BlockPos;
+    use crate::world::{ChunkGenerator, FlatGenerator};
 
     #[test]
     fn level_dat_region_mca_and_playerdata_roundtrip() {
@@ -819,41 +868,46 @@ mod tests {
             thunder_time: 9_000,
         };
         storage
-            .save_level(clock, &generator, [8.5, 65.0, 8.5])
+            .save_level(clock, Some(generator.config()), [8.5, 65.0, 8.5])
             .unwrap();
         let loaded_level = storage.load_level().unwrap().unwrap();
         assert_eq!(loaded_level.clock, clock);
         assert_eq!(loaded_level.flat.as_ref(), Some(generator.config()));
 
-        // 2. region/r.-1.0.mca and r.0.0.mca with block state properties (oak_stairs / torch / stone)
-        let mut c0 = Edits::new();
-        let pos_stone = BlockPos([3, 64, 5]);
-        let pos_bedrock_broken = BlockPos([8, 60, 8]);
+        // 2. Lazy single-chunk load/save across regions with block state properties & biomes
+        let mut c0 = (*generator.generate_chunk(0, 0)).clone();
         let mut props = BTreeMap::new();
         props.insert("facing".into(), "east".into());
         let stairs_state = registry()
             .resolve_state("minecraft:oak_stairs", &props)
             .unwrap();
-        c0.insert(pos_stone.index(), stairs_state);
-        c0.insert(pos_bedrock_broken.index(), crate::game::AIR_STATE);
+        c0.set_block(3, 64, 5, stairs_state);
+        c0.set_block(8, 60, 8, crate::game::AIR_STATE);
+        let desert = biome_id("minecraft:desert").unwrap();
+        c0.section_mut(7).set_biome(1, 2, 3, desert);
 
-        let mut c_neg = Edits::new();
-        let pos_neg = BlockPos([-2, 65, 1]);
-        c_neg.insert(pos_neg.index(), crate::game::GLASS_STATE);
+        let mut c_neg = (*generator.generate_chunk(-1, 0)).clone();
+        c_neg.set_block(14, 65, 1, crate::game::GLASS_STATE);
+
+        let c0 = Arc::new(c0);
+        let c_neg = Arc::new(c_neg);
 
         let saved = storage
-            .save_chunks(
-                &[([0, 0], Some(c0.clone())), ([-1, 0], Some(c_neg.clone()))],
-                &generator,
-            )
+            .save_chunks(&[([0, 0], c0.clone()), ([-1, 0], c_neg.clone())])
             .unwrap();
         assert_eq!(saved, 2);
         assert!(dir.path().join("region/r.0.0.mca").exists());
         assert!(dir.path().join("region/r.-1.0.mca").exists());
 
-        let reloaded = storage.load_all_chunks(&generator).unwrap();
-        assert_eq!(reloaded.get(&[0, 0]), Some(&c0));
-        assert_eq!(reloaded.get(&[-1, 0]), Some(&c_neg));
+        assert_eq!(
+            storage.load_chunk(0, 0).unwrap().as_ref(),
+            Some(c0.as_ref())
+        );
+        assert_eq!(
+            storage.load_chunk(-1, 0).unwrap().as_ref(),
+            Some(c_neg.as_ref())
+        );
+        assert!(storage.load_chunk(5, 5).unwrap().is_none());
 
         // 3. playerdata/<uuid>.dat
         let uuid = Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);

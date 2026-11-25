@@ -10,14 +10,16 @@ use crate::{
         Clientbound,
         packets::{play::HeldItemSlot, play_blocks::*},
     },
-    world::{BlockPos, Snapshot, World},
+    world::{BlockPos, Chunk, World},
 };
 use std::{collections::HashMap, io, sync::Arc};
+
+type PendingChunk = (Arc<Chunk>, Arc<[u8]>);
 
 #[derive(Debug)]
 pub(super) struct CreativeSession {
     world: Arc<World>,
-    pending_chunks: HashMap<[i32; 2], (Snapshot, Arc<[u8]>)>,
+    pending_chunks: HashMap<[i32; 2], PendingChunk>,
 }
 
 impl CreativeSession {
@@ -32,9 +34,7 @@ impl CreativeSession {
         for packet in packets {
             if let Clientbound::ChunkData(data) = packet {
                 let prepared = self.world.prepare_chunk(data.0);
-                if let Some(payload) = prepared.payload {
-                    data.1 = payload;
-                }
+                data.1 = prepared.payload;
                 self.pending_chunks
                     .insert(data.0, (prepared.snapshot, prepared.light));
             }

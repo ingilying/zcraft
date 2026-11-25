@@ -26,17 +26,37 @@ pub fn tags_packet() -> Vec<u8> {
 /// Resolve a vanilla 1.21.1 biome identifier (with or without `minecraft:`)
 /// to its dynamic wire registry ID sent in `minecraft:worldgen/biome`.
 pub fn biome_id(name: &str) -> Option<i32> {
-    static BIOMES: std::sync::LazyLock<std::collections::HashMap<String, i32>> =
-        std::sync::LazyLock::new(parse_biome_ids);
     if name.contains(':') {
-        BIOMES.get(name).copied()
+        biome_tables().by_name.get(name).copied()
     } else {
-        BIOMES.get(&format!("minecraft:{name}")).copied()
+        biome_tables()
+            .by_name
+            .get(&format!("minecraft:{name}"))
+            .copied()
     }
 }
 
-fn parse_biome_ids() -> std::collections::HashMap<String, i32> {
-    let mut map = std::collections::HashMap::new();
+/// Resolve a dynamic wire biome registry ID back to its vanilla 1.21.1 identifier.
+pub fn biome_name(id: i32) -> Option<&'static str> {
+    usize::try_from(id)
+        .ok()
+        .and_then(|idx| biome_tables().by_id.get(idx))
+        .map(String::as_str)
+}
+
+struct BiomeTables {
+    by_name: std::collections::HashMap<String, i32>,
+    by_id: Vec<String>,
+}
+
+fn biome_tables() -> &'static BiomeTables {
+    static TABLES: std::sync::LazyLock<BiomeTables> = std::sync::LazyLock::new(parse_biome_tables);
+    &TABLES
+}
+
+fn parse_biome_tables() -> BiomeTables {
+    let mut by_name = std::collections::HashMap::new();
+    let mut by_id = Vec::new();
     for packet in generated::REGISTRY_PACKETS {
         let mut cursor = RegistryCursor(packet);
         let reg_name = cursor.string();
@@ -44,9 +64,11 @@ fn parse_biome_ids() -> std::collections::HashMap<String, i32> {
             continue;
         }
         let count = cursor.varint();
+        by_id.reserve(count);
         for id in 0..count {
             let key = cursor.string();
-            map.insert(key, id as i32);
+            by_name.insert(key.clone(), id as i32);
+            by_id.push(key);
             if cursor.byte() != 0 {
                 let tag = cursor.byte();
                 debug_assert_eq!(tag, 10);
@@ -55,7 +77,7 @@ fn parse_biome_ids() -> std::collections::HashMap<String, i32> {
         }
         break;
     }
-    map
+    BiomeTables { by_name, by_id }
 }
 
 struct RegistryCursor<'a>(&'a [u8]);

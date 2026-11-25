@@ -1,10 +1,39 @@
-//! Configurable Superflat terrain generator (extensible for future generators).
+//! Extensible `ChunkGenerator` trait and configurable Superflat implementation.
 use super::{
-    ALL_LIGHT_SECTIONS, HEIGHT, LIGHT_BYTES, LIGHT_SECTION_COUNT, MIN_Y, SECTION_COUNT,
-    pack_entries, put_bitset, put_heightmaps_with, put_single_palette, put_varint,
+    ALL_LIGHT_SECTIONS, Chunk, ChunkSection, HEIGHT, LIGHT_BYTES, LIGHT_SECTION_COUNT, MIN_Y,
+    SECTION_COUNT, put_bitset, put_varint,
 };
 use serde::{Deserialize, Serialize};
-use std::{io, sync::Arc};
+use std::{fmt, io, sync::Arc};
+
+/// Pluggable terrain generator producing section-based `Chunk`s.
+pub trait ChunkGenerator: Send + Sync + fmt::Debug {
+    /// Generate a chunk at chunk coordinates `(cx, cz)`.
+    fn generate_chunk(&self, cx: i32, cz: i32) -> Arc<Chunk>;
+
+    /// Default world spawn position `[x, y, z]`.
+    fn spawn_position(&self) -> [f64; 3];
+
+    /// Optional shared immutable chunk template for uniform worlds (e.g. Superflat).
+    fn default_chunk(&self) -> Option<&Arc<Chunk>> {
+        None
+    }
+
+    /// Optional pre-encoded Chunk Data + Light payload matching `default_chunk()`.
+    fn default_terrain_payload(&self) -> Option<&Arc<[u8]>> {
+        None
+    }
+
+    /// Optional pre-encoded Update Light payload matching `default_chunk()`.
+    fn default_light_payload(&self) -> Option<&Arc<[u8]>> {
+        None
+    }
+
+    /// Optional Superflat config for `level.dat` serialization.
+    fn flat_config(&self) -> Option<&FlatGeneratorConfig> {
+        None
+    }
+}
 
 /// One horizontal layer in a Superflat preset, stacked bottom-up from `base_y`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,19 +117,16 @@ impl FlatGeneratorConfig {
     }
 }
 
-/// Compiled Superflat generator with precomputed column states, heightmaps,
-/// sky-light payload, and immutable chunk template.
+/// Compiled Superflat generator with a shared immutable chunk template and
+/// pre-encoded terrain/light payloads.
 #[derive(Debug, Clone)]
 pub struct FlatGenerator {
     config: FlatGeneratorConfig,
     biome_id: i32,
-    column: Box<[i32; HEIGHT as usize]>,
-    section_has_blocks: [bool; SECTION_COUNT],
     surface_y: i32,
     sky_top: u16,
     spawn_position: [f64; 3],
-    heightmap: [u16; 256],
-    section_data: Arc<[u8]>,
+    template: Arc<Chunk>,
     light_payload: Arc<[u8]>,
     terrain_payload: Arc<[u8]>,
 }
@@ -115,6 +141,9 @@ impl Default for FlatGenerator {
 impl FlatGenerator {
     pub fn from_config(config: FlatGeneratorConfig) -> io::Result<Self> {
         config.validate()?;
+        let biome_id = crate::registry_data::biome_id(&config.biome)
+            .expect("validated flat biome must exist in registry");
+
         let mut column = Box::new([crate::game::AIR_STATE; HEIGHT as usize]);
         let mut y = config.base_y;
         for layer in &config.layers {
@@ -127,13 +156,22 @@ impl FlatGenerator {
             }
         }
 
-        let mut section_has_blocks = [false; SECTION_COUNT];
-        for (sec, has_blocks) in section_has_blocks.iter_mut().enumerate() {
+        let sections: Box<[ChunkSection; SECTION_COUNT]> = Box::new(std::array::from_fn(|sec| {
             let start = sec * 16;
-            *has_blocks = column[start..start + 16]
-                .iter()
-                .any(|&s| s != crate::game::AIR_STATE);
-        }
+            let slice = &column[start..start + 16];
+            let first = slice[0];
+            if slice.iter().all(|&s| s == first) {
+                return ChunkSection::filled(first, biome_id);
+            }
+            let mut section = ChunkSection::empty(biome_id);
+            for (ly, &state) in slice.iter().enumerate() {
+                if state != crate::game::AIR_STATE {
+                    section.fill_layer(ly, state);
+                }
+            }
+            section
+        }));
+        let template = Arc::new(Chunk::from_sections(sections));
 
         let surface_y = column
             .iter()
@@ -152,31 +190,16 @@ impl FlatGenerator {
         };
         let spawn_position = [super::SPAWN_X, spawn_y, super::SPAWN_Z];
 
-        let height_value = if surface_y >= MIN_Y {
-            (surface_y + 1 - MIN_Y) as u16
-        } else {
-            0
-        };
-        let heightmap = [height_value; 256];
-
-        let biome_id = crate::registry_data::biome_id(&config.biome)
-            .expect("validated flat biome must exist in registry");
-        let section_data: Arc<[u8]> =
-            encode_flat_sections(&column, &section_has_blocks, biome_id).into();
         let light_payload: Arc<[u8]> = encode_flat_light(&column, sky_top).into();
-        let terrain_payload: Arc<[u8]> =
-            encode_flat_chunk_payload(&heightmap, &section_data, &light_payload).into();
+        let terrain_payload = template.encode_payload(&light_payload);
 
         Ok(Self {
             config,
             biome_id,
-            column,
-            section_has_blocks,
             surface_y,
             sky_top,
             spawn_position,
-            heightmap,
-            section_data,
+            template,
             light_payload,
             terrain_payload,
         })
@@ -193,20 +216,7 @@ impl FlatGenerator {
 
     #[inline]
     pub fn base_state(&self, y: i32) -> i32 {
-        let idx = y - MIN_Y;
-        if (0..HEIGHT).contains(&idx) {
-            self.column[idx as usize]
-        } else {
-            crate::game::AIR_STATE
-        }
-    }
-
-    #[inline]
-    pub fn has_blocks_in_section(&self, section: usize) -> bool {
-        self.section_has_blocks
-            .get(section)
-            .copied()
-            .unwrap_or(false)
+        self.template.get_block(0, y, 0)
     }
 
     #[inline]
@@ -224,81 +234,40 @@ impl FlatGenerator {
         self.spawn_position
     }
 
-    pub fn heightmap(&self) -> &[u16; 256] {
-        &self.heightmap
-    }
-
-    pub fn section_data(&self) -> &[u8] {
-        &self.section_data
-    }
-
-    pub fn light_payload(&self) -> &Arc<[u8]> {
-        &self.light_payload
-    }
-
     pub fn terrain_payload(&self) -> &Arc<[u8]> {
         &self.terrain_payload
     }
+}
 
-    pub fn column(&self) -> &[i32; HEIGHT as usize] {
-        &self.column
+impl ChunkGenerator for FlatGenerator {
+    fn generate_chunk(&self, _cx: i32, _cz: i32) -> Arc<Chunk> {
+        self.template.clone()
+    }
+
+    fn spawn_position(&self) -> [f64; 3] {
+        self.spawn_position
+    }
+
+    fn default_chunk(&self) -> Option<&Arc<Chunk>> {
+        Some(&self.template)
+    }
+
+    fn default_terrain_payload(&self) -> Option<&Arc<[u8]>> {
+        Some(&self.terrain_payload)
+    }
+
+    fn default_light_payload(&self) -> Option<&Arc<[u8]>> {
+        Some(&self.light_payload)
+    }
+
+    fn flat_config(&self) -> Option<&FlatGeneratorConfig> {
+        Some(&self.config)
     }
 }
 
 #[inline]
 fn allows_direct_skylight(state: i32) -> bool {
     crate::game::block_by_state(state).is_some_and(|def| def.skylight && def.light_block == 0)
-}
-
-fn encode_flat_sections(
-    column: &[i32; HEIGHT as usize],
-    section_has_blocks: &[bool; SECTION_COUNT],
-    biome_id: i32,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2300);
-    for (section, &has_blocks) in section_has_blocks.iter().enumerate() {
-        if !has_blocks {
-            out.extend_from_slice(&0u16.to_be_bytes());
-            put_single_palette(crate::game::AIR_STATE, &mut out);
-            put_single_palette(biome_id, &mut out);
-            continue;
-        }
-        let base_idx = section * 16;
-        let slice = &column[base_idx..base_idx + 16];
-        let non_air = slice
-            .iter()
-            .filter(|&&s| s != crate::game::AIR_STATE)
-            .count() as u16
-            * 256;
-        out.extend_from_slice(&non_air.to_be_bytes());
-
-        let mut palette = Vec::new();
-        let mut layer_indices = [0u64; 16];
-        for (ly, &state) in slice.iter().enumerate() {
-            layer_indices[ly] = palette.iter().position(|&s| s == state).unwrap_or_else(|| {
-                palette.push(state);
-                palette.len() - 1
-            }) as u64;
-        }
-
-        if palette.len() == 1 {
-            put_single_palette(palette[0], &mut out);
-        } else {
-            let bits = ((palette.len() - 1).ilog2() as u8 + 1).max(4);
-            out.push(bits);
-            put_varint(palette.len() as i32, &mut out);
-            for state in palette {
-                put_varint(state, &mut out);
-            }
-            let mut entries = [0u64; 4096];
-            for (ly, &idx) in layer_indices.iter().enumerate() {
-                entries[ly * 256..(ly + 1) * 256].fill(idx);
-            }
-            pack_entries(&entries, bits, &mut out);
-        }
-        put_single_palette(biome_id, &mut out);
-    }
-    out
 }
 
 fn encode_flat_light(column: &[i32; HEIGHT as usize], sky_top: u16) -> Vec<u8> {
@@ -308,14 +277,12 @@ fn encode_flat_light(column: &[i32; HEIGHT as usize], sky_top: u16) -> Vec<u8> {
             *level = 15;
         }
     }
-    // Check if any flat layer emits block light.
     let mut block_levels = [0u8; HEIGHT as usize];
     for (y_rel, &state) in column.iter().enumerate() {
         if let Some(def) = crate::game::block_by_state(state) {
             block_levels[y_rel] = def.light_emission.min(15);
         }
     }
-    // Propagate vertical block light in uniform flat layers if any emitter exists.
     if block_levels.iter().any(|&v| v > 0) {
         for y in 1..HEIGHT as usize {
             let atten = crate::game::block_by_state(column[y])
@@ -341,7 +308,6 @@ fn encode_flat_light(column: &[i32; HEIGHT as usize], sky_top: u16) -> Vec<u8> {
     for section in 1..LIGHT_SECTION_COUNT {
         let bottom = (section - 1) * 16;
         if bottom >= HEIGHT as usize {
-            // Top boundary section above max_y is always full skylight (15).
             sky_mask |= 1 << section;
             put_varint(LIGHT_BYTES as i32, &mut sky_arrays);
             sky_arrays.resize(sky_arrays.len() + LIGHT_BYTES, 0xff);
@@ -376,20 +342,6 @@ fn encode_flat_light(column: &[i32; HEIGHT as usize], sky_top: u16) -> Vec<u8> {
     out.extend(sky_arrays);
     put_varint(block_mask.count_ones() as i32, &mut out);
     out.extend(block_arrays);
-    out
-}
-
-fn encode_flat_chunk_payload(
-    heightmap: &[u16; 256],
-    section_data: &[u8],
-    light_payload: &[u8],
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(section_data.len() + light_payload.len() + 1024);
-    put_heightmaps_with(&mut out, heightmap);
-    put_varint(section_data.len() as i32, &mut out);
-    out.extend_from_slice(section_data);
-    put_varint(0, &mut out); // Block entity count.
-    out.extend_from_slice(light_payload);
     out
 }
 

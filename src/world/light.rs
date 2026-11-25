@@ -1,15 +1,13 @@
-//! Vanilla-aligned sky light and block light propagation over a 3x3 chunk
-//! neighborhood (Java 1.21.1 / protocol 767).
+//! Vanilla-aligned sky light and block light propagation over a 3x3 `Chunk`
+//! neighborhood (Java 1.21.1 / protocol 767), independent of terrain generator.
 use super::{
-    ALL_LIGHT_SECTIONS, HEIGHT, LIGHT_BYTES, LIGHT_SECTION_COUNT, MIN_Y,
-    edits::{Edits, Snapshot, state_at},
-    generator::FlatGenerator,
+    ALL_LIGHT_SECTIONS, BlockPos, Chunk, HEIGHT, LIGHT_BYTES, LIGHT_SECTION_COUNT, MIN_Y,
     put_bitset, put_varint,
 };
 use std::{collections::VecDeque, sync::Arc};
 
 /// 3x3 chunk snapshots ordered as `[dz + 1][dx + 1]` around the center chunk.
-pub(crate) type Neighborhood = [[Snapshot; 3]; 3];
+pub(crate) type Neighborhood = [[Arc<Chunk>; 3]; 3];
 
 const GRID: usize = 48;
 const LAYER: usize = GRID * GRID;
@@ -31,33 +29,36 @@ fn allows_direct_skylight(state: i32) -> bool {
     skylight && atten == 0
 }
 
-pub(crate) fn has_any_edits(neighborhood: &Neighborhood) -> bool {
-    neighborhood.iter().flatten().any(Option::is_some)
+pub(crate) fn is_uniform_template(neighborhood: &Neighborhood, template: &Arc<Chunk>) -> bool {
+    neighborhood
+        .iter()
+        .flatten()
+        .all(|chunk| Arc::ptr_eq(chunk, template))
 }
 
 /// Compute protocol 767 sky-light and block-light payload for the center chunk
 /// of `neighborhood`, propagating across chunk borders up to 14 blocks.
-pub(crate) fn chunk_light(neighborhood: &Neighborhood, generator: &FlatGenerator) -> Arc<[u8]> {
-    if !has_any_edits(neighborhood) {
-        return generator.light_payload().clone();
+pub(crate) fn chunk_light(
+    neighborhood: &Neighborhood,
+    fast_path: Option<(&Arc<Chunk>, &Arc<[u8]>)>,
+) -> Arc<[u8]> {
+    if let Some((template, default_light)) = fast_path
+        && is_uniform_template(neighborhood, template)
+    {
+        return default_light.clone();
     }
 
-    let mut sky_top = [generator.sky_top(); LAYER];
-    let mut min_edit_y = usize::MAX;
-    let mut max_edit_y = 0usize;
+    let mut sky_top = [0u16; LAYER];
+    let mut min_emissive = usize::MAX;
+    let mut max_emissive = 0usize;
 
     for (dz, row) in neighborhood.iter().enumerate() {
-        for (dx, snap) in row.iter().enumerate() {
-            let Some(edits) = snap.as_deref() else {
-                continue;
-            };
-            if let Some(&first) = edits.keys().next() {
-                min_edit_y = min_edit_y.min((first / 256) as usize);
+        for (dx, chunk) in row.iter().enumerate() {
+            if let Some((lo, hi)) = chunk.emissive_y_bounds() {
+                min_emissive = min_emissive.min(lo);
+                max_emissive = max_emissive.max(hi);
             }
-            if let Some(&last) = edits.keys().next_back() {
-                max_edit_y = max_edit_y.max((last / 256) as usize);
-            }
-            let chunk_top = chunk_sky_heights(edits, generator);
+            let chunk_top = chunk.heightmap(|s| !allows_direct_skylight(s));
             for lz in 0..16 {
                 let gz = dz * 16 + lz;
                 for lx in 0..16 {
@@ -68,12 +69,13 @@ pub(crate) fn chunk_light(neighborhood: &Neighborhood, generator: &FlatGenerator
         }
     }
 
-    let min_top = usize::from(*sky_top.iter().min().unwrap());
-    let max_top = usize::from(*sky_top.iter().max().unwrap());
-    let min_y = min_top.min(min_edit_y);
-    let max_y = max_top.max(max_edit_y.saturating_add(16));
-    let band_start = min_y.saturating_sub(15) & !15;
-    let band_end = max_y.next_multiple_of(16).min(HEIGHT as usize);
+    let min_top = usize::from(*sky_top.iter().min().unwrap_or(&0));
+    let max_top = usize::from(*sky_top.iter().max().unwrap_or(&0));
+    let band_start = min_top.min(min_emissive).saturating_sub(15) & !15;
+    let band_end = max_top
+        .max(max_emissive.saturating_add(16))
+        .next_multiple_of(16)
+        .min(HEIGHT as usize);
     let band_height = band_end.saturating_sub(band_start);
 
     let cells = band_height * LAYER;
@@ -84,28 +86,18 @@ pub(crate) fn chunk_light(neighborhood: &Neighborhood, generator: &FlatGenerator
 
     for dy in 0..band_height {
         let y_rel = band_start + dy;
-        let default_state = generator.base_state(MIN_Y + y_rel as i32);
-        let (default_skylight, default_emission, default_atten) = light_props(default_state);
-        let _ = default_skylight;
+        let world_y = MIN_Y + y_rel as i32;
         let layer_base = dy * LAYER;
         for (dz, row) in neighborhood.iter().enumerate() {
-            for (dx, snap) in row.iter().enumerate() {
-                let edits = snap.as_deref();
+            for (dx, chunk) in row.iter().enumerate() {
                 for lz in 0..16 {
                     let gz = dz * 16 + lz;
                     let row_offset = layer_base + gz * GRID + dx * 16;
                     let top_offset = gz * GRID + dx * 16;
                     for lx in 0..16 {
                         let idx = row_offset + lx;
-                        let (emission, opacity) = match edits {
-                            Some(edits) => {
-                                let state =
-                                    state_at(edits, (y_rel * 256 + lz * 16 + lx) as u32, generator);
-                                let (_, e, a) = light_props(state);
-                                (e, a)
-                            }
-                            None => (default_emission, default_atten),
-                        };
+                        let state = chunk.get_block(lx, world_y, lz);
+                        let (_, emission, opacity) = light_props(state);
                         atten[idx] = opacity;
                         if y_rel >= usize::from(sky_top[top_offset + lx]) {
                             sky[idx] = 15;
@@ -159,8 +151,6 @@ fn can_improve(level: u8, neighbor_atten: u8, neighbor_light: u8) -> bool {
 }
 
 fn propagate(light: &mut [u8], atten: &[u8], buckets: &mut [Vec<usize>; 16], band_height: usize) {
-    // Process strictly from highest light level (15) down to 2 so every cell
-    // settles on its first visit without redundant re-queuing.
     let mut queue = VecDeque::new();
     for level in (2..=15u8).rev() {
         queue.extend(buckets[usize::from(level)].drain(..));
@@ -201,33 +191,6 @@ fn propagate(light: &mut [u8], atten: &[u8], buckets: &mut [Vec<usize>; 16], ban
             }
         }
     }
-}
-
-fn chunk_sky_heights(edits: &Edits, generator: &FlatGenerator) -> [u16; 256] {
-    let mut result = [0u16; 256];
-    let top_base = generator.surface_y();
-    if top_base >= MIN_Y {
-        let base_y = generator.config().base_y;
-        for (col, height) in result.iter_mut().enumerate() {
-            for y in (base_y..=top_base).rev() {
-                if !allows_direct_skylight(state_at(
-                    edits,
-                    ((y - MIN_Y) as u32) * 256 + col as u32,
-                    generator,
-                )) {
-                    *height = (y - MIN_Y + 1) as u16;
-                    break;
-                }
-            }
-        }
-    }
-    for (&i, &state) in edits {
-        if !allows_direct_skylight(state) {
-            let height = (i / 256 + 1) as u16;
-            result[i as usize % 256] = result[i as usize % 256].max(height);
-        }
-    }
-    result
 }
 
 fn encode_center_light(sky: &[u8], block: &[u8], band_start: usize, band_end: usize) -> Arc<[u8]> {
@@ -294,7 +257,7 @@ fn pack_center_section(grid: &[u8], dy_start: usize, out: &mut Vec<u8>) -> bool 
 }
 
 /// Chunks whose light may be affected by editing `pos` (max light spread is 14).
-pub(crate) fn affected_light_chunks(pos: super::BlockPos) -> Vec<[i32; 2]> {
+pub(crate) fn affected_light_chunks(pos: BlockPos) -> Vec<[i32; 2]> {
     let [cx, cz] = pos.chunk();
     let lx = pos.0[0].rem_euclid(16);
     let lz = pos.0[2].rem_euclid(16);
@@ -317,4 +280,142 @@ pub(crate) fn affected_light_chunks(pos: super::BlockPos) -> Vec<[i32; 2]> {
         }
     }
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::{ChunkGenerator, FlatGenerator};
+
+    fn decode_light(payload: &[u8]) -> (u64, Vec<&[u8]>, u64, Vec<&[u8]>) {
+        let mut r = crate::protocol::Reader::new(payload);
+        let read_mask = |r: &mut crate::protocol::Reader<'_>| -> u64 {
+            let len = r.varint().unwrap();
+            assert!(len <= 1);
+            if len == 1 { r.i64().unwrap() as u64 } else { 0 }
+        };
+        let sky_mask = read_mask(&mut r);
+        let block_mask = read_mask(&mut r);
+        let _empty_sky = read_mask(&mut r);
+        let _empty_block = read_mask(&mut r);
+        let sky_count = r.varint().unwrap() as usize;
+        let mut sky_arrays = Vec::with_capacity(sky_count);
+        for _ in 0..sky_count {
+            let len = r.varint().unwrap() as usize;
+            sky_arrays.push(r.take(len).unwrap());
+        }
+        let block_count = r.varint().unwrap() as usize;
+        let mut block_arrays = Vec::with_capacity(block_count);
+        for _ in 0..block_count {
+            let len = r.varint().unwrap() as usize;
+            block_arrays.push(r.take(len).unwrap());
+        }
+        r.finish().unwrap();
+        (sky_mask, sky_arrays, block_mask, block_arrays)
+    }
+
+    fn light_at(mask: u64, arrays: &[&[u8]], x: usize, y: i32, z: usize) -> u8 {
+        let sec = ((y - MIN_Y) / 16 + 1) as u32;
+        if (mask & (1u64 << sec)) == 0 {
+            return 0;
+        }
+        let arr_idx = (mask & ((1u64 << sec) - 1)).count_ones() as usize;
+        let sample = ((y - MIN_Y) as usize % 16) * 256 + z * 16 + x;
+        let byte = arrays[arr_idx][sample / 2];
+        if sample.is_multiple_of(2) {
+            byte & 0x0f
+        } else {
+            byte >> 4
+        }
+    }
+
+    fn flat_neighborhood(center: Arc<Chunk>, base: &Arc<Chunk>) -> Neighborhood {
+        let mut grid: Neighborhood = std::array::from_fn(|_| std::array::from_fn(|_| base.clone()));
+        grid[1][1] = center;
+        grid
+    }
+
+    #[test]
+    fn broken_bedrock_and_overhangs_receive_skylight() {
+        let generator = FlatGenerator::default();
+        let base = generator.generate_chunk(0, 0);
+        let mut center = (*base).clone();
+        for y in 60..=63 {
+            center.set_block(8, y, 8, 0);
+        }
+        center.set_block(9, 61, 8, 0);
+
+        let payload = chunk_light(&flat_neighborhood(Arc::new(center), &base), None);
+        let (sky_mask, sky_arrays, block_mask, _) = decode_light(&payload);
+        assert_eq!(block_mask, 0);
+        assert_eq!(light_at(sky_mask, &sky_arrays, 8, 60, 8), 15);
+        assert_eq!(light_at(sky_mask, &sky_arrays, 8, 59, 8), 15);
+        assert_eq!(light_at(sky_mask, &sky_arrays, 9, 61, 8), 14);
+    }
+
+    #[test]
+    fn block_light_emits_attenuates_and_crosses_chunk_borders() {
+        let generator = FlatGenerator::default();
+        let base = generator.generate_chunk(0, 0);
+        let glowstone = crate::game::block_by_name("glowstone")
+            .unwrap()
+            .default_state;
+        let torch = crate::game::block_by_name("torch").unwrap().default_state;
+        let tinted_glass = crate::game::block_by_name("tinted_glass")
+            .unwrap()
+            .default_state;
+
+        let mut c0 = (*base).clone();
+        c0.set_block(15, 64, 8, glowstone);
+        c0.set_block(14, 64, 8, tinted_glass);
+        c0.set_block(2, 64, 2, torch);
+        let c0 = Arc::new(c0);
+
+        let payload0 = chunk_light(&flat_neighborhood(c0.clone(), &base), None);
+        let (_, _, b0_mask, b0_arr) = decode_light(&payload0);
+        assert_eq!(light_at(b0_mask, &b0_arr, 15, 64, 8), 15);
+        assert_eq!(light_at(b0_mask, &b0_arr, 14, 64, 8), 0);
+        assert_eq!(light_at(b0_mask, &b0_arr, 15, 65, 8), 14);
+        assert_eq!(light_at(b0_mask, &b0_arr, 2, 64, 2), 14);
+        assert_eq!(light_at(b0_mask, &b0_arr, 3, 64, 2), 13);
+
+        // Chunk [1, 0] has c0 as its west neighbor ([1][0]).
+        let mut grid1: Neighborhood =
+            std::array::from_fn(|_| std::array::from_fn(|_| base.clone()));
+        grid1[1][0] = c0;
+        let payload1 = chunk_light(&grid1, None);
+        let (_, _, b1_mask, b1_arr) = decode_light(&payload1);
+        assert_eq!(light_at(b1_mask, &b1_arr, 0, 64, 8), 14);
+        assert_eq!(light_at(b1_mask, &b1_arr, 1, 64, 8), 13);
+        assert_eq!(light_at(b1_mask, &b1_arr, 13, 64, 8), 1);
+        assert_eq!(light_at(b1_mask, &b1_arr, 14, 64, 8), 0);
+    }
+
+    #[test]
+    fn deep_underground_light_sources_below_sky_band_are_lit_and_cross_borders() {
+        let generator = FlatGenerator::default();
+        let base = generator.generate_chunk(0, 0);
+        let torch = crate::game::block_by_name("torch").unwrap().default_state;
+
+        // Place a torch at y = -20 (84 blocks below the intact y = 63 flat surface).
+        let mut c0 = (*base).clone();
+        c0.set_block(15, -20, 8, torch);
+        let c0 = Arc::new(c0);
+
+        let payload0 = chunk_light(&flat_neighborhood(c0.clone(), &base), None);
+        let (_, _, b0_mask, b0_arr) = decode_light(&payload0);
+        assert_eq!(light_at(b0_mask, &b0_arr, 15, -20, 8), 14);
+        assert_eq!(light_at(b0_mask, &b0_arr, 15, -21, 8), 13);
+        assert_eq!(light_at(b0_mask, &b0_arr, 15, -19, 8), 13);
+
+        // Neighboring chunk [1, 0] also receives the underground cross-border light.
+        let mut grid1: Neighborhood =
+            std::array::from_fn(|_| std::array::from_fn(|_| base.clone()));
+        grid1[1][0] = c0;
+        let payload1 = chunk_light(&grid1, None);
+        let (_, _, b1_mask, b1_arr) = decode_light(&payload1);
+        assert_eq!(light_at(b1_mask, &b1_arr, 0, -20, 8), 13);
+        assert_eq!(light_at(b1_mask, &b1_arr, 12, -20, 8), 1);
+        assert_eq!(light_at(b1_mask, &b1_arr, 13, -20, 8), 0);
+    }
 }

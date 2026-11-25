@@ -109,7 +109,7 @@ async fn anvil_superflat_world_survives_restart_via_save_all() {
 
     // Reopen world WITHOUT passing `flat` in config; level.dat must restore everything!
     let reopened = World::open(&world_dir, None).unwrap();
-    assert_eq!(reopened.generator().config(), &custom_flat);
+    assert_eq!(reopened.flat_config(), Some(&custom_flat));
     assert_eq!(reopened.block_at(pos_a), stairs);
     assert_eq!(reopened.block_at(pos_b), zcraft::game::GLASS_STATE);
     assert_eq!(reopened.block_at(pos_break), zcraft::game::AIR_STATE);
@@ -261,5 +261,55 @@ fn custom_biome_is_validated_and_encoded_in_flat_generator() {
         zcraft::world::FlatGenerator::default()
             .terrain_payload()
             .as_ref()
+    );
+}
+
+#[test]
+fn pluggable_chunk_generator_produces_distinct_per_chunk_terrain() {
+    use std::sync::Arc;
+    use zcraft::world::{Chunk, ChunkGenerator};
+
+    #[derive(Debug)]
+    struct CheckerboardGenerator;
+
+    impl ChunkGenerator for CheckerboardGenerator {
+        fn generate_chunk(&self, cx: i32, cz: i32) -> Arc<Chunk> {
+            let biome = if (cx + cz).rem_euclid(2) == 0 {
+                zcraft::registry_data::biome_id("minecraft:plains").unwrap()
+            } else {
+                zcraft::registry_data::biome_id("minecraft:desert").unwrap()
+            };
+            let mut chunk = Chunk::empty(biome);
+            let top_block = if (cx + cz).rem_euclid(2) == 0 {
+                zcraft::game::GRASS_BLOCK_STATE
+            } else {
+                zcraft::game::STONE_STATE
+            };
+            chunk.set_block(0, 64, 0, top_block);
+            Arc::new(chunk)
+        }
+
+        fn spawn_position(&self) -> [f64; 3] {
+            [0.5, 66.0, 0.5]
+        }
+    }
+
+    let world = World::with_generator(Arc::new(CheckerboardGenerator));
+    assert_eq!(
+        world.block_at(BlockPos([0, 64, 0])),
+        zcraft::game::GRASS_BLOCK_STATE
+    );
+    assert_eq!(
+        world.block_at(BlockPos([16, 64, 0])),
+        zcraft::game::STONE_STATE
+    );
+    assert!(
+        world
+            .set_block(BlockPos([16, 65, 0]), zcraft::game::GLASS_STATE)
+            .is_some()
+    );
+    assert_eq!(
+        world.block_at(BlockPos([16, 65, 0])),
+        zcraft::game::GLASS_STATE
     );
 }
