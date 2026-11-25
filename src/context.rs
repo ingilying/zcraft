@@ -60,7 +60,7 @@ impl ServerContext {
     /// Snapshot currently ready entities for command evaluation. The current
     /// world contains players only; returned values do not retain registry locks.
     pub fn command_entities(&self) -> Vec<crate::command::arguments::EntitySnapshot> {
-        self.players().command_entities(self.play.game_mode())
+        self.players().command_entities()
     }
 
     /// Shared admission, presence, and broadcast service.

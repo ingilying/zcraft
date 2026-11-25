@@ -10,18 +10,18 @@ use crate::{
         Clientbound,
         packets::{play::HeldItemSlot, play_blocks::*},
     },
-    world::{self, BlockPos, BlockWorld, Snapshot},
+    world::{BlockPos, Snapshot, World},
 };
 use std::{collections::HashMap, io, sync::Arc};
 
 #[derive(Debug)]
 pub(super) struct CreativeSession {
-    world: Arc<BlockWorld>,
+    world: Arc<World>,
     pending_chunks: HashMap<[i32; 2], (Snapshot, Arc<[u8]>)>,
 }
 
 impl CreativeSession {
-    pub(super) fn new(world: Arc<BlockWorld>) -> Self {
+    pub(super) fn new(world: Arc<World>) -> Self {
         Self {
             world,
             pending_chunks: HashMap::new(),
@@ -31,77 +31,48 @@ impl CreativeSession {
     pub(super) fn prepare_chunks(&mut self, packets: &mut [Clientbound]) {
         for packet in packets {
             if let Clientbound::ChunkData(data) = packet {
-                let neighborhood = self.world.lock().neighborhood(data.0);
-                let light = world::chunk_light(&neighborhood);
-                if world::has_any_edits(&neighborhood) {
-                    data.1 = world::chunk_payload_with_light(&neighborhood);
+                let prepared = self.world.prepare_chunk(data.0);
+                if let Some(payload) = prepared.payload {
+                    data.1 = payload;
                 }
-                let center = neighborhood[1][1].clone();
-                self.pending_chunks.insert(data.0, (center, light));
+                self.pending_chunks
+                    .insert(data.0, (prepared.snapshot, prepared.light));
             }
         }
     }
 
     pub(super) fn chunk_sent(&mut self, slot: &Reservation, chunk: [i32; 2]) -> io::Result<()> {
         let (old, old_light) = self.pending_chunks.remove(&chunk).expect("prepared chunk");
-        let blocks = self.world.lock();
-        let neighborhood = blocks.neighborhood(chunk);
-        let new = &neighborhood[1][1];
-        let changes = world::changed_blocks(chunk, &old, new);
-        let new_light = world::chunk_light(&neighborhood);
-        let updates = updates(chunk, changes, &old_light, new_light)?;
-        // The edit lock spans both reconciliation and subscription. A write
-        // can never slip in between the two; no lock spans a socket write.
-        slot.watch_blocks(chunk, updates);
-        Ok(())
+        self.world
+            .reconcile_and_subscribe(chunk, &old, &old_light, |changes, light_update| {
+                let updates = encode_chunk_updates(chunk, changes, light_update)?;
+                slot.watch_blocks(chunk, updates);
+                Ok(())
+            })
     }
 }
 
 type Bodies = Arc<[Arc<[u8]>]>;
-fn updates(
+fn encode_chunk_updates(
     chunk: [i32; 2],
     changes: Vec<(BlockPos, i32)>,
-    old_light: &Arc<[u8]>,
-    new_light: Arc<[u8]>,
+    light_update: Option<Arc<[u8]>>,
 ) -> io::Result<Bodies> {
-    let light_changed = new_light != *old_light;
-    if changes.is_empty() && !light_changed {
+    if changes.is_empty() && light_update.is_none() {
         return Ok(Arc::from([]));
     }
-    let mut bodies = Vec::with_capacity(changes.len() + usize::from(light_changed));
+    let mut bodies = Vec::with_capacity(changes.len() + usize::from(light_update.is_some()));
     for (pos, state) in changes {
         bodies.push(Clientbound::from(BlockUpdate(pos, state)).encode()?.into());
     }
-    if light_changed {
+    if let Some(light) = light_update {
         bodies.push(
-            Clientbound::from(LightUpdate(chunk, new_light))
+            Clientbound::from(LightUpdate(chunk, light))
                 .encode()?
                 .into(),
         );
     }
     Ok(bodies.into())
-}
-
-fn in_reach(position: [f64; 3], pos: BlockPos) -> bool {
-    let eye = [position[0], position[1] + 1.62, position[2]];
-    eye.into_iter()
-        .zip(pos.0)
-        .map(|(p, b)| {
-            let b = f64::from(b);
-            (p - p.clamp(b, b + 1.)).powi(2)
-        })
-        .sum::<f64>()
-        <= 5.0f64.powi(2)
-}
-
-fn intersects_player([x, y, z]: [f64; 3], pos: BlockPos) -> bool {
-    let [bx, by, bz] = pos.0.map(f64::from);
-    x + 0.3 > bx
-        && x - 0.3 < bx + 1.
-        && y + 1.8 > by
-        && y < by + 1.
-        && z + 0.3 > bz
-        && z - 0.3 < bz + 1.
 }
 
 #[derive(Clone, Copy)]
@@ -125,18 +96,18 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
         .play
         .as_ref()
         .ok_or_else(|| crate::protocol::invalid("Play session not initialized"))?;
-    if state.game_mode != crate::config::GameMode::Creative {
+    if !state.player.is_creative() {
         return Ok(reply(vec![BlockAck(sequence).into()]));
     }
     let Some(slot) = session.reservation.as_ref() else {
         return Ok(reply(vec![BlockAck(sequence).into()]));
     };
     let valid = |pos: BlockPos| pos.valid() && state.chunks.tracks(pos.chunk());
-    let reachable = |pos: BlockPos| valid(pos) && in_reach(state.position, pos);
-    let mut blocks = state.blocks.world.lock();
+    let reachable = |pos: BlockPos| valid(pos) && state.player.in_reach(pos);
+    let world = &state.blocks.world;
     let (positions, edit) = match action {
         Action::Dig { pos, face, start } => {
-            let current = blocks.get(pos);
+            let current = world.block_at(pos);
             let edit = if start && face < 6 && reachable(pos) && current != crate::game::AIR_STATE {
                 Some((pos, crate::game::AIR_STATE))
             } else {
@@ -156,15 +127,15 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
                 let stack = session.inventory.hand(hand)?;
                 let block = stack.definition().block?;
                 let material = crate::game::registry().default_state(block)?;
-                let support_block = crate::game::block_by_state(blocks.get(support))?;
-                let target_block = crate::game::block_by_state(blocks.get(pos))?;
+                let support_block = crate::game::block_by_state(world.block_at(support))?;
+                let target_block = crate::game::block_by_state(world.block_at(pos))?;
                 let placed = crate::game::block_by_state(material)?;
                 (hit.iter().all(|f| (0.0..=1.0).contains(f))
                     && reachable(support)
                     && reachable(pos)
                     && !support_block.replaceable
                     && target_block.replaceable
-                    && (!placed.collision || !intersects_player(state.position, pos)))
+                    && (!placed.collision || !state.player.intersects_block(pos)))
                 .then_some((pos, material))
             });
             ([Some(support), place], edit)
@@ -173,32 +144,25 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
     let ack: Arc<[u8]> = Clientbound::from(BlockAck(sequence)).encode()?.into();
     if state.pending_teleport.is_none()
         && let Some((pos, material)) = edit
+        && let Some(mutation) = world.set_block(pos, material)
     {
         let chunk = pos.chunk();
-        let affected = world::affected_light_chunks(pos);
-        let old_lights: Vec<_> = affected
-            .iter()
-            .map(|&nc| (nc, world::chunk_light(&blocks.neighborhood(nc))))
-            .collect();
-        if blocks.set(pos, material) {
-            for (nc, old_light) in old_lights {
-                let new_light = world::chunk_light(&blocks.neighborhood(nc));
-                if nc == chunk {
-                    let data = updates(chunk, vec![(pos, material)], &old_light, new_light)?;
-                    slot.publish_blocks(chunk, data, ack.clone());
-                } else if new_light != old_light {
-                    let body = Clientbound::from(LightUpdate(nc, new_light))
-                        .encode()?
-                        .into();
-                    slot.publish_light(nc, body);
-                }
+        let mut center_light = None;
+        for (nc, light) in mutation.light_changes {
+            if nc == chunk {
+                center_light = Some(light);
+            } else {
+                let body = Clientbound::from(LightUpdate(nc, light)).encode()?.into();
+                slot.publish_light(nc, body);
             }
-            return Ok(Outcome::empty());
         }
+        let data = encode_chunk_updates(chunk, mutation.block_changes, center_light)?;
+        slot.publish_blocks(chunk, data, ack);
+        return Ok(Outcome::empty());
     }
     let mut corrections = Vec::new();
     for pos in positions.into_iter().flatten().filter(|&pos| valid(pos)) {
-        let body = Clientbound::from(BlockUpdate(pos, blocks.get(pos)))
+        let body = Clientbound::from(BlockUpdate(pos, world.block_at(pos)))
             .encode()?
             .into();
         corrections.push((pos.chunk(), body));
@@ -265,7 +229,7 @@ pub async fn handle_use_item(ctx: &mut Context<'_>, p: UseItem) -> io::Result<Ou
             .session
             .play
             .as_ref()
-            .is_some_and(|state| state.game_mode == crate::config::GameMode::Creative)
+            .is_some_and(|state| state.player.is_creative())
     {
         // Future food/tools/projectiles dispatch through item categories here. Even a
         // no-op use is acknowledged in the same FIFO as block predictions.
@@ -283,7 +247,7 @@ pub async fn handle_slot(ctx: &mut Context<'_>, p: HeldItemSlot) -> io::Result<O
 }
 
 fn inventory(ctx: &mut Context<'_>) -> io::Result<Outcome> {
-    if play(ctx.session)?.game_mode == crate::config::GameMode::Creative {
+    if play(ctx.session)?.player.is_creative() {
         Ok(reply(vec![
             InventoryContent(Box::new(ctx.session.inventory.clone())).into(),
         ]))
@@ -293,7 +257,7 @@ fn inventory(ctx: &mut Context<'_>) -> io::Result<Outcome> {
 }
 
 pub async fn handle_creative_slot(ctx: &mut Context<'_>, p: CreativeSlot) -> io::Result<Outcome> {
-    if play(ctx.session)?.game_mode != crate::config::GameMode::Creative {
+    if !play(ctx.session)?.player.is_creative() {
         return Ok(Outcome::empty());
     }
     if let Some(item) = p.item.supported() {
@@ -321,7 +285,7 @@ pub async fn handle_inventory_click(
     ctx: &mut Context<'_>,
     p: InventoryClickPacket,
 ) -> io::Result<Outcome> {
-    if play(ctx.session)?.game_mode != crate::config::GameMode::Creative {
+    if !play(ctx.session)?.player.is_creative() {
         return Ok(Outcome::empty());
     }
     if p.window == 0 && p.state_id == ctx.session.inventory.state_id() {

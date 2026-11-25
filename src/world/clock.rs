@@ -1,8 +1,5 @@
 //! 20 TPS world clock, daylight cycle, and vanilla Java 1.21.1 weather cycle.
-use crate::protocol::{
-    Clientbound,
-    packets::play::{GameEvent, TimeUpdate},
-};
+//! Pure domain model: produces protocol-agnostic time and weather events.
 use rand::Rng;
 use std::time::Duration;
 
@@ -23,12 +20,32 @@ const THUNDER_MIN: u32 = 3_600;
 const THUNDER_MAX: u32 = 15_600;
 const MAX_WEATHER_STEPS: u8 = 100;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeSnapshot {
+    pub world_age: i64,
+    pub day_time: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WeatherSnapshot {
     pub raining: bool,
     pub thundering: bool,
     pub rain_level: f32,
     pub thunder_level: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WeatherEvent {
+    StartRaining,
+    StopRaining,
+    RainLevel(f32),
+    ThunderLevel(f32),
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TickEvents {
+    pub time_sync: Option<TimeSnapshot>,
+    pub weather: Vec<WeatherEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +93,13 @@ impl WorldClock {
         self.day_time
     }
 
+    pub fn time(&self) -> TimeSnapshot {
+        TimeSnapshot {
+            world_age: self.world_age,
+            day_time: self.day_time,
+        }
+    }
+
     fn rain_level(&self) -> f32 {
         f32::from(self.rain_steps) / f32::from(MAX_WEATHER_STEPS)
     }
@@ -93,41 +117,32 @@ impl WorldClock {
         }
     }
 
-    pub fn time_packet(&self) -> TimeUpdate {
-        TimeUpdate {
-            world_age: self.world_age,
-            time_of_day: self.day_time,
-        }
-    }
-
-    /// Packets sent to a newly entering Play client to synchronize current
-    /// time and active weather.
-    pub fn initial_packets(&self) -> Vec<Clientbound> {
-        let mut packets = vec![self.time_packet().into()];
+    /// Initial domain state to synchronize a newly entering player.
+    pub fn initial_state(&self) -> (TimeSnapshot, Vec<WeatherEvent>) {
+        let mut weather = Vec::new();
         if self.raining {
-            packets.push(GameEvent::start_raining().into());
+            weather.push(WeatherEvent::StartRaining);
         }
         if self.rain_steps > 0 {
-            packets.push(GameEvent::rain_level(self.rain_level()).into());
+            weather.push(WeatherEvent::RainLevel(self.rain_level()));
         }
         if self.thunder_steps > 0 {
-            packets.push(GameEvent::thunder_level(self.thunder_level()).into());
+            weather.push(WeatherEvent::ThunderLevel(self.thunder_level()));
         }
-        packets
+        (self.time(), weather)
     }
 
-    pub fn set_day_time(&mut self, day_time: i64) -> TimeUpdate {
+    pub fn set_day_time(&mut self, day_time: i64) -> TimeSnapshot {
         self.day_time = day_time.max(0);
-        self.time_packet()
+        self.time()
     }
 
-    /// Explicitly override weather (e.g. for a future `/weather` command).
     pub fn set_weather(
         &mut self,
         raining: bool,
         thundering: bool,
         duration: u32,
-    ) -> Vec<Clientbound> {
+    ) -> Vec<WeatherEvent> {
         let duration = duration.max(1);
         let was_raining = self.raining;
         self.raining = raining;
@@ -136,32 +151,29 @@ impl WorldClock {
         self.thunder_time = duration;
         let mut out = Vec::new();
         if was_raining != self.raining {
-            out.push(
-                if self.raining {
-                    GameEvent::start_raining()
-                } else {
-                    GameEvent::stop_raining()
-                }
-                .into(),
-            );
+            out.push(if self.raining {
+                WeatherEvent::StartRaining
+            } else {
+                WeatherEvent::StopRaining
+            });
         }
         out
     }
 
     /// Advance the world by one 50ms tick (20 TPS) using the thread RNG.
-    pub fn tick(&mut self) -> Vec<Clientbound> {
+    pub fn tick(&mut self) -> TickEvents {
         let mut rng = rand::thread_rng();
         self.tick_with_rng(&mut rng)
     }
 
     /// Advance the world by one 50ms tick (20 TPS) with an injected RNG.
-    pub fn tick_with_rng(&mut self, rng: &mut impl Rng) -> Vec<Clientbound> {
+    pub fn tick_with_rng(&mut self, rng: &mut impl Rng) -> TickEvents {
         self.world_age = self.world_age.wrapping_add(1);
         self.day_time = self.day_time.wrapping_add(1);
 
-        let mut packets = Vec::new();
+        let mut events = TickEvents::default();
         if self.world_age % TIME_SYNC_INTERVAL == 0 {
-            packets.push(self.time_packet().into());
+            events.time_sync = Some(self.time());
         }
 
         let was_raining = self.raining;
@@ -200,22 +212,23 @@ impl WorldClock {
         };
 
         if was_raining != self.raining {
-            packets.push(
-                if self.raining {
-                    GameEvent::start_raining()
-                } else {
-                    GameEvent::stop_raining()
-                }
-                .into(),
-            );
+            events.weather.push(if self.raining {
+                WeatherEvent::StartRaining
+            } else {
+                WeatherEvent::StopRaining
+            });
         }
         if self.rain_steps != prev_rain_steps {
-            packets.push(GameEvent::rain_level(self.rain_level()).into());
+            events
+                .weather
+                .push(WeatherEvent::RainLevel(self.rain_level()));
         }
         if self.thunder_steps != prev_thunder_steps {
-            packets.push(GameEvent::thunder_level(self.thunder_level()).into());
+            events
+                .weather
+                .push(WeatherEvent::ThunderLevel(self.thunder_level()));
         }
-        packets
+        events
     }
 }
 
@@ -230,16 +243,17 @@ mod tests {
         let mut clock = WorldClock::with_rng(&mut rng);
         assert_eq!((clock.world_age(), clock.day_time()), (0, INITIAL_DAY_TIME));
         for tick in 1..TIME_SYNC_INTERVAL {
-            let packets = clock.tick_with_rng(&mut rng);
-            assert!(packets.is_empty(), "unexpected packet on tick {tick}");
+            let events = clock.tick_with_rng(&mut rng);
+            assert!(events.time_sync.is_none(), "unexpected sync on tick {tick}");
+            assert!(events.weather.is_empty());
         }
-        let packets = clock.tick_with_rng(&mut rng);
+        let events = clock.tick_with_rng(&mut rng);
         assert_eq!(
-            packets,
-            vec![Clientbound::from(TimeUpdate {
+            events.time_sync,
+            Some(TimeSnapshot {
                 world_age: 20,
-                time_of_day: INITIAL_DAY_TIME + 20,
-            })]
+                day_time: INITIAL_DAY_TIME + 20,
+            })
         );
     }
 
@@ -248,47 +262,47 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         let mut clock = WorldClock::with_rng(&mut rng);
 
-        // Start a thunderstorm for 120 ticks.
         let start = clock.set_weather(true, true, 120);
-        assert_eq!(start, vec![Clientbound::from(GameEvent::start_raining())]);
+        assert_eq!(start, vec![WeatherEvent::StartRaining]);
 
         for _ in 0..100 {
-            let packets = clock.tick_with_rng(&mut rng);
-            assert!(packets.iter().any(|p| matches!(
-                p,
-                Clientbound::GameEvent(e) if e.event == GameEvent::RAIN_LEVEL_CHANGE
-            )));
-            assert!(packets.iter().any(|p| matches!(
-                p,
-                Clientbound::GameEvent(e) if e.event == GameEvent::THUNDER_LEVEL_CHANGE
-            )));
+            let events = clock.tick_with_rng(&mut rng);
+            assert!(
+                events
+                    .weather
+                    .iter()
+                    .any(|e| matches!(e, WeatherEvent::RainLevel(_)))
+            );
+            assert!(
+                events
+                    .weather
+                    .iter()
+                    .any(|e| matches!(e, WeatherEvent::ThunderLevel(_)))
+            );
         }
         let snap = clock.weather();
         assert!(snap.raining && snap.thundering);
         assert_eq!(snap.rain_level, 1.0);
         assert_eq!(snap.thunder_level, 1.0);
 
-        // Initial packets for a joining player include time + active rain & thunder levels.
-        let initial = clock.initial_packets();
-        assert_eq!(initial.len(), 4);
-        assert!(matches!(initial[0], Clientbound::TimeUpdate(_)));
-        assert_eq!(initial[1], Clientbound::from(GameEvent::start_raining()));
-        assert_eq!(initial[2], Clientbound::from(GameEvent::rain_level(1.0)));
-        assert_eq!(initial[3], Clientbound::from(GameEvent::thunder_level(1.0)));
-
-        // Once settled at 1.0, ticks emit no redundant weather packets until countdown ends.
-        let steady = clock.tick_with_rng(&mut rng);
-        assert!(
-            steady
-                .iter()
-                .all(|p| !matches!(p, Clientbound::GameEvent(_)))
+        let (time, weather) = clock.initial_state();
+        assert_eq!(time.world_age, 100);
+        assert_eq!(
+            weather,
+            vec![
+                WeatherEvent::StartRaining,
+                WeatherEvent::RainLevel(1.0),
+                WeatherEvent::ThunderLevel(1.0),
+            ]
         );
 
-        // Finish countdown -> rain & thunder stop and fade back down to 0.0.
+        let steady = clock.tick_with_rng(&mut rng);
+        assert!(steady.weather.is_empty());
+
         let mut saw_stop = false;
         for _ in 0..150 {
-            let packets = clock.tick_with_rng(&mut rng);
-            if packets.contains(&Clientbound::from(GameEvent::stop_raining())) {
+            let events = clock.tick_with_rng(&mut rng);
+            if events.weather.contains(&WeatherEvent::StopRaining) {
                 saw_stop = true;
             }
         }

@@ -1,10 +1,10 @@
 use super::*;
-use crate::{players::Players, protocol::packets::play::ChunkData};
+use crate::{players::Players, protocol::packets::play::ChunkData, world};
 use uuid::Uuid;
 
 #[tokio::test]
 async fn mutation_during_chunk_write_is_reconciled_before_later_updates() {
-    let world = Arc::new(BlockWorld::default());
+    let world = Arc::new(World::new());
     let mut creative = CreativeSession::new(world.clone());
     let players = Players::new(1);
     let slot = players.reserve(Uuid::nil()).unwrap();
@@ -12,14 +12,16 @@ async fn mutation_during_chunk_write_is_reconciled_before_later_updates() {
     let pos = BlockPos([-1, 64, 0]);
     let mut batch = [Clientbound::from(ChunkData(chunk, world::chunk_payload()))];
     creative.prepare_chunks(&mut batch);
-    assert!(world.lock().set(pos, 1));
+    assert!(world.set_block(pos, 1).is_some());
     creative.chunk_sent(&slot, chunk).unwrap();
     {
-        let mut blocks = world.lock();
-        let old_light = world::chunk_light(&blocks.neighborhood(chunk));
-        assert!(blocks.set(pos, 0));
-        let new_light = world::chunk_light(&blocks.neighborhood(chunk));
-        let bodies = updates(chunk, vec![(pos, 0)], &old_light, new_light).unwrap();
+        let mutation = world.set_block(pos, 0).unwrap();
+        let center_light = mutation
+            .light_changes
+            .into_iter()
+            .find(|(c, _)| *c == chunk)
+            .map(|(_, l)| l);
+        let bodies = encode_chunk_updates(chunk, mutation.block_changes, center_light).unwrap();
         slot.publish_blocks(
             chunk,
             bodies,

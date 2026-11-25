@@ -313,6 +313,7 @@ mod tests {
             uuid,
             name: name.into(),
             id: id as i32,
+            game_mode: crate::config::GameMode::Spectator,
             pose: EntityPose::new([0.0; 3], 0.0, 0.0, false),
             info: Arc::from([]),
         });
@@ -367,6 +368,7 @@ mod tests {
             uuid: Uuid::from_u128(1),
             name: "Alice".into(),
             id: 1,
+            game_mode: crate::config::GameMode::Spectator,
             pose: EntityPose::new([8.5, 65.0, 8.5], 0.0, 0.0, false),
             info: Arc::from([]),
         });

@@ -49,6 +49,7 @@ pub(crate) type Snapshot = Option<Arc<Edits>>;
 #[derive(Debug, Default)]
 pub(crate) struct Blocks {
     chunks: HashMap<[i32; 2], Arc<Edits>>,
+    light_cache: HashMap<[i32; 2], Arc<[u8]>>,
     count: usize,
 }
 #[derive(Debug, Default)]
@@ -76,6 +77,38 @@ impl Blocks {
         std::array::from_fn(|dz| {
             std::array::from_fn(|dx| self.snapshot([cx + dx as i32 - 1, cz + dz as i32 - 1]))
         })
+    }
+
+    /// Return cached light for `chunk`, computing and caching it once if needed.
+    pub(crate) fn light_for(&mut self, chunk: [i32; 2], neighborhood: &Neighborhood) -> Arc<[u8]> {
+        if let Some(cached) = self.light_cache.get(&chunk) {
+            return cached.clone();
+        }
+        let computed = chunk_light(neighborhood);
+        if has_any_edits(neighborhood) {
+            self.light_cache.insert(chunk, computed.clone());
+        }
+        computed
+    }
+
+    /// Return currently cached light if present, otherwise compute without mutating.
+    pub(crate) fn cached_or_current_light(&self, chunk: [i32; 2]) -> Arc<[u8]> {
+        if let Some(cached) = self.light_cache.get(&chunk) {
+            return cached.clone();
+        }
+        chunk_light(&self.neighborhood(chunk))
+    }
+
+    /// Recompute light for `chunk` after edits and update or evict its cache entry.
+    pub(crate) fn recompute_light(&mut self, chunk: [i32; 2]) -> Arc<[u8]> {
+        let neighborhood = self.neighborhood(chunk);
+        let computed = chunk_light(&neighborhood);
+        if has_any_edits(&neighborhood) {
+            self.light_cache.insert(chunk, computed.clone());
+        } else {
+            self.light_cache.remove(&chunk);
+        }
+        computed
     }
     pub(crate) fn get(&self, pos: BlockPos) -> i32 {
         self.chunks
@@ -170,7 +203,10 @@ fn heights(edits: &Edits, qualifies: impl Fn(i32) -> bool) -> [u16; 256] {
     result
 }
 
-pub(crate) fn chunk_payload_with_light(neighborhood: &Neighborhood) -> Arc<[u8]> {
+pub(crate) fn chunk_payload_with_light(
+    neighborhood: &Neighborhood,
+    light: &Arc<[u8]>,
+) -> Arc<[u8]> {
     let mut out = Vec::with_capacity(45 * 1024);
     let sections = match neighborhood[1][1].as_deref() {
         Some(edits) => {
@@ -186,7 +222,7 @@ pub(crate) fn chunk_payload_with_light(neighborhood: &Neighborhood) -> Arc<[u8]>
     put_varint(sections.len() as i32, &mut out);
     out.extend(sections);
     put_varint(0, &mut out);
-    out.extend_from_slice(&chunk_light(neighborhood));
+    out.extend_from_slice(light);
     out.into()
 }
 
@@ -341,8 +377,12 @@ mod tests {
         for i in 0..20 {
             assert!(wide.set(BlockPos([i % 16, 64 + i / 16, 0]), i + 1));
         }
-        let wide_payload = chunk_payload_with_light(&wide.neighborhood([0, 0]));
+        let neighborhood = wide.neighborhood([0, 0]);
+        let light = wide.light_for([0, 0], &neighborhood);
+        let wide_payload = chunk_payload_with_light(&neighborhood, &light);
         assert!(!wide_payload.is_empty());
+        // Second light_for hits cache (identical Arc pointer).
+        assert!(Arc::ptr_eq(&light, &wide.light_for([0, 0], &neighborhood)));
     }
 
     #[test]

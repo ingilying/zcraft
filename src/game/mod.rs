@@ -3,6 +3,7 @@
 mod data;
 mod inventory;
 mod items;
+mod player;
 
 pub use data::{
     BlockDefinition, BlockStateDefinition, GameRegistry, ItemDefinition, ToolRule, block_by_name,
@@ -10,6 +11,7 @@ pub use data::{
 };
 pub use inventory::{ClickResult, Inventory, InventoryClick, SLOT_COUNT};
 pub use items::{Hand, ItemStack};
+pub use player::{PLAYER_EYE_HEIGHT, Player};
 
 pub const AIR_STATE: i32 = 0;
 pub const STONE_STATE: i32 = 1;
