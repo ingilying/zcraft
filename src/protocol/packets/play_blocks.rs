@@ -1,6 +1,6 @@
 //! Block interaction and inventory packets for Java 1.21.1 / protocol 767.
 use crate::{
-    game::{Inventory, InventoryClick, ItemStack, SLOT_COUNT, item_by_id},
+    game::{Inventory, InventoryClick, ItemStack, item_by_id},
     protocol::{Decode, Encode, Reader, invalid, put_varint},
     world::BlockPos,
 };
@@ -127,7 +127,7 @@ fn item_stack(r: &mut Reader<'_>) -> io::Result<IncomingStack> {
     Ok(ItemStack::with_damage(id, count as u8, damage)
         .map_or(IncomingStack::Unsupported, IncomingStack::Supported))
 }
-fn put_item_stack(stack: Option<ItemStack>, out: &mut Vec<u8>) {
+pub(crate) fn put_item_stack(stack: Option<ItemStack>, out: &mut Vec<u8>) {
     if let Some(stack) = stack {
         put_varint(i32::from(stack.count), out);
         put_varint(stack.item, out);
@@ -235,16 +235,102 @@ impl Encode for LightUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InventoryContent(pub Box<Inventory>);
+pub struct CloseWindow {
+    pub window_id: u8,
+}
+impl Decode for CloseWindow {
+    fn decode(r: &mut Reader<'_>) -> io::Result<Self> {
+        Ok(Self { window_id: r.u8()? })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockAction {
+    pub pos: BlockPos,
+    pub action_id: u8,
+    pub action_param: u8,
+    pub block_id: i32,
+}
+impl Encode for BlockAction {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        let [x, y, z] = self.pos.0;
+        let packed =
+            ((x as u64 & 0x3ff_ffff) << 38) | ((z as u64 & 0x3ff_ffff) << 12) | (y as u64 & 0xfff);
+        out.extend(packed.to_be_bytes());
+        out.push(self.action_id);
+        out.push(self.action_param);
+        put_varint(self.block_id, out);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseContainer(pub u8);
+impl Encode for CloseContainer {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        out.push(self.0);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenScreen {
+    pub window_id: i32,
+    pub menu_type: i32,
+    pub title: String,
+}
+impl Encode for OpenScreen {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        put_varint(self.window_id, out);
+        put_varint(self.menu_type, out);
+        // Anonymous NBT TAG_String (type 8) for plain text component.
+        out.push(8);
+        let bytes = self.title.as_bytes();
+        out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+        out.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryContent {
+    pub window_id: u8,
+    pub state_id: i32,
+    pub slots: Vec<Option<ItemStack>>,
+    pub carried: Option<ItemStack>,
+}
+impl InventoryContent {
+    pub fn player(inv: &Inventory) -> Self {
+        Self {
+            window_id: 0,
+            state_id: inv.state_id(),
+            slots: inv.slots().to_vec(),
+            carried: inv.carried(),
+        }
+    }
+    pub fn container(
+        window_id: u8,
+        state_id: i32,
+        slots: Vec<Option<ItemStack>>,
+        carried: Option<ItemStack>,
+    ) -> Self {
+        Self {
+            window_id,
+            state_id,
+            slots,
+            carried,
+        }
+    }
+}
 impl Encode for InventoryContent {
     fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
-        out.push(0);
-        put_varint(self.0.state_id(), out);
-        put_varint(SLOT_COUNT as i32, out);
-        for stack in self.0.slots() {
+        out.push(self.window_id);
+        put_varint(self.state_id, out);
+        put_varint(self.slots.len() as i32, out);
+        for stack in &self.slots {
             put_item_stack(*stack, out)
         }
-        put_item_stack(self.0.carried(), out);
+        put_item_stack(self.carried, out);
         Ok(())
     }
 }
@@ -294,13 +380,13 @@ mod tests {
     fn inventory_slots_are_bounded_typed_and_component_free() {
         let inventory = Inventory::default();
         let mut body = Vec::new();
-        InventoryContent(Box::new(inventory.clone()))
+        InventoryContent::player(&inventory)
             .encode(&mut body)
             .unwrap();
         let mut r = Reader::new(&body);
         assert_eq!(r.u8().unwrap(), 0);
         assert_eq!(r.varint().unwrap(), 0);
-        assert_eq!(r.varint().unwrap(), SLOT_COUNT as i32);
+        assert_eq!(r.varint().unwrap(), crate::game::SLOT_COUNT as i32);
         for (index, expected) in inventory.slots().iter().enumerate() {
             let decoded = item_stack(&mut r).unwrap().supported().unwrap();
             assert_eq!(decoded, *expected, "slot {index}");

@@ -313,3 +313,83 @@ fn pluggable_chunk_generator_produces_distinct_per_chunk_terrain() {
         zcraft::game::GLASS_STATE
     );
 }
+
+#[test]
+fn chest_block_entity_persists_in_anvil_and_clears_when_broken() {
+    let dir = tempfile::tempdir().unwrap();
+    let world_dir = dir.path().join("world");
+    let world = World::open(&world_dir, None).unwrap();
+
+    let chest_pos = BlockPos([4, 64, 4]);
+    let chest_state = zcraft::game::block_by_name("chest").unwrap().default_state;
+    assert!(world.set_block(chest_pos, chest_state).is_some());
+
+    let diamond = item_by_name("diamond").unwrap().id;
+    let pickaxe = item_by_name("iron_pickaxe").unwrap().id;
+    let stack_a = ItemStack::new(diamond, 16).unwrap();
+    let stack_b = ItemStack::with_damage(pickaxe, 1, 25).unwrap();
+
+    let updated = world
+        .update_chest(chest_pos, |slots| {
+            slots[0] = Some(stack_a);
+            slots[26] = Some(stack_b);
+            true
+        })
+        .unwrap();
+    assert_eq!(updated[0], Some(stack_a));
+    assert_eq!(updated[26], Some(stack_b));
+
+    let summary = world.save_all().unwrap();
+    assert_eq!(summary.chunks_saved, 1);
+
+    // Reopen from Anvil and verify chest BlockEntity contents survived.
+    let reopened = World::open(&world_dir, None).unwrap();
+    let items = reopened.chest_items(chest_pos).unwrap();
+    assert_eq!(items[0], Some(stack_a));
+    assert_eq!(items[26], Some(stack_b));
+
+    // Breaking the chest removes its BlockEntity.
+    assert!(
+        reopened
+            .set_block(chest_pos, zcraft::game::AIR_STATE)
+            .is_some()
+    );
+    assert!(reopened.chest_items(chest_pos).is_none());
+}
+
+#[tokio::test]
+async fn overworld_seed_and_edits_persist_via_anvil_level_dat() {
+    let dir = tempfile::tempdir().unwrap();
+    let world_dir = dir.path().join("overworld");
+    let config = Config {
+        world_dir: Some(world_dir.to_string_lossy().into_owned()),
+        world_type: zcraft::config::WorldType::Overworld,
+        seed: Some(2026),
+        ..Config::default()
+    };
+    let server = ServerContext::from_config(&config).await.unwrap();
+    let world = server.play.world();
+    assert_eq!(world.overworld_seed(), Some(2026));
+    assert_eq!(
+        world.block_at(BlockPos([0, -64, 0])),
+        zcraft::game::BEDROCK_STATE
+    );
+    assert!(world.spawn_position()[1] >= f64::from(zcraft::world::SEA_LEVEL));
+
+    let sample_pos = BlockPos([3, 120, 7]);
+    let edit_pos = BlockPos([5, 100, 5]);
+    let natural_state = world.block_at(sample_pos);
+    assert!(
+        world
+            .set_block(edit_pos, zcraft::game::GLASS_STATE)
+            .is_some()
+    );
+    world.save_all().unwrap();
+    drop(server);
+
+    // Reopen WITHOUT passing world_type or seed: level.dat must restore Overworld(2026).
+    let reopened = World::open(&world_dir, None).unwrap();
+    assert_eq!(reopened.overworld_seed(), Some(2026));
+    assert_eq!(reopened.block_at(sample_pos), natural_state);
+    assert_eq!(reopened.block_at(edit_pos), zcraft::game::GLASS_STATE);
+}

@@ -491,6 +491,37 @@ impl Reservation {
         }
     }
 
+    /// Broadcast an entity-scoped packet (animation, metadata, equipment) to
+    /// all other ready players currently watching this player's chunk.
+    pub(crate) fn broadcast_to_viewers(&self, packet: &Clientbound) -> io::Result<()> {
+        let body: Arc<[u8]> = packet.encode()?.into();
+        let mut registry = lock(&self.0.registry);
+        let chunk = match self
+            .0
+            .slot(&mut registry)
+            .filter(|slot| !slot.lagged)
+            .and_then(|slot| slot.visible.as_ref())
+        {
+            Some(peer) => pose_chunk(peer.pose),
+            None => return Ok(()),
+        };
+        let uuid = self.0.uuid;
+        let viewers: Vec<Uuid> = registry
+            .watchers
+            .at(chunk)
+            .filter(|&viewer| viewer != uuid)
+            .collect();
+        for viewer in viewers {
+            if let Some(slot) = registry.players.get_mut(&viewer)
+                && !slot.lagged
+                && !slot.enqueue(Delivery::Packet(body.clone()))
+            {
+                registry.deactivate(viewer);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_view(&self, center: [i32; 2], radius: i32) {
         let mut registry = lock(&self.0.registry);
         let Registry {

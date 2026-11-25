@@ -39,6 +39,8 @@ pub struct PlaySession {
     next_keep_alive: Instant,
     chunks: ChunkStream,
     blocks: blocks::CreativeSession,
+    open_container: Option<blocks::OpenContainer>,
+    next_window_id: u8,
 }
 
 pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
@@ -110,6 +112,8 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         next_keep_alive: now + KEEP_ALIVE_INTERVAL,
         chunks,
         blocks,
+        open_container: None,
+        next_window_id: 1,
     });
     let mut replies = vec![
         JoinGame {
@@ -131,7 +135,7 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
     ]);
     if game_mode == GameMode::Creative {
         replies.extend([
-            Clientbound::from(InventoryContent(Box::new(ctx.session.inventory.clone()))),
+            Clientbound::from(InventoryContent::player(&ctx.session.inventory)),
             SelectedSlot(ctx.session.inventory.selected()).into(),
         ]);
     }
@@ -450,8 +454,58 @@ pub async fn handle_information(
     Ok(Outcome::empty())
 }
 pub async fn handle_action(ctx: &mut Context<'_>, packet: EntityAction) -> io::Result<Outcome> {
-    if play(ctx.session)?.player.entity_id != packet.entity_id {
+    let state = play(ctx.session)?;
+    if state.player.entity_id != packet.entity_id {
         return Err(invalid("entity action refers to another player"));
+    }
+    let mut changed = false;
+    match packet.action {
+        0 if !state.player.sneaking => {
+            state.player.sneaking = true;
+            changed = true;
+        }
+        1 if state.player.sneaking => {
+            state.player.sneaking = false;
+            changed = true;
+        }
+        3 if !state.player.sprinting => {
+            state.player.sprinting = true;
+            changed = true;
+        }
+        4 if state.player.sprinting => {
+            state.player.sprinting = false;
+            changed = true;
+        }
+        _ => {}
+    }
+    let (entity_id, sneaking, sprinting) = (
+        state.player.entity_id,
+        state.player.sneaking,
+        state.player.sprinting,
+    );
+    if changed && let Some(slot) = &ctx.session.reservation {
+        let packet = Clientbound::from(crate::protocol::packets::play_entities::EntityMetadata {
+            id: entity_id,
+            sneaking,
+            sprinting,
+        });
+        slot.broadcast_to_viewers(&packet)?;
+    }
+    Ok(Outcome::empty())
+}
+
+pub async fn handle_arm_animation(
+    ctx: &mut Context<'_>,
+    packet: ArmAnimation,
+) -> io::Result<Outcome> {
+    let entity_id = play(ctx.session)?.player.entity_id;
+    let animation = if packet.hand == 0 { 0 } else { 3 };
+    if let Some(slot) = &ctx.session.reservation {
+        let out = Clientbound::from(crate::protocol::packets::play_entities::EntityAnimation {
+            id: entity_id,
+            animation,
+        });
+        slot.broadcast_to_viewers(&out)?;
     }
     Ok(Outcome::empty())
 }
@@ -495,6 +549,8 @@ mod tests {
                 next_keep_alive: now,
                 chunks: ChunkStream::new(2, now),
                 blocks: blocks::CreativeSession::new(Arc::default()),
+                open_container: None,
+                next_window_id: 1,
             }),
             ..Session::default()
         };

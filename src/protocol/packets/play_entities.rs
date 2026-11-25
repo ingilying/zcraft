@@ -1,5 +1,8 @@
 //! Player entity packets for Java 1.21.1 (protocol 767).
-use crate::protocol::{Encode, put_varint};
+use crate::{
+    game::ItemStack,
+    protocol::{Encode, packets::play_blocks::put_item_stack, put_varint},
+};
 use std::io;
 use uuid::Uuid;
 
@@ -135,6 +138,66 @@ impl Encode for EntityLook {
     }
 }
 
+/// Clientbound 0x03: Entity Animation (`0` = swing main arm, `3` = swing offhand).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityAnimation {
+    pub id: i32,
+    pub animation: u8,
+}
+
+impl Encode for EntityAnimation {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        put_varint(self.id, out);
+        out.push(self.animation);
+        Ok(())
+    }
+}
+
+/// Clientbound 0x58: Set Entity Metadata (flags + Pose for sneaking/sprinting).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityMetadata {
+    pub id: i32,
+    pub sneaking: bool,
+    pub sprinting: bool,
+}
+
+impl Encode for EntityMetadata {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        put_varint(self.id, out);
+        // Index 0: Entity shared flags (type 0 = Byte).
+        let flags = (u8::from(self.sneaking) << 1) | (u8::from(self.sprinting) << 3);
+        out.push(0);
+        put_varint(0, out);
+        out.push(flags);
+        // Index 6: Entity Pose (type 21 = Pose VarInt; 0 = STANDING, 5 = CROUCHING).
+        out.push(6);
+        put_varint(21, out);
+        put_varint(if self.sneaking { 5 } else { 0 }, out);
+        out.push(0xff); // Metadata terminator.
+        Ok(())
+    }
+}
+
+/// Clientbound 0x5b: Set Equipment (main hand slot 0 + offhand slot 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityEquipment {
+    pub id: i32,
+    pub main_hand: Option<ItemStack>,
+    pub off_hand: Option<ItemStack>,
+}
+
+impl Encode for EntityEquipment {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        put_varint(self.id, out);
+        // Top-bit-set-terminated array: bit 7 set on slot 0 (more follows), clear on slot 1.
+        out.push(0x80); // slot 0 (main hand) | 0x80
+        put_item_stack(self.main_hand, out);
+        out.push(0x01); // slot 1 (offhand)
+        put_item_stack(self.off_hand, out);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +242,37 @@ mod tests {
         let remove = encode(RemovePlayerInfo(vec![uuid]).into());
         assert_eq!(&remove[..2], &[0x3d, 1]);
         assert_eq!(&remove[2..], uuid.as_bytes());
+
+        // EntityAnimation (0x03), EntityMetadata (0x58), EntityEquipment (0x5b).
+        assert_eq!(
+            encode(
+                EntityAnimation {
+                    id: 5,
+                    animation: 0
+                }
+                .into()
+            ),
+            [0x03, 5, 0]
+        );
+        assert_eq!(
+            encode(
+                EntityMetadata {
+                    id: 5,
+                    sneaking: true,
+                    sprinting: true,
+                }
+                .into()
+            ),
+            [0x58, 5, 0, 0, 0x0a, 6, 21, 5, 0xff]
+        );
+        let eq = encode(
+            EntityEquipment {
+                id: 5,
+                main_hand: None,
+                off_hand: None,
+            }
+            .into(),
+        );
+        assert_eq!(eq, [0x5b, 5, 0x80, 0, 0x01, 0]);
     }
 }

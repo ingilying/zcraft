@@ -66,7 +66,7 @@ pub(crate) fn apply_control(
         PlayerControl::Give { item, count } => {
             session.inventory.give(item, count);
             Ok(Outcome {
-                replies: vec![InventoryContent(Box::new(session.inventory.clone())).into()],
+                replies: vec![InventoryContent::player(&session.inventory).into()],
                 close: false,
                 encryption: None,
             })
@@ -81,7 +81,7 @@ pub(crate) fn apply_control(
                 PlayerAbilities(mode).into(),
             ];
             if mode == GameMode::Creative {
-                replies.push(InventoryContent(Box::new(session.inventory.clone())).into());
+                replies.push(InventoryContent::player(&session.inventory).into());
                 replies.push(SelectedSlot(session.inventory.selected()).into());
             }
             Ok(Outcome {

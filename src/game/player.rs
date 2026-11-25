@@ -21,6 +21,8 @@ pub struct Player {
     pub yaw: f32,
     pub pitch: f32,
     pub on_ground: bool,
+    pub sneaking: bool,
+    pub sprinting: bool,
 }
 
 impl Player {
@@ -34,6 +36,8 @@ impl Player {
             yaw: 0.0,
             pitch: 0.0,
             on_ground: false,
+            sneaking: false,
+            sprinting: false,
         }
     }
 
