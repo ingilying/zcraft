@@ -65,9 +65,13 @@ pub struct GameRegistry {
 }
 impl GameRegistry {
     fn load() -> Self {
+        const COMPRESSED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/game_data.json.zlib"));
+        let mut decoder = flate2::read::ZlibDecoder::new(COMPRESSED);
+        let mut json = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut json)
+            .expect("compressed game data must be valid");
         let raw: RawGameData =
-            serde_json::from_slice(include_bytes!("../../assets/protocol/767/game_data.json"))
-                .expect("generated game data must be valid");
+            serde_json::from_slice(&json).expect("generated game data must be valid");
         assert_eq!(
             (raw.format, raw.minecraft.as_str(), raw.protocol),
             (1, "1.21.1", 767)

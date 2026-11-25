@@ -26,6 +26,7 @@ fn main() {
         "build_support/cache.rs",
         "build_support/tags.rs",
         "assets/protocol/767/static_registry_ids.json",
+        "assets/protocol/767/game_data.json",
     ] {
         println!("cargo:rerun-if-changed={file}");
     }
@@ -104,12 +105,25 @@ fn build() -> io::Result<()> {
             source
         }
     };
-    let out =
-        PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("missing OUT_DIR"))?)
-            .join("registries.rs");
+    let out_dir =
+        PathBuf::from(env::var_os("OUT_DIR").ok_or_else(|| io::Error::other("missing OUT_DIR"))?);
+    let out = out_dir.join("registries.rs");
     // Avoid rewriting unchanged output when only other tracked inputs changed.
     if fs::read(&out).ok().as_deref() != Some(source.as_bytes()) {
         cache::atomic_write(&out, source.as_bytes())?;
+    }
+    compress_game_data(&root, &out_dir)?;
+    Ok(())
+}
+
+fn compress_game_data(root: &Path, out_dir: &Path) -> io::Result<()> {
+    let raw = fs::read(root.join("assets/protocol/767/game_data.json"))?;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(&raw)?;
+    let compressed = encoder.finish()?;
+    let target = out_dir.join("game_data.json.zlib");
+    if fs::read(&target).ok().as_deref() != Some(compressed.as_slice()) {
+        cache::atomic_write(&target, &compressed)?;
     }
     Ok(())
 }
