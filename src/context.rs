@@ -101,6 +101,15 @@ impl<H: crate::command::CommandHost> crate::command::CommandHost for ServerComma
     ) -> std::io::Result<Vec<crate::command::arguments::EntitySnapshot>> {
         Ok(self.server.command_entities())
     }
+    fn world(&mut self) -> Option<&mut dyn crate::command::WorldCommandHost> {
+        Some(self)
+    }
+    fn admin(&mut self) -> Option<&mut dyn crate::command::AdminCommandHost> {
+        Some(self)
+    }
+}
+
+impl<H: crate::command::CommandHost> crate::command::WorldCommandHost for ServerCommandHost<'_, H> {
     fn world_time(&mut self) -> std::io::Result<(i64, i64)> {
         Ok(self.server.play.world_time())
     }
@@ -133,6 +142,9 @@ impl<H: crate::command::CommandHost> crate::command::CommandHost for ServerComma
             state,
         )
     }
+}
+
+impl<H: crate::command::CommandHost> crate::command::AdminCommandHost for ServerCommandHost<'_, H> {
     fn teleport_player(
         &mut self,
         uuid: uuid::Uuid,

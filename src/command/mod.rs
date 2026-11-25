@@ -76,8 +76,9 @@ impl CommandResult {
     }
 }
 
-/// Server capabilities used by builtins. Other callbacks may be pure commands.
-/// No Session, socket, packet or protocol state is exposed.
+/// Server capabilities used by core builtins. Domain-specific capabilities
+/// are exposed via narrow sub-traits (`WorldCommandHost`, `AdminCommandHost`)
+/// so new commands do not bloat the core trait or runtime forwarding layer.
 pub trait CommandHost {
     fn list_players(&mut self) -> io::Result<CommandResult>;
     fn action(&mut self, player: Uuid, text: &str) -> io::Result<CommandResult>;
@@ -99,78 +100,37 @@ pub trait CommandHost {
     fn execution(&mut self) -> Option<&mut dyn ExecutionControl> {
         None
     }
-    fn world_time(&mut self) -> io::Result<(i64, i64)> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "World clock is unavailable.",
-        ))
+    /// Optional world-manipulation capabilities (`/time`, `/weather`, `/setblock`, `/fill`).
+    fn world(&mut self) -> Option<&mut dyn WorldCommandHost> {
+        None
     }
-    fn set_time(&mut self, _day_time: i64) -> io::Result<i64> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "World clock is unavailable.",
-        ))
+    /// Optional player/server administration capabilities (`/tp`, `/give`, `/gamemode`, `/op`, `/kick`, `/stop`).
+    fn admin(&mut self) -> Option<&mut dyn AdminCommandHost> {
+        None
     }
-    fn set_weather(&mut self, _raining: bool, _thundering: bool, _duration: u32) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Weather control is unavailable.",
-        ))
-    }
-    fn set_block(&mut self, _pos: [i32; 3], _state: i32) -> io::Result<bool> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Block editing is unavailable.",
-        ))
-    }
-    fn fill_blocks(&mut self, _from: [i32; 3], _to: [i32; 3], _state: i32) -> io::Result<usize> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Block editing is unavailable.",
-        ))
-    }
+}
+
+pub trait WorldCommandHost {
+    fn world_time(&mut self) -> io::Result<(i64, i64)>;
+    fn set_time(&mut self, day_time: i64) -> io::Result<i64>;
+    fn set_weather(&mut self, raining: bool, thundering: bool, duration: u32) -> io::Result<()>;
+    fn set_block(&mut self, pos: [i32; 3], state: i32) -> io::Result<bool>;
+    fn fill_blocks(&mut self, from: [i32; 3], to: [i32; 3], state: i32) -> io::Result<usize>;
+}
+
+pub trait AdminCommandHost {
     fn teleport_player(
         &mut self,
-        _uuid: Uuid,
-        _position: [f64; 3],
-        _yaw: Option<f32>,
-        _pitch: Option<f32>,
-    ) -> io::Result<bool> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Player teleportation is unavailable.",
-        ))
-    }
-    fn give_item(&mut self, _uuid: Uuid, _item: i32, _count: u32) -> io::Result<bool> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Inventory modification is unavailable.",
-        ))
-    }
-    fn set_game_mode(&mut self, _uuid: Uuid, _mode: crate::config::GameMode) -> io::Result<bool> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Game mode switching is unavailable.",
-        ))
-    }
-    fn set_op(&mut self, _target: &str, _op: bool) -> io::Result<CommandResult> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Operator management is unavailable.",
-        ))
-    }
-    fn kick_player(&mut self, _uuid: Uuid, _reason: &str) -> io::Result<bool> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Player kicking is unavailable.",
-        ))
-    }
-    fn request_shutdown(&mut self) -> io::Result<bool> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Server shutdown is unavailable.",
-        ))
-    }
+        uuid: Uuid,
+        position: [f64; 3],
+        yaw: Option<f32>,
+        pitch: Option<f32>,
+    ) -> io::Result<bool>;
+    fn give_item(&mut self, uuid: Uuid, item: i32, count: u32) -> io::Result<bool>;
+    fn set_game_mode(&mut self, uuid: Uuid, mode: crate::config::GameMode) -> io::Result<bool>;
+    fn set_op(&mut self, target: &str, op: bool) -> io::Result<CommandResult>;
+    fn kick_player(&mut self, uuid: Uuid, reason: &str) -> io::Result<bool>;
+    fn request_shutdown(&mut self) -> io::Result<bool>;
 }
 
 /// Custom types can be used for server-only nodes, or provide a verified
