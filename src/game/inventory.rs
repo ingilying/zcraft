@@ -53,6 +53,14 @@ impl Default for Inventory {
     }
 }
 impl Inventory {
+    pub fn from_persisted(slots: [Option<ItemStack>; SLOT_COUNT], selected: u8) -> Self {
+        Self {
+            slots,
+            carried: None,
+            selected: selected.min(8),
+            state_id: 0,
+        }
+    }
     pub fn slots(&self) -> &[Option<ItemStack>; SLOT_COUNT] {
         &self.slots
     }

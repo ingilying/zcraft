@@ -2,12 +2,13 @@
 //! delivery to chunk subscribers and reconciliation of just-written snapshots.
 use super::*;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex, MutexGuard},
 };
 
 pub(crate) const MAX_EDITS: usize = 65_536;
 const MAX_CHUNK_EDITS: usize = 256;
+const PERSISTED_MAX_CHUNK_EDITS: usize = (HEIGHT as usize) * 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockPos(pub [i32; 3]);
@@ -34,7 +35,7 @@ impl BlockPos {
         next[axis] = next[axis].checked_add(offset)?;
         Some(Self(next))
     }
-    fn index(self) -> u32 {
+    pub(crate) fn index(self) -> u32 {
         let [x, y, z] = self.0;
         ((y - MIN_Y) * 256 + z.rem_euclid(16) * 16 + x.rem_euclid(16)) as u32
     }
@@ -46,30 +47,68 @@ impl BlockPos {
 
 pub(crate) type Edits = BTreeMap<u32, i32>;
 pub(crate) type Snapshot = Option<Arc<Edits>>;
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Blocks {
+    generator: Arc<FlatGenerator>,
     chunks: HashMap<[i32; 2], Arc<Edits>>,
     light_cache: HashMap<[i32; 2], Arc<[u8]>>,
+    dirty_chunks: HashSet<[i32; 2]>,
     count: usize,
+    max_edits: usize,
+    max_chunk_edits: usize,
+}
+impl Default for Blocks {
+    fn default() -> Self {
+        Self {
+            generator: Arc::new(FlatGenerator::default()),
+            chunks: HashMap::new(),
+            light_cache: HashMap::new(),
+            dirty_chunks: HashSet::new(),
+            count: 0,
+            max_edits: MAX_EDITS,
+            max_chunk_edits: MAX_CHUNK_EDITS,
+        }
+    }
 }
 #[derive(Debug, Default)]
 pub(crate) struct BlockWorld(Mutex<Blocks>);
 impl BlockWorld {
+    pub(crate) fn with_generator(
+        generator: Arc<FlatGenerator>,
+        initial_chunks: HashMap<[i32; 2], Edits>,
+        persisted: bool,
+    ) -> Self {
+        let mut count = 0usize;
+        let mut chunks = HashMap::with_capacity(initial_chunks.len());
+        for (coords, edits) in initial_chunks {
+            if !edits.is_empty() {
+                count += edits.len();
+                chunks.insert(coords, Arc::new(edits));
+            }
+        }
+        Self(Mutex::new(Blocks {
+            generator,
+            chunks,
+            light_cache: HashMap::new(),
+            dirty_chunks: HashSet::new(),
+            count,
+            max_edits: if persisted { usize::MAX } else { MAX_EDITS },
+            max_chunk_edits: if persisted {
+                PERSISTED_MAX_CHUNK_EDITS
+            } else {
+                MAX_CHUNK_EDITS
+            },
+        }))
+    }
     pub(crate) fn lock(&self) -> MutexGuard<'_, Blocks> {
         self.0.lock().expect("block world poisoned")
     }
 }
 
-pub(super) fn base(y: i32) -> i32 {
-    match y {
-        60 => crate::game::BEDROCK_STATE,
-        61 | 62 => crate::game::DIRT_STATE,
-        63 => crate::game::GRASS_BLOCK_STATE,
-        _ => crate::game::AIR_STATE,
-    }
-}
-
 impl Blocks {
+    pub(crate) fn generator(&self) -> &FlatGenerator {
+        &self.generator
+    }
     pub(crate) fn snapshot(&self, chunk: [i32; 2]) -> Snapshot {
         self.chunks.get(&chunk).cloned()
     }
@@ -79,12 +118,23 @@ impl Blocks {
         })
     }
 
+    pub(crate) fn drain_dirty(&mut self) -> Vec<([i32; 2], Option<Edits>)> {
+        self.dirty_chunks
+            .drain()
+            .map(|chunk| (chunk, self.chunks.get(&chunk).map(|e| (**e).clone())))
+            .collect()
+    }
+
+    pub(crate) fn mark_dirty(&mut self, chunks: impl IntoIterator<Item = [i32; 2]>) {
+        self.dirty_chunks.extend(chunks);
+    }
+
     /// Return cached light for `chunk`, computing and caching it once if needed.
     pub(crate) fn light_for(&mut self, chunk: [i32; 2], neighborhood: &Neighborhood) -> Arc<[u8]> {
         if let Some(cached) = self.light_cache.get(&chunk) {
             return cached.clone();
         }
-        let computed = chunk_light(neighborhood);
+        let computed = chunk_light(neighborhood, &self.generator);
         if has_any_edits(neighborhood) {
             self.light_cache.insert(chunk, computed.clone());
         }
@@ -96,13 +146,13 @@ impl Blocks {
         if let Some(cached) = self.light_cache.get(&chunk) {
             return cached.clone();
         }
-        chunk_light(&self.neighborhood(chunk))
+        chunk_light(&self.neighborhood(chunk), &self.generator)
     }
 
     /// Recompute light for `chunk` after edits and update or evict its cache entry.
     pub(crate) fn recompute_light(&mut self, chunk: [i32; 2]) -> Arc<[u8]> {
         let neighborhood = self.neighborhood(chunk);
-        let computed = chunk_light(&neighborhood);
+        let computed = chunk_light(&neighborhood, &self.generator);
         if has_any_edits(&neighborhood) {
             self.light_cache.insert(chunk, computed.clone());
         } else {
@@ -115,16 +165,17 @@ impl Blocks {
             .get(&pos.chunk())
             .and_then(|s| s.get(&pos.index()))
             .copied()
-            .unwrap_or_else(|| base(pos.0[1]))
+            .unwrap_or_else(|| self.generator.base_state(pos.0[1]))
     }
     // Caller validates bounds, allowed states, and the current block first.
     pub(crate) fn set(&mut self, pos: BlockPos, state: i32) -> bool {
         let chunk = pos.chunk();
         let index = pos.index();
-        if state == base(pos.0[1]) {
+        if state == self.generator.base_state(pos.0[1]) {
             if let Some(edits) = self.chunks.get_mut(&chunk) {
                 if Arc::make_mut(edits).remove(&index).is_some() {
                     self.count -= 1;
+                    self.dirty_chunks.insert(chunk);
                 }
                 if edits.is_empty() {
                     self.chunks.remove(&chunk);
@@ -137,31 +188,33 @@ impl Blocks {
             .get(&chunk)
             .is_some_and(|e| e.contains_key(&index));
         if is_new
-            && (self.count == MAX_EDITS
+            && (self.count == self.max_edits
                 || self
                     .chunks
                     .get(&chunk)
-                    .is_some_and(|e| e.len() == MAX_CHUNK_EDITS))
+                    .is_some_and(|e| e.len() == self.max_chunk_edits))
         {
             return false;
         }
         Arc::make_mut(self.chunks.entry(chunk).or_default()).insert(index, state);
         self.count += usize::from(is_new);
+        self.dirty_chunks.insert(chunk);
         true
     }
 }
 
-pub(super) fn state_at(edits: &Edits, index: u32) -> i32 {
+pub(super) fn state_at(edits: &Edits, index: u32, generator: &FlatGenerator) -> i32 {
     edits
         .get(&index)
         .copied()
-        .unwrap_or_else(|| base(MIN_Y + (index / 256) as i32))
+        .unwrap_or_else(|| generator.base_state(MIN_Y + (index / 256) as i32))
 }
 
 pub(crate) fn changed_blocks(
     chunk: [i32; 2],
     old: &Snapshot,
     new: &Snapshot,
+    generator: &FlatGenerator,
 ) -> Vec<(BlockPos, i32)> {
     if match (old, new) {
         (None, None) => true,
@@ -175,8 +228,8 @@ pub(crate) fn changed_blocks(
     let b = new.as_deref().unwrap_or(&empty);
     let mut changed = Vec::new();
     for i in a.keys().chain(b.keys().filter(|i| !a.contains_key(i))) {
-        let state = state_at(b, *i);
-        if state_at(a, *i) != state {
+        let state = state_at(b, *i, generator);
+        if state_at(a, *i, generator) != state {
             changed.push((BlockPos::from_index(chunk, *i), state));
         }
     }
@@ -184,13 +237,25 @@ pub(crate) fn changed_blocks(
 }
 
 // Heights are first air above the highest qualifying block, relative to min_y.
-fn heights(edits: &Edits, qualifies: impl Fn(i32) -> bool) -> [u16; 256] {
+fn heights(
+    edits: &Edits,
+    generator: &FlatGenerator,
+    qualifies: impl Fn(i32) -> bool,
+) -> [u16; 256] {
     let mut result = [0; 256];
-    for (col, height) in result.iter_mut().enumerate() {
-        for y in (60..=SURFACE_Y).rev() {
-            if qualifies(state_at(edits, ((y - MIN_Y) as u32) * 256 + col as u32)) {
-                *height = (y - MIN_Y + 1) as u16;
-                break;
+    let top_base = generator.surface_y();
+    if top_base >= MIN_Y {
+        let base_y = generator.config().base_y;
+        for (col, height) in result.iter_mut().enumerate() {
+            for y in (base_y..=top_base).rev() {
+                if qualifies(state_at(
+                    edits,
+                    ((y - MIN_Y) as u32) * 256 + col as u32,
+                    generator,
+                )) {
+                    *height = (y - MIN_Y + 1) as u16;
+                    break;
+                }
             }
         }
     }
@@ -206,17 +271,18 @@ fn heights(edits: &Edits, qualifies: impl Fn(i32) -> bool) -> [u16; 256] {
 pub(crate) fn chunk_payload_with_light(
     neighborhood: &Neighborhood,
     light: &Arc<[u8]>,
+    generator: &FlatGenerator,
 ) -> Arc<[u8]> {
     let mut out = Vec::with_capacity(45 * 1024);
     let sections = match neighborhood[1][1].as_deref() {
         Some(edits) => {
-            let top = heights(edits, |s| s != 0);
+            let top = heights(edits, generator, |s| s != 0);
             put_heightmaps_with(&mut out, &top);
-            edited_sections(edits)
+            edited_sections(edits, generator)
         }
         None => {
-            put_heightmaps(&mut out);
-            section_data()
+            put_heightmaps_with(&mut out, generator.heightmap());
+            generator.section_data().to_vec()
         }
     };
     put_varint(sections.len() as i32, &mut out);
@@ -226,21 +292,22 @@ pub(crate) fn chunk_payload_with_light(
     out.into()
 }
 
-fn edited_sections(edits: &Edits) -> Vec<u8> {
+fn edited_sections(edits: &Edits, generator: &FlatGenerator) -> Vec<u8> {
+    let biome_id = generator.biome_id();
     let mut sections = Vec::new();
     for section in 0..SECTION_COUNT {
         let offset = (section * 4096) as u32;
         let mut section_edits = edits.range(offset..offset + 4096).peekable();
-        if section != GROUND_SECTION && section_edits.peek().is_none() {
+        if !generator.has_blocks_in_section(section) && section_edits.peek().is_none() {
             sections.extend([0, 0]);
             put_single_palette(0, &mut sections);
-            put_single_palette(PLAINS_BIOME_ID, &mut sections);
+            put_single_palette(biome_id, &mut sections);
             continue;
         }
         let mut states = [0i32; 4096];
-        if section == GROUND_SECTION {
+        if generator.has_blocks_in_section(section) {
             for (y, layer) in states.as_chunks_mut::<256>().0.iter_mut().enumerate() {
-                layer.fill(base(MIN_Y + (section * 16 + y) as i32));
+                layer.fill(generator.base_state(MIN_Y + (section * 16 + y) as i32));
             }
         }
         for (&i, &state) in section_edits {
@@ -270,22 +337,9 @@ fn edited_sections(edits: &Edits) -> Vec<u8> {
             sections.push(15);
             pack_entries(&direct, 15, &mut sections);
         }
-        put_single_palette(PLAINS_BIOME_ID, &mut sections);
+        put_single_palette(biome_id, &mut sections);
     }
     sections
-}
-
-fn pack_entries(entries: &[u64; 4096], bits: u8, out: &mut Vec<u8>) {
-    let per_long = 64 / usize::from(bits);
-    let longs = entries.len().div_ceil(per_long);
-    put_varint(longs as i32, out);
-    for chunk in entries.chunks(per_long) {
-        let mut value = 0u64;
-        for (i, &entry) in chunk.iter().enumerate() {
-            value |= entry << (i * usize::from(bits));
-        }
-        out.extend(value.to_be_bytes());
-    }
 }
 
 #[cfg(test)]
@@ -294,18 +348,25 @@ mod tests {
     #[test]
     fn sparse_cap_restore_and_snapshot_reconciliation() {
         let mut world = Blocks::default();
+        let generator = FlatGenerator::default();
         let pos = BlockPos([-1, 64, 0]);
         assert_eq!(pos.chunk(), [-1, 0]);
         assert!(world.set(pos, 519));
         let old = world.snapshot(pos.chunk());
-        assert_eq!(heights(old.as_deref().unwrap(), |s| s != 0)[15], 129);
         assert_eq!(
-            heights(old.as_deref().unwrap(), |s| s != 0 && s != 519)[15],
+            heights(old.as_deref().unwrap(), &generator, |s| s != 0)[15],
+            129
+        );
+        assert_eq!(
+            heights(old.as_deref().unwrap(), &generator, |s| s != 0 && s != 519)[15],
             128
         );
         assert!(world.set(pos, 0));
         assert!(world.chunks.is_empty());
-        assert_eq!(changed_blocks(pos.chunk(), &old, &None), vec![(pos, 0)]);
+        assert_eq!(
+            changed_blocks(pos.chunk(), &old, &None, &generator),
+            vec![(pos, 0)]
+        );
         for i in 0..MAX_CHUNK_EDITS as u32 {
             assert!(world.set(BlockPos::from_index([0, 0], i), 1));
         }
@@ -365,7 +426,8 @@ mod tests {
         // Carve a sideways alcove at (9, 61, 8) under intact grass/dirt.
         assert!(world.set(BlockPos([9, 61, 8]), 0));
 
-        let payload = chunk_light(&world.neighborhood([0, 0]));
+        let generator = FlatGenerator::default();
+        let payload = chunk_light(&world.neighborhood([0, 0]), &generator);
         let (sky_mask, sky_arrays, block_mask, _) = decode_light(&payload);
         assert_eq!(block_mask, 0);
         assert_eq!(light_at(sky_mask, &sky_arrays, 8, 60, 8), 15);
@@ -379,7 +441,7 @@ mod tests {
         }
         let neighborhood = wide.neighborhood([0, 0]);
         let light = wide.light_for([0, 0], &neighborhood);
-        let wide_payload = chunk_payload_with_light(&neighborhood, &light);
+        let wide_payload = chunk_payload_with_light(&neighborhood, &light, &generator);
         assert!(!wide_payload.is_empty());
         // Second light_for hits cache (identical Arc pointer).
         assert!(Arc::ptr_eq(&light, &wide.light_for([0, 0], &neighborhood)));
@@ -388,6 +450,7 @@ mod tests {
     #[test]
     fn block_light_emits_attenuates_and_crosses_chunk_borders() {
         let mut world = Blocks::default();
+        let generator = FlatGenerator::default();
         let glowstone = crate::game::block_by_name("glowstone")
             .unwrap()
             .default_state;
@@ -403,7 +466,7 @@ mod tests {
         // Place torch (level 14) at (2, 64, 2).
         assert!(world.set(BlockPos([2, 64, 2]), torch));
 
-        let c0 = chunk_light(&world.neighborhood([0, 0]));
+        let c0 = chunk_light(&world.neighborhood([0, 0]), &generator);
         let (_, _, b0_mask, b0_arr) = decode_light(&c0);
         assert_eq!(light_at(b0_mask, &b0_arr, 15, 64, 8), 15);
         assert_eq!(light_at(b0_mask, &b0_arr, 14, 64, 8), 0); // tinted_glass blocks light
@@ -412,7 +475,7 @@ mod tests {
         assert_eq!(light_at(b0_mask, &b0_arr, 3, 64, 2), 13);
 
         // Neighboring chunk [1, 0] receives cross-border block light at local x=0 (world x=16).
-        let c1 = chunk_light(&world.neighborhood([1, 0]));
+        let c1 = chunk_light(&world.neighborhood([1, 0]), &generator);
         let (_, _, b1_mask, b1_arr) = decode_light(&c1);
         assert_eq!(light_at(b1_mask, &b1_arr, 0, 64, 8), 14);
         assert_eq!(light_at(b1_mask, &b1_arr, 1, 64, 8), 13);

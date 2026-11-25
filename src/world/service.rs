@@ -1,15 +1,18 @@
-//! Unified world domain service: terrain template, sparse block edits,
-//! cached per-chunk lighting, and 20 TPS clock/weather cycle.
+//! Unified world domain service: Superflat generator, sparse block edits,
+//! cached per-chunk lighting, 20 TPS clock/weather cycle, and Anvil persistence.
 use super::{
-    BlockPos, BlockWorld, Snapshot, TickEvents, TimeSnapshot, WeatherEvent, WeatherSnapshot,
-    WorldClock, affected_light_chunks, changed_blocks, chunk_payload, chunk_payload_with_light,
-    has_any_edits,
+    AnvilStorage, BlockPos, BlockWorld, FlatGenerator, FlatGeneratorConfig, SavedPlayer, Snapshot,
+    TickEvents, TimeSnapshot, WeatherEvent, WeatherSnapshot, WorldClock, affected_light_chunks,
+    changed_blocks, chunk_payload_with_light, has_any_edits,
 };
+use crate::game::{Inventory, Player};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     io,
+    path::Path,
     sync::{Arc, Mutex},
 };
+use uuid::Uuid;
 
 /// Result of a world block mutation, computed under a single world lock and
 /// returned without holding any lock so callers can encode and fan out safely.
@@ -17,6 +20,13 @@ use std::{
 pub struct WorldMutation {
     pub block_changes: Vec<(BlockPos, i32)>,
     pub light_changes: Vec<([i32; 2], Arc<[u8]>)>,
+}
+
+/// Summary of a world persistence flush (`save_all`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SaveSummary {
+    pub persisted: bool,
+    pub chunks_saved: usize,
 }
 
 /// Prepared chunk data plus snapshot metadata needed to reconcile concurrent
@@ -30,9 +40,12 @@ pub(crate) struct PreparedChunk {
 
 #[derive(Debug)]
 pub struct World {
-    terrain: Arc<[u8]>,
+    generator: Arc<FlatGenerator>,
+    storage: Option<AnvilStorage>,
     blocks: Arc<BlockWorld>,
     clock: Mutex<WorldClock>,
+    save_lock: Mutex<()>,
+    spawn: [f64; 3],
 }
 
 impl Default for World {
@@ -43,19 +56,138 @@ impl Default for World {
 
 impl World {
     pub fn new() -> Self {
+        Self::with_generator(FlatGenerator::default())
+    }
+
+    pub fn with_generator(generator: FlatGenerator) -> Self {
+        let spawn = generator.spawn_position();
+        let generator = Arc::new(generator);
+        let blocks = Arc::new(BlockWorld::with_generator(
+            generator.clone(),
+            HashMap::new(),
+            false,
+        ));
         Self {
-            terrain: chunk_payload(),
-            blocks: Arc::default(),
+            generator,
+            storage: None,
+            blocks,
             clock: Mutex::new(WorldClock::new()),
+            save_lock: Mutex::new(()),
+            spawn,
         }
     }
 
+    /// Open (or initialize) a persisted Anvil world directory.
+    /// Existing `level.dat` generator settings take precedence over `flat_config`.
+    pub fn open(
+        dir: impl AsRef<Path>,
+        flat_config: Option<FlatGeneratorConfig>,
+    ) -> io::Result<Self> {
+        let storage = AnvilStorage::new(dir.as_ref());
+        let loaded = storage.load_level()?;
+
+        let effective_flat = loaded
+            .as_ref()
+            .and_then(|l| l.flat.clone())
+            .or(flat_config)
+            .unwrap_or_default();
+        let generator = Arc::new(FlatGenerator::from_config(effective_flat)?);
+        let spawn = loaded
+            .as_ref()
+            .and_then(|l| l.spawn)
+            .unwrap_or_else(|| generator.spawn_position());
+        let clock = loaded
+            .as_ref()
+            .map_or_else(WorldClock::new, |l| WorldClock::from_persisted(l.clock));
+
+        let initial_chunks = storage.load_all_chunks(&generator)?;
+        if loaded.is_none() {
+            storage.save_level(clock.persisted_state(), &generator, spawn)?;
+        }
+
+        let blocks = Arc::new(BlockWorld::with_generator(
+            generator.clone(),
+            initial_chunks,
+            true,
+        ));
+        Ok(Self {
+            generator,
+            storage: Some(storage),
+            blocks,
+            clock: Mutex::new(clock),
+            save_lock: Mutex::new(()),
+            spawn,
+        })
+    }
+
+    pub fn generator(&self) -> &Arc<FlatGenerator> {
+        &self.generator
+    }
+
     pub fn terrain(&self) -> &Arc<[u8]> {
-        &self.terrain
+        self.generator.terrain_payload()
+    }
+
+    pub fn spawn_position(&self) -> [f64; 3] {
+        self.spawn
+    }
+
+    pub fn has_storage(&self) -> bool {
+        self.storage.is_some()
     }
 
     pub fn block_at(&self, pos: BlockPos) -> i32 {
         self.blocks.lock().get(pos)
+    }
+
+    /// Persist `level.dat` and all dirty chunks to Anvil `region/*.mca`.
+    /// Serialized across concurrent callers so an older snapshot can never
+    /// overwrite a newer one, and restores dirty markers on any I/O failure.
+    pub fn save_all(&self) -> io::Result<SaveSummary> {
+        let Some(storage) = &self.storage else {
+            return Ok(SaveSummary {
+                persisted: false,
+                chunks_saved: 0,
+            });
+        };
+        let _save_guard = self.save_lock.lock().expect("world save lock poisoned");
+        let clock_state = self
+            .clock
+            .lock()
+            .expect("world clock poisoned")
+            .persisted_state();
+        let dirty = self.blocks.lock().drain_dirty();
+        let dirty_coords: Vec<[i32; 2]> = dirty.iter().map(|(c, _)| *c).collect();
+
+        let write_result = (|| -> io::Result<usize> {
+            storage.save_level(clock_state, &self.generator, self.spawn)?;
+            storage.save_chunks(&dirty, &self.generator)
+        })();
+
+        match write_result {
+            Ok(chunks_saved) => Ok(SaveSummary {
+                persisted: true,
+                chunks_saved,
+            }),
+            Err(error) => {
+                self.blocks.lock().mark_dirty(dirty_coords);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn load_player(&self, uuid: Uuid) -> io::Result<Option<SavedPlayer>> {
+        match &self.storage {
+            Some(storage) => storage.load_player(uuid),
+            None => Ok(None),
+        }
+    }
+
+    pub fn save_player(&self, player: &Player, inventory: &Inventory) -> io::Result<()> {
+        match &self.storage {
+            Some(storage) => storage.save_player(player, inventory),
+            None => Ok(()),
+        }
     }
 
     /// Prepare a chunk payload and light snapshot using the per-chunk light cache.
@@ -63,8 +195,8 @@ impl World {
         let mut blocks = self.blocks.lock();
         let neighborhood = blocks.neighborhood(chunk);
         let light = blocks.light_for(chunk, &neighborhood);
-        let payload =
-            has_any_edits(&neighborhood).then(|| chunk_payload_with_light(&neighborhood, &light));
+        let payload = has_any_edits(&neighborhood)
+            .then(|| chunk_payload_with_light(&neighborhood, &light, blocks.generator()));
         PreparedChunk {
             snapshot: neighborhood[1][1].clone(),
             light,
@@ -84,7 +216,7 @@ impl World {
     ) -> io::Result<R> {
         let mut blocks = self.blocks.lock();
         let neighborhood = blocks.neighborhood(chunk);
-        let changes = changed_blocks(chunk, old_snapshot, &neighborhood[1][1]);
+        let changes = changed_blocks(chunk, old_snapshot, &neighborhood[1][1], blocks.generator());
         let new_light = blocks.light_for(chunk, &neighborhood);
         let light_update = (new_light != *old_light).then_some(new_light);
         on_reconciled(changes, light_update)

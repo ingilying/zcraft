@@ -1,9 +1,9 @@
 //! Vanilla-aligned sky light and block light propagation over a 3x3 chunk
 //! neighborhood (Java 1.21.1 / protocol 767).
 use super::{
-    ALL_LIGHT_SECTIONS, DARK_SKY_SECTIONS, HEIGHT, LIGHT_BYTES, LIGHT_SECTION_COUNT,
-    LIT_SKY_SECTIONS, MIN_Y, SURFACE_Y,
-    edits::{Edits, Snapshot, base, state_at},
+    ALL_LIGHT_SECTIONS, HEIGHT, LIGHT_BYTES, LIGHT_SECTION_COUNT, MIN_Y,
+    edits::{Edits, Snapshot, state_at},
+    generator::FlatGenerator,
     put_bitset, put_varint,
 };
 use std::{collections::VecDeque, sync::Arc};
@@ -31,34 +31,18 @@ fn allows_direct_skylight(state: i32) -> bool {
     skylight && atten == 0
 }
 
-fn flat_light_payload() -> Arc<[u8]> {
-    let mut out =
-        Vec::with_capacity(LIT_SKY_SECTIONS.count_ones() as usize * (LIGHT_BYTES + 2) + 32);
-    put_bitset(LIT_SKY_SECTIONS, &mut out);
-    put_bitset(0, &mut out);
-    put_bitset(DARK_SKY_SECTIONS, &mut out);
-    put_bitset(ALL_LIGHT_SECTIONS, &mut out);
-    put_varint(LIT_SKY_SECTIONS.count_ones() as i32, &mut out);
-    for _ in 0..LIT_SKY_SECTIONS.count_ones() {
-        put_varint(LIGHT_BYTES as i32, &mut out);
-        out.resize(out.len() + LIGHT_BYTES, 0xff);
-    }
-    put_varint(0, &mut out);
-    out.into()
-}
-
 pub(crate) fn has_any_edits(neighborhood: &Neighborhood) -> bool {
     neighborhood.iter().flatten().any(Option::is_some)
 }
 
 /// Compute protocol 767 sky-light and block-light payload for the center chunk
 /// of `neighborhood`, propagating across chunk borders up to 14 blocks.
-pub(crate) fn chunk_light(neighborhood: &Neighborhood) -> Arc<[u8]> {
+pub(crate) fn chunk_light(neighborhood: &Neighborhood, generator: &FlatGenerator) -> Arc<[u8]> {
     if !has_any_edits(neighborhood) {
-        return flat_light_payload();
+        return generator.light_payload().clone();
     }
 
-    let mut sky_top = [128u16; LAYER];
+    let mut sky_top = [generator.sky_top(); LAYER];
     let mut min_edit_y = usize::MAX;
     let mut max_edit_y = 0usize;
 
@@ -73,7 +57,7 @@ pub(crate) fn chunk_light(neighborhood: &Neighborhood) -> Arc<[u8]> {
             if let Some(&last) = edits.keys().next_back() {
                 max_edit_y = max_edit_y.max((last / 256) as usize);
             }
-            let chunk_top = chunk_sky_heights(edits);
+            let chunk_top = chunk_sky_heights(edits, generator);
             for lz in 0..16 {
                 let gz = dz * 16 + lz;
                 for lx in 0..16 {
@@ -100,7 +84,7 @@ pub(crate) fn chunk_light(neighborhood: &Neighborhood) -> Arc<[u8]> {
 
     for dy in 0..band_height {
         let y_rel = band_start + dy;
-        let default_state = base(MIN_Y + y_rel as i32);
+        let default_state = generator.base_state(MIN_Y + y_rel as i32);
         let (default_skylight, default_emission, default_atten) = light_props(default_state);
         let _ = default_skylight;
         let layer_base = dy * LAYER;
@@ -115,7 +99,8 @@ pub(crate) fn chunk_light(neighborhood: &Neighborhood) -> Arc<[u8]> {
                         let idx = row_offset + lx;
                         let (emission, opacity) = match edits {
                             Some(edits) => {
-                                let state = state_at(edits, (y_rel * 256 + lz * 16 + lx) as u32);
+                                let state =
+                                    state_at(edits, (y_rel * 256 + lz * 16 + lx) as u32, generator);
                                 let (_, e, a) = light_props(state);
                                 (e, a)
                             }
@@ -218,13 +203,21 @@ fn propagate(light: &mut [u8], atten: &[u8], buckets: &mut [Vec<usize>; 16], ban
     }
 }
 
-fn chunk_sky_heights(edits: &Edits) -> [u16; 256] {
+fn chunk_sky_heights(edits: &Edits, generator: &FlatGenerator) -> [u16; 256] {
     let mut result = [0u16; 256];
-    for (col, height) in result.iter_mut().enumerate() {
-        for y in (60..=SURFACE_Y).rev() {
-            if !allows_direct_skylight(state_at(edits, ((y - MIN_Y) as u32) * 256 + col as u32)) {
-                *height = (y - MIN_Y + 1) as u16;
-                break;
+    let top_base = generator.surface_y();
+    if top_base >= MIN_Y {
+        let base_y = generator.config().base_y;
+        for (col, height) in result.iter_mut().enumerate() {
+            for y in (base_y..=top_base).rev() {
+                if !allows_direct_skylight(state_at(
+                    edits,
+                    ((y - MIN_Y) as u32) * 256 + col as u32,
+                    generator,
+                )) {
+                    *height = (y - MIN_Y + 1) as u16;
+                    break;
+                }
             }
         }
     }

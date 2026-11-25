@@ -48,6 +48,16 @@ pub struct TickEvents {
     pub weather: Vec<WeatherEvent>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistedClock {
+    pub world_age: i64,
+    pub day_time: i64,
+    pub raining: bool,
+    pub rain_time: u32,
+    pub thundering: bool,
+    pub thunder_time: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorldClock {
     world_age: i64,
@@ -82,6 +92,34 @@ impl WorldClock {
             thunder_time: rng.gen_range(CLEAR_THUNDER_MIN..=CLEAR_THUNDER_MAX),
             rain_steps: 0,
             thunder_steps: 0,
+        }
+    }
+
+    pub fn from_persisted(state: PersistedClock) -> Self {
+        Self {
+            world_age: state.world_age.max(0),
+            day_time: state.day_time.max(0),
+            raining: state.raining,
+            rain_time: state.rain_time.max(1),
+            thundering: state.raining && state.thundering,
+            thunder_time: state.thunder_time.max(1),
+            rain_steps: if state.raining { MAX_WEATHER_STEPS } else { 0 },
+            thunder_steps: if state.raining && state.thundering {
+                MAX_WEATHER_STEPS
+            } else {
+                0
+            },
+        }
+    }
+
+    pub fn persisted_state(&self) -> PersistedClock {
+        PersistedClock {
+            world_age: self.world_age,
+            day_time: self.day_time,
+            raining: self.raining,
+            rain_time: self.rain_time,
+            thundering: self.thundering,
+            thunder_time: self.thunder_time,
         }
     }
 

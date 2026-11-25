@@ -18,18 +18,23 @@
 //!   Light bits cover the dimension's sections plus one boundary at each end;
 //!   arrays follow set bits in ascending order, with 2048 bytes per nibble array.
 
+mod anvil;
 mod clock;
 mod edits;
+mod generator;
 mod light;
+mod nbt;
 mod service;
+pub use anvil::{AnvilStorage, SavedPlayer};
 pub use clock::{
-    DAY_LENGTH, INITIAL_DAY_TIME, TICK_INTERVAL, TICKS_PER_SECOND, TIME_SYNC_INTERVAL, TickEvents,
-    TimeSnapshot, WeatherEvent, WeatherSnapshot, WorldClock,
+    DAY_LENGTH, INITIAL_DAY_TIME, PersistedClock, TICK_INTERVAL, TICKS_PER_SECOND,
+    TIME_SYNC_INTERVAL, TickEvents, TimeSnapshot, WeatherEvent, WeatherSnapshot, WorldClock,
 };
 pub use edits::BlockPos;
 pub(crate) use edits::{BlockWorld, Snapshot, changed_blocks, chunk_payload_with_light};
+pub use generator::{FlatGenerator, FlatGeneratorConfig, FlatLayerConfig};
 pub(crate) use light::{Neighborhood, affected_light_chunks, chunk_light, has_any_edits};
-pub use service::{World, WorldMutation};
+pub use service::{SaveSummary, World, WorldMutation};
 
 use std::io;
 
@@ -87,6 +92,7 @@ pub fn chunk_data(x: i32, z: i32) -> io::Result<Vec<u8>> {
 }
 
 // All coordinates share exactly one immutable terrain/light payload.
+#[cfg(test)]
 pub(crate) fn chunk_payload() -> std::sync::Arc<[u8]> {
     let mut out = Vec::with_capacity(40 * 1024);
     put_chunk_payload(&mut out);
@@ -201,6 +207,19 @@ fn put_varint(value: i32, out: &mut Vec<u8>) {
         if value == 0 {
             break;
         }
+    }
+}
+
+pub(super) fn pack_entries(entries: &[u64; 4096], bits: u8, out: &mut Vec<u8>) {
+    let per_long = 64 / usize::from(bits);
+    let longs = entries.len().div_ceil(per_long);
+    put_varint(longs as i32, out);
+    for chunk in entries.chunks(per_long) {
+        let mut value = 0u64;
+        for (i, &entry) in chunk.iter().enumerate() {
+            value |= entry << (i * usize::from(bits));
+        }
+        out.extend(value.to_be_bytes());
     }
 }
 

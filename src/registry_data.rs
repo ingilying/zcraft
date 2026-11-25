@@ -23,6 +23,116 @@ pub fn tags_packet() -> Vec<u8> {
     generated::TAGS_PACKET.to_vec()
 }
 
+/// Resolve a vanilla 1.21.1 biome identifier (with or without `minecraft:`)
+/// to its dynamic wire registry ID sent in `minecraft:worldgen/biome`.
+pub fn biome_id(name: &str) -> Option<i32> {
+    static BIOMES: std::sync::LazyLock<std::collections::HashMap<String, i32>> =
+        std::sync::LazyLock::new(parse_biome_ids);
+    if name.contains(':') {
+        BIOMES.get(name).copied()
+    } else {
+        BIOMES.get(&format!("minecraft:{name}")).copied()
+    }
+}
+
+fn parse_biome_ids() -> std::collections::HashMap<String, i32> {
+    let mut map = std::collections::HashMap::new();
+    for packet in generated::REGISTRY_PACKETS {
+        let mut cursor = RegistryCursor(packet);
+        let reg_name = cursor.string();
+        if reg_name != "minecraft:worldgen/biome" {
+            continue;
+        }
+        let count = cursor.varint();
+        for id in 0..count {
+            let key = cursor.string();
+            map.insert(key, id as i32);
+            if cursor.byte() != 0 {
+                let tag = cursor.byte();
+                debug_assert_eq!(tag, 10);
+                cursor.skip_nbt(10);
+            }
+        }
+        break;
+    }
+    map
+}
+
+struct RegistryCursor<'a>(&'a [u8]);
+impl<'a> RegistryCursor<'a> {
+    fn take(&mut self, len: usize) -> &'a [u8] {
+        let (head, tail) = self.0.split_at(len);
+        self.0 = tail;
+        head
+    }
+    fn byte(&mut self) -> u8 {
+        self.take(1)[0]
+    }
+    fn i32(&mut self) -> usize {
+        i32::from_be_bytes(self.take(4).try_into().unwrap()) as usize
+    }
+    fn varint(&mut self) -> usize {
+        let mut value = 0;
+        for shift in (0..35).step_by(7) {
+            let byte = self.byte();
+            value |= usize::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+        }
+        panic!("invalid VarInt in generated registry packet")
+    }
+    fn string(&mut self) -> String {
+        let len = self.varint();
+        String::from_utf8(self.take(len).to_vec()).expect("valid UTF-8 registry key")
+    }
+    fn skip_nbt_string(&mut self) {
+        let len = u16::from_be_bytes(self.take(2).try_into().unwrap()) as usize;
+        self.take(len);
+    }
+    fn skip_nbt(&mut self, id: u8) {
+        match id {
+            1 => {
+                self.take(1);
+            }
+            2 => {
+                self.take(2);
+            }
+            3 | 5 => {
+                self.take(4);
+            }
+            4 | 6 => {
+                self.take(8);
+            }
+            7 => {
+                let len = self.i32();
+                self.take(len);
+            }
+            8 => self.skip_nbt_string(),
+            9 => {
+                let kind = self.byte();
+                let len = self.i32();
+                for _ in 0..len {
+                    self.skip_nbt(kind);
+                }
+            }
+            10 => loop {
+                let kind = self.byte();
+                if kind == 0 {
+                    break;
+                }
+                self.skip_nbt_string();
+                self.skip_nbt(kind);
+            },
+            11 | 12 => {
+                let len = self.i32();
+                self.take(len * if id == 11 { 4 } else { 8 });
+            }
+            _ => panic!("invalid NBT tag {id} in generated registry packet"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
