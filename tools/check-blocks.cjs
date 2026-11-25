@@ -102,44 +102,44 @@ async function run () {
   assert.equal(skylight({ ...target, y: 65 }), 15)
   assert.equal(skylight({ ...target, x: 11 }), 15)
 
-  // A block item is not a tool. Wooden pickaxe meets stone's requirement.
-  cursorA = a.events.length
-  dig(a, target, 2)
-  await change(a, target, stone, cursorA)
-  await ack(a, 2)
-  slot(a, 3)
+  // Creative mode breaks any non-air block immediately regardless of held item.
   cursorB = b.events.length
-  dig(a, target, 3)
-  await ack(a, 3)
+  dig(a, target, 2)
+  await ack(a, 2)
   await change(b, target, 0, cursorB)
   move(b, 160.5, -160.5)
   await b.expect('unload_chunk', p => p.chunkX === 0 && p.chunkZ === 0, cursorB)
-  // Out-of-range item IDs are rejected; valid vanilla catalog items are accepted.
+
+  // Out-of-range item IDs are rejected with set_slot (not window_items, which
+  // would wipe the client's local Creative cursor); valid catalog items succeed.
   cursorA = a.events.length
   a.write('set_creative_slot', { slot: 38, item: stack(9999) })
-  const rejected = await a.expect('window_items', () => true, cursorA)
-  assert.equal(rejected.items[38].itemId, md.itemsByName.glass.id)
+  const rejected = await a.expect('set_slot', p => p.slot === 38, cursorA)
+  assert.equal(rejected.item.itemId, md.itemsByName.glass.id)
+  assert(!a.events.slice(cursorA).some(([n]) => n === 'window_items'), 'set_creative_slot must not send window_items')
+
   cursorA = a.events.length
   a.write('set_creative_slot', { slot: 38, item: stack(md.itemsByName.iron_ore.id) })
-  await a.expect('window_items', p => p.items[38].itemId === md.itemsByName.iron_ore.id, cursorA)
+  await a.expect('set_slot', p => p.slot === 38 && p.item.itemId === md.itemsByName.iron_ore.id, cursorA)
   const ironOre = md.blocksByName.iron_ore.defaultState
   slot(a, 2)
   place(a, support, 4)
   await change(a, target, ironOre, cursorA)
   await ack(a, 4)
-  // Correct kind but insufficient tier is denied; stone-tier pickaxe succeeds.
-  slot(a, 3)
-  cursorA = a.events.length
   dig(a, target, 5)
-  await change(a, target, ironOre, cursorA)
-  await ack(a, 5)
-  slot(a, 4)
-  dig(a, target, 6)
   await change(a, target, 0, cursorA)
-  await ack(a, 6)
+  await ack(a, 5)
+
+  // Clearing a slot (as the vanilla Creative client does when picking an item
+  // onto its local cursor) replies with set_slot so the cursor is not wiped.
+  cursorA = a.events.length
+  a.write('set_creative_slot', { slot: 38, item: emptyStack })
+  await a.expect('set_slot', p => p.slot === 38 && p.item.itemCount === 0, cursorA)
+  assert(!a.events.slice(cursorA).some(([n]) => n === 'window_items'))
+
   cursorA = a.events.length
   a.write('set_creative_slot', { slot: 38, item: stack(md.itemsByName.glass.id) })
-  const corrected = await a.expect('window_items', p => p.items[38].itemId === md.itemsByName.glass.id, cursorA)
+  const restoredSlot = await a.expect('set_slot', p => p.slot === 38 && p.item.itemId === md.itemsByName.glass.id, cursorA)
   slot(a, 2)
   place(a, support, 7)
   await change(a, target, glass, cursorA)
@@ -148,7 +148,7 @@ async function run () {
   // Server-authoritative storage: move glass through the main inventory and
   // back. Client changedSlots/cursor reports remain advisory.
   cursorA = a.events.length
-  click(a, corrected.stateId, 38, stack(md.itemsByName.glass.id), emptyStack)
+  click(a, restoredSlot.stateId, 38, stack(md.itemsByName.glass.id), emptyStack)
   const carrying = await a.expect('window_items', p => p.carriedItem.itemId === md.itemsByName.glass.id && p.items[38].itemCount === 0, cursorA)
   cursorA = a.events.length
   click(a, carrying.stateId, 9, emptyStack, stack(md.itemsByName.glass.id))
@@ -174,16 +174,12 @@ async function run () {
   assert(!b.events.slice(cursorB).some(([n, p]) => n === 'block_change' && same(p.location, target)), 'out-of-range observer received mutation')
 
   const mineable = { x: 9, y: 63, z: 8 }
-  // Pickaxe mismatches grass' shovel requirement; wooden shovel is sufficient.
+  // Creative mode breaks terrain blocks regardless of held tool.
   slot(a, 4)
   cursorA = a.events.length
   dig(a, mineable, 9)
-  await change(a, mineable, md.blocksByName.grass_block.defaultState, cursorA)
-  await ack(a, 9)
-  slot(a, 6)
-  dig(a, mineable, 10)
   await change(a, mineable, 0, cursorA)
-  await ack(a, 10)
+  await ack(a, 9)
   const remote = { x: 15, y: 63, z: 15 }
   cursorA = a.events.length
   dig(a, remote, 11)

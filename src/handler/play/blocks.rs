@@ -130,18 +130,7 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
     let (positions, edit) = match action {
         Action::Dig { pos, face, start } => {
             let current = blocks.get(pos);
-            let edit = if start
-                && face < 6
-                && reachable(pos)
-                && crate::game::registry()
-                    .state_by_id(current)
-                    .is_some_and(|(block, _, state)| {
-                        crate::game::registry().can_mine(
-                            session.inventory.hand(Hand::Main).map(|stack| stack.item),
-                            block,
-                            state,
-                        )
-                    }) {
+            let edit = if start && face < 6 && reachable(pos) && current != crate::game::AIR_STATE {
                 Some((pos, crate::game::AIR_STATE))
             } else {
                 None
@@ -285,7 +274,23 @@ pub async fn handle_creative_slot(ctx: &mut Context<'_>, p: CreativeSlot) -> io:
     if let Some(item) = p.item.supported() {
         ctx.session.inventory.set_creative(p.slot, item);
     }
-    inventory(ctx)
+    // Reply with only the affected slot instead of full InventoryContent;
+    // Creative inventory keeps the cursor client-side, and sending
+    // InventoryContent with an empty carried item would wipe it out.
+    let Ok(slot) = usize::try_from(p.slot) else {
+        return Ok(Outcome::empty());
+    };
+    let Some(&item) = ctx.session.inventory.slots().get(slot) else {
+        return Ok(Outcome::empty());
+    };
+    Ok(reply(vec![
+        SetInventorySlot {
+            state_id: ctx.session.inventory.state_id(),
+            slot: p.slot,
+            item,
+        }
+        .into(),
+    ]))
 }
 pub async fn handle_inventory_click(
     ctx: &mut Context<'_>,
