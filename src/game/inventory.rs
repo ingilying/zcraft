@@ -138,6 +138,49 @@ impl Inventory {
         self.changed();
         ClickResult::Changed
     }
+
+    /// Add up to `count` undamaged items into hotbar then main inventory.
+    /// Returns the number of items actually inserted.
+    pub fn give(&mut self, item: i32, count: u32) -> u32 {
+        let Some(definition) = super::item_by_id(item) else {
+            return 0;
+        };
+        let max_stack = u32::from(definition.max_stack);
+        if max_stack == 0 || count == 0 {
+            return 0;
+        }
+        let mut remaining = count;
+        for slot in HOTBAR.chain(MAIN) {
+            if remaining == 0 {
+                break;
+            }
+            if let Some(mut stack) = self.slots[slot]
+                && stack.item == item
+                && stack.damage == 0
+                && u32::from(stack.count) < max_stack
+            {
+                let add = (max_stack - u32::from(stack.count)).min(remaining);
+                stack.count += add as u8;
+                remaining -= add;
+                self.slots[slot] = Some(stack);
+            }
+        }
+        for slot in HOTBAR.chain(MAIN) {
+            if remaining == 0 {
+                break;
+            }
+            if self.slots[slot].is_none() {
+                let add = max_stack.min(remaining);
+                self.slots[slot] = ItemStack::new(item, add as u8);
+                remaining -= add;
+            }
+        }
+        let added = count - remaining;
+        if added > 0 {
+            self.changed();
+        }
+        added
+    }
     pub fn click(&mut self, click: InventoryClick) -> ClickResult {
         let before = (self.slots, self.carried);
         let valid = match click.mode {

@@ -137,7 +137,11 @@ pub(crate) async fn handle_signed_command(
 fn player_stack(ctx: &Context<'_>) -> Option<SourceStack> {
     let profile = ctx.session.profile.as_ref()?;
     let play = ctx.session.play.as_ref()?;
-    SourceStack::new(CommandSource::player(profile.uuid))
+    let source = CommandSource {
+        permission: ctx.server.play.permission_for(profile.uuid, &profile.name),
+        ..CommandSource::player(profile.uuid)
+    };
+    SourceStack::new(source)
         .positioned(
             Dimension {
                 id: "minecraft:overworld".into(),

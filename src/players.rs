@@ -192,9 +192,26 @@ pub(crate) struct Peer {
     pub info: Arc<[u8]>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PlayerControl {
+    Teleport {
+        position: [f64; 3],
+        yaw: Option<f32>,
+        pitch: Option<f32>,
+    },
+    Give {
+        item: i32,
+        count: u32,
+    },
+    SetGameMode(crate::config::GameMode),
+    RefreshCommands,
+    Kick(String),
+}
+
 #[derive(Debug)]
 pub(crate) enum Delivery {
     Packet(Arc<[u8]>),
+    Control(PlayerControl),
     Chat {
         body: Arc<[u8]>,
         private: bool,
@@ -229,6 +246,7 @@ impl Delivery {
         let mut ack = None;
         match self {
             Self::Packet(body) | Self::Chat { body, .. } => bodies[0] = Some(body),
+            Self::Control(_) => {}
             Self::Terrain {
                 updates,
                 ack: sequence,
@@ -471,6 +489,56 @@ impl Players {
             registry.deactivate(uuid);
         }
         Ok(report)
+    }
+
+    /// Enqueue a server-initiated control action for a ready Play player.
+    pub(crate) fn send_control(&self, uuid: Uuid, control: PlayerControl) -> bool {
+        let mut registry = lock(&self.registry);
+        let Some(slot) = registry.players.get_mut(&uuid) else {
+            return false;
+        };
+        if !slot.receiving || slot.lagged {
+            return false;
+        }
+        slot.enqueue(Delivery::Control(control))
+    }
+
+    /// Publish world block/light updates to all subscribers of `chunk`.
+    pub(crate) fn publish_world_updates(&self, chunk: Chunk, updates: Arc<[Arc<[u8]>]>) {
+        if updates.is_empty() {
+            return;
+        }
+        let mut registry = lock(&self.registry);
+        let viewers: Vec<_> = registry.block_watchers.at(chunk).collect();
+        for viewer in viewers {
+            registry.enqueue_terrain(viewer, chunk, updates.clone(), None);
+        }
+    }
+
+    /// Find an online ready player by exact username or unique case-insensitive match.
+    pub(crate) fn find_player_by_name(&self, name: &str) -> Option<(Uuid, String)> {
+        let registry = lock(&self.registry);
+        let mut case_match: Option<(Uuid, String)> = None;
+        let mut ambiguous = false;
+        for (&uuid, slot) in &registry.players {
+            let Some(peer) = &slot.visible else {
+                continue;
+            };
+            if !slot.receiving || slot.lagged {
+                continue;
+            }
+            if peer.name.as_ref() == name {
+                return Some((uuid, peer.name.to_string()));
+            }
+            if peer.name.eq_ignore_ascii_case(name) {
+                if case_match.is_some() {
+                    ambiguous = true;
+                } else {
+                    case_match = Some((uuid, peer.name.to_string()));
+                }
+            }
+        }
+        (!ambiguous).then_some(case_match).flatten()
     }
 }
 

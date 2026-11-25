@@ -125,12 +125,15 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
         .play
         .as_ref()
         .ok_or_else(|| crate::protocol::invalid("Play session not initialized"))?;
-    let Some((creative, slot)) = state.creative.as_ref().zip(session.reservation.as_ref()) else {
+    if state.game_mode != crate::config::GameMode::Creative {
+        return Ok(reply(vec![BlockAck(sequence).into()]));
+    }
+    let Some(slot) = session.reservation.as_ref() else {
         return Ok(reply(vec![BlockAck(sequence).into()]));
     };
     let valid = |pos: BlockPos| pos.valid() && state.chunks.tracks(pos.chunk());
     let reachable = |pos: BlockPos| valid(pos) && in_reach(state.position, pos);
-    let mut blocks = creative.world.lock();
+    let mut blocks = state.blocks.world.lock();
     let (positions, edit) = match action {
         Action::Dig { pos, face, start } => {
             let current = blocks.get(pos);
@@ -258,7 +261,11 @@ pub async fn handle_place(ctx: &mut Context<'_>, p: BlockPlace) -> io::Result<Ou
 pub async fn handle_use_item(ctx: &mut Context<'_>, p: UseItem) -> io::Result<Outcome> {
     let _held = Hand::from_wire(p.hand).and_then(|hand| ctx.session.inventory.hand(hand));
     if let Some(slot) = &ctx.session.reservation
-        && ctx.server.play.game_mode == crate::config::GameMode::Creative
+        && ctx
+            .session
+            .play
+            .as_ref()
+            .is_some_and(|state| state.game_mode == crate::config::GameMode::Creative)
     {
         // Future food/tools/projectiles dispatch through item categories here. Even a
         // no-op use is acknowledged in the same FIFO as block predictions.
@@ -276,7 +283,7 @@ pub async fn handle_slot(ctx: &mut Context<'_>, p: HeldItemSlot) -> io::Result<O
 }
 
 fn inventory(ctx: &mut Context<'_>) -> io::Result<Outcome> {
-    if play(ctx.session)?.creative.is_some() {
+    if play(ctx.session)?.game_mode == crate::config::GameMode::Creative {
         Ok(reply(vec![
             InventoryContent(Box::new(ctx.session.inventory.clone())).into(),
         ]))
@@ -286,7 +293,7 @@ fn inventory(ctx: &mut Context<'_>) -> io::Result<Outcome> {
 }
 
 pub async fn handle_creative_slot(ctx: &mut Context<'_>, p: CreativeSlot) -> io::Result<Outcome> {
-    if play(ctx.session)?.creative.is_none() {
+    if play(ctx.session)?.game_mode != crate::config::GameMode::Creative {
         return Ok(Outcome::empty());
     }
     if let Some(item) = p.item.supported() {
@@ -314,7 +321,7 @@ pub async fn handle_inventory_click(
     ctx: &mut Context<'_>,
     p: InventoryClickPacket,
 ) -> io::Result<Outcome> {
-    if play(ctx.session)?.creative.is_none() {
+    if play(ctx.session)?.game_mode != crate::config::GameMode::Creative {
         return Ok(Outcome::empty());
     }
     if p.window == 0 && p.state_id == ctx.session.inventory.state_id() {

@@ -75,6 +75,24 @@ impl Encode for DefaultSpawnPosition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerPosition {
     pub teleport_id: i32,
+    position_bits: [u64; 3],
+    yaw_bits: u32,
+    pitch_bits: u32,
+}
+
+impl PlayerPosition {
+    pub fn spawn(teleport_id: i32) -> Self {
+        Self::at([SPAWN_X, SPAWN_Y, SPAWN_Z], 0.0, 0.0, teleport_id)
+    }
+
+    pub fn at(position: [f64; 3], yaw: f32, pitch: f32, teleport_id: i32) -> Self {
+        Self {
+            teleport_id,
+            position_bits: position.map(f64::to_bits),
+            yaw_bits: yaw.to_bits(),
+            pitch_bits: pitch.to_bits(),
+        }
+    }
 }
 
 impl Encode for PlayerPosition {
@@ -82,11 +100,11 @@ impl Encode for PlayerPosition {
         if self.teleport_id < 0 {
             return Err(invalid("negative teleport ID"));
         }
-        for coordinate in [SPAWN_X, SPAWN_Y, SPAWN_Z] {
+        for coordinate in self.position_bits {
             out.extend_from_slice(&coordinate.to_be_bytes());
         }
-        out.extend_from_slice(&0f32.to_be_bytes());
-        out.extend_from_slice(&0f32.to_be_bytes());
+        out.extend_from_slice(&self.yaw_bits.to_be_bytes());
+        out.extend_from_slice(&self.pitch_bits.to_be_bytes());
         out.push(0);
         put_varint(self.teleport_id, out);
         Ok(())
@@ -180,6 +198,7 @@ pub struct GameEvent {
 impl GameEvent {
     pub const START_RAINING: u8 = 1;
     pub const STOP_RAINING: u8 = 2;
+    pub const CHANGE_GAME_MODE: u8 = 3;
     pub const RAIN_LEVEL_CHANGE: u8 = 7;
     pub const THUNDER_LEVEL_CHANGE: u8 = 8;
     pub const LEVEL_CHUNKS_LOAD_START: u8 = 13;
@@ -197,6 +216,10 @@ impl GameEvent {
 
     pub fn level_chunks_load_start() -> Self {
         Self::new(Self::LEVEL_CHUNKS_LOAD_START, 0.0)
+    }
+
+    pub fn change_game_mode(mode: GameMode) -> Self {
+        Self::new(Self::CHANGE_GAME_MODE, f32::from(mode.wire_id()))
     }
 
     pub fn start_raining() -> Self {
@@ -669,7 +692,7 @@ mod tests {
 
     #[test]
     fn position_and_spawn_are_absolute_and_correctly_packed() {
-        let bytes = encoded(&PlayerPosition { teleport_id: 123 });
+        let bytes = encoded(&PlayerPosition::spawn(123));
         let mut reader = Reader::new(&bytes);
         assert_eq!(f64_field(&mut reader), SPAWN_X);
         assert_eq!(f64_field(&mut reader), SPAWN_Y);
@@ -853,11 +876,7 @@ mod tests {
         let mut negative = Vec::new();
         put_varint(-1, &mut negative);
         assert!(TeleportConfirm::decode(&mut Reader::new(&negative)).is_err());
-        assert!(
-            PlayerPosition { teleport_id: -1 }
-                .encode(&mut Vec::new())
-                .is_err()
-        );
+        assert!(PlayerPosition::spawn(-1).encode(&mut Vec::new()).is_err());
         assert!(
             ChunkBatchFinished { count: -1 }
                 .encode(&mut Vec::new())
