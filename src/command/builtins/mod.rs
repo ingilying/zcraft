@@ -53,6 +53,7 @@ pub(super) fn builder() -> CommandRegistryBuilder {
     admin::register_gamemode(&mut builder);
     admin::register_op(&mut builder);
     admin::register_kick(&mut builder);
+    admin::register_save_all(&mut builder);
     admin::register_stop(&mut builder);
     builder
 }

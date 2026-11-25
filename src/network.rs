@@ -78,13 +78,40 @@ async fn serve_validated(
         crate::world::TICK_INTERVAL,
     );
     world_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    const AUTOSAVE_TICKS: u64 = 6_000; // 5 minutes at 20 TPS.
+    let mut ticks_since_save = 0u64;
+    let mut autosave: Option<tokio::task::JoinHandle<io::Result<crate::world::SaveSummary>>> = None;
     tokio::pin!(shutdown);
     let result = loop {
         tokio::select! {
             _ = &mut shutdown => break Ok(()),
+            res = async { autosave.as_mut().unwrap().await }, if autosave.is_some() => {
+                autosave = None;
+                match res {
+                    Ok(Ok(summary)) => {
+                        tracing::info!(chunks = summary.chunks_saved, "autosaved world");
+                    }
+                    Ok(Err(error)) => {
+                        tracing::error!(%error, "world autosave failed");
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "world autosave task panicked");
+                    }
+                }
+            }
             _ = world_tick.tick() => {
                 for packet in server.play.tick_world() {
                     let _ = server.players().broadcast(&packet);
+                }
+                ticks_since_save += 1;
+                if ticks_since_save >= AUTOSAVE_TICKS {
+                    ticks_since_save = 0;
+                    if server.play.world().has_storage() && autosave.is_none() {
+                        let save_server = server.clone();
+                        autosave = Some(tokio::task::spawn_blocking(move || {
+                            save_server.play.save_world()
+                        }));
+                    }
                 }
             }
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
@@ -110,9 +137,34 @@ async fn serve_validated(
             }
         }
     };
-    // Cancel idle reads and release sockets/permits before returning.
+    // Wait for any in-flight autosave, cancel connection tasks (whose drop
+    // guards persist online players), then perform a final blocking world save.
+    if let Some(handle) = autosave
+        && let Err(error) = handle.await
+    {
+        tracing::error!(%error, "in-flight autosave task failed during shutdown");
+    }
     tasks.shutdown().await;
-    result
+    let save_result = if server.play.world().has_storage() {
+        let save_server = server.clone();
+        match tokio::task::spawn_blocking(move || save_server.play.save_world()).await {
+            Ok(Ok(summary)) => {
+                tracing::info!(chunks = summary.chunks_saved, "saved world on shutdown");
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                tracing::error!(%error, "failed to save world on shutdown");
+                Err(error)
+            }
+            Err(error) => {
+                tracing::error!(%error, "shutdown save task panicked");
+                Err(io::Error::other(error))
+            }
+        }
+    } else {
+        Ok(())
+    };
+    result.and(save_result)
 }
 
 /// Transport reads are cancellation-safe. Poll them alongside a timer whose
@@ -208,13 +260,40 @@ enum ConnectionEvent {
     Eof,
 }
 
+struct ConnectionSession<'a> {
+    session: Session,
+    server: &'a ServerContext,
+}
+
+impl std::ops::Deref for ConnectionSession<'_> {
+    type Target = Session;
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for ConnectionSession<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session
+    }
+}
+
+impl Drop for ConnectionSession<'_> {
+    fn drop(&mut self) {
+        crate::handler::play::save_session(&self.session, &self.server.play);
+    }
+}
+
 async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
     mut transport: Transport<S>,
     server: &ServerContext,
     deadline: Duration,
     compression_threshold: Option<usize>,
 ) -> io::Result<()> {
-    let mut session = Session::default();
+    let mut session = ConnectionSession {
+        session: Session::default(),
+        server,
+    };
     let login_deadline = Instant::now() + Duration::from_secs(30);
     let mut frame_deadline = Instant::now() + deadline;
     let mut ticks = tokio::time::interval(Duration::from_secs(1));

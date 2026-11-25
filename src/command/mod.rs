@@ -131,6 +131,7 @@ pub trait AdminCommandHost {
     fn set_op(&mut self, target: &str, op: bool) -> io::Result<CommandResult>;
     fn kick_player(&mut self, uuid: Uuid, reason: &str) -> io::Result<bool>;
     fn request_shutdown(&mut self) -> io::Result<bool>;
+    fn save_all(&mut self) -> io::Result<String>;
 }
 
 /// Custom types can be used for server-only nodes, or provide a verified

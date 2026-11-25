@@ -40,9 +40,17 @@ impl PlayService {
     }
 
     pub fn with_options(max_view_distance: i32, game_mode: GameMode) -> io::Result<Self> {
+        Self::with_world(max_view_distance, game_mode, Arc::new(World::new()))
+    }
+
+    pub fn with_world(
+        max_view_distance: i32,
+        game_mode: GameMode,
+        world: Arc<World>,
+    ) -> io::Result<Self> {
         world::validate_view_distance(max_view_distance)?;
         Ok(Self {
-            world: Arc::new(World::new()),
+            world,
             ops: Mutex::new(HashSet::new()),
             shutdown: Mutex::new(None),
             game_mode,
@@ -54,6 +62,22 @@ impl PlayService {
 
     pub fn world(&self) -> &Arc<World> {
         &self.world
+    }
+
+    pub fn save_world(&self) -> io::Result<world::SaveSummary> {
+        self.world.save_all()
+    }
+
+    pub fn load_player(&self, uuid: uuid::Uuid) -> io::Result<Option<world::SavedPlayer>> {
+        self.world.load_player(uuid)
+    }
+
+    pub fn save_player(
+        &self,
+        player: &crate::game::Player,
+        inventory: &crate::game::Inventory,
+    ) -> io::Result<()> {
+        self.world.save_player(player, inventory)
     }
 
     pub(super) fn allocate_entity_id(&self) -> io::Result<i32> {

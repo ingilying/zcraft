@@ -16,13 +16,23 @@ impl ServerContext {
         if let Some(pack) = &config.resource_pack {
             configuration = configuration.with_resource_pack(pack.clone())?;
         }
+        let world = if let Some(dir) = &config.world_dir {
+            std::sync::Arc::new(crate::world::World::open(dir, config.flat.clone())?)
+        } else if let Some(flat) = &config.flat {
+            std::sync::Arc::new(crate::world::World::with_generator(
+                crate::world::FlatGenerator::from_config(flat.clone())?,
+            ))
+        } else {
+            std::sync::Arc::new(crate::world::World::new())
+        };
         Ok(Self {
             status: StatusService::from_config(config)?,
             login: LoginService::from_config(config).await?,
             configuration,
-            play: crate::handler::play::PlayService::with_options(
+            play: crate::handler::play::PlayService::with_world(
                 config.max_view_distance,
                 config.game_mode,
+                world,
             )?
             .with_ops(config.ops.clone()),
         })
@@ -219,6 +229,17 @@ impl<H: crate::command::CommandHost> crate::command::AdminCommandHost for Server
     }
     fn request_shutdown(&mut self) -> std::io::Result<bool> {
         Ok(self.server.play.request_shutdown())
+    }
+    fn save_all(&mut self) -> std::io::Result<String> {
+        let summary = self.server.play.save_world()?;
+        if !summary.persisted {
+            Ok("World persistence is disabled (set world_dir in zcraft.toml).".into())
+        } else {
+            Ok(format!(
+                "Saved the game ({} chunk(s) flushed).",
+                summary.chunks_saved
+            ))
+        }
     }
 }
 

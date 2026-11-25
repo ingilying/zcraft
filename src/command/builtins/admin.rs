@@ -370,6 +370,19 @@ fn execute_kick(
     })
 }
 
+pub(super) fn register_save_all(b: &mut CommandRegistryBuilder) {
+    b.add_node(
+        NodeId::ROOT,
+        CommandNode::literal("save-all")
+            .requires(require_op4)
+            .executes(|_, host| {
+                let message = admin_host(host)?.save_all()?;
+                Ok(CommandResult::message(message))
+            }),
+    )
+    .unwrap();
+}
+
 pub(super) fn register_stop(b: &mut CommandRegistryBuilder) {
     b.add_node(
         NodeId::ROOT,

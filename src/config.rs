@@ -53,6 +53,13 @@ pub struct Config {
     /// Operator usernames or UUIDs granted command permission level 4.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ops: Vec<String>,
+    /// Optional Anvil world directory (level.dat, region/*.mca, playerdata/*.dat).
+    /// When omitted, the world runs in memory only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_dir: Option<String>,
+    /// Optional Superflat generator preset (used when creating a new world or in memory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flat: Option<crate::world::FlatGeneratorConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +128,8 @@ impl Default for Config {
             io_timeout: Duration::from_secs(10),
             resource_pack: None,
             ops: Vec::new(),
+            world_dir: None,
+            flat: None,
         }
     }
 }
@@ -154,6 +163,17 @@ impl Config {
              {defaults}\n\
              # Optional operator usernames or UUIDs (permission level 4):\n\
              # ops = [\"YourName\"]\n\n\
+             # Optional Anvil world persistence directory (level.dat, region/*.mca, playerdata/*.dat):\n\
+             # world_dir = \"world\"\n\n\
+             # Optional Superflat terrain preset (default: y=60 bedrock, 2x dirt, grass_block):\n\
+             # [flat]\n\
+             # base_y = -64\n\
+             # biome = \"minecraft:plains\"\n\
+             # layers = [\n\
+             #   {{ block = \"minecraft:bedrock\", height = 1 }},\n\
+             #   {{ block = \"minecraft:dirt\", height = 2 }},\n\
+             #   {{ block = \"minecraft:grass_block\", height = 1 }},\n\
+             # ]\n\n\
              # Optional server resource pack (uncomment and configure to enable):\n\
              {commented_optional}"
         ))
@@ -247,6 +267,14 @@ impl Config {
             if !valid_uuid && !crate::auth::valid_username(entry) {
                 return Err(invalid("ops entries must be valid usernames or UUIDs"));
             }
+        }
+        if let Some(dir) = &self.world_dir
+            && dir.trim().is_empty()
+        {
+            return Err(invalid("world_dir must not be empty"));
+        }
+        if let Some(flat) = &self.flat {
+            flat.validate()?;
         }
         Ok(())
     }

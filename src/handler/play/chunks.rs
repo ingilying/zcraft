@@ -41,10 +41,15 @@ pub(super) struct ChunkStream {
 }
 
 impl ChunkStream {
+    #[cfg(test)]
     pub(super) fn new(radius: i32, now: Instant) -> Self {
+        Self::at([0, 0], radius, now)
+    }
+
+    pub(super) fn at(center: Chunk, radius: i32, now: Instant) -> Self {
         Self {
-            center: [0, 0],
-            advertised_center: [0, 0],
+            center,
+            advertised_center: center,
             radius,
             advertised_radius: radius,
             loaded: BTreeSet::new(),

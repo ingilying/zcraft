@@ -59,21 +59,49 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         .server
         .play
         .view_distance(ctx.session.client_information.as_ref());
-    let mut chunks = ChunkStream::new(view_distance, now);
-    if let Some(slot) = &ctx.session.reservation {
-        slot.set_view([0, 0], view_distance);
-    }
     let world = ctx.server.play.world();
+    // Fail-closed on corrupt/unreadable playerdata so we never overwrite a
+    // player's existing save with default spawn/inventory state on disconnect.
+    let saved = ctx.server.play.load_player(profile.uuid).map_err(|error| {
+        tracing::error!(uuid = %profile.uuid, %error, "failed to load playerdata; rejecting login to prevent overwrite");
+        error
+    })?;
+    let (position, yaw, pitch, on_ground, game_mode) = if let Some(saved) = saved {
+        ctx.session.inventory = saved.inventory;
+        (
+            saved.position,
+            saved.yaw,
+            saved.pitch,
+            saved.on_ground,
+            saved.game_mode,
+        )
+    } else {
+        (
+            world.spawn_position(),
+            0.0,
+            0.0,
+            false,
+            ctx.server.play.game_mode,
+        )
+    };
+    let spawn_chunk = world::chunk_at(position[0], position[2]);
+    let mut chunks = ChunkStream::at(spawn_chunk, view_distance, now);
+    if let Some(slot) = &ctx.session.reservation {
+        slot.set_view(spawn_chunk, view_distance);
+    }
     let mut first_batch = chunks.pump(world.terrain(), now);
     let mut blocks = blocks::CreativeSession::new(world.clone());
     blocks.prepare_chunks(&mut first_batch);
-    let game_mode = ctx.server.play.game_mode;
     let command_source = crate::command::CommandSource {
         permission: ctx.server.play.permission_for(profile.uuid, &profile.name),
         ..crate::command::CommandSource::player(profile.uuid)
     };
-    let player =
+    let mut player =
         crate::game::Player::at_spawn(entity_id, profile.uuid, profile.name.clone(), game_mode);
+    player.position = position;
+    player.yaw = yaw;
+    player.pitch = pitch;
+    player.on_ground = on_ground;
     ctx.session.play = Some(PlaySession {
         player,
         pending_teleport: Some((0, now)),
@@ -97,7 +125,7 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
     replies.extend(ctx.server.play.initial_environment_packets());
     replies.extend([
         WorldBorder.into(),
-        CenterChunk([0, 0]).into(),
+        CenterChunk(spawn_chunk).into(),
         GameEvent::level_chunks_load_start().into(),
         DeclareCommands::new(ctx.server.play.commands(), &command_source).into(),
     ]);
@@ -110,12 +138,26 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
     replies.extend(first_batch);
     // The nearest chunks (including spawn) precede the initial teleport.
     // The rest of the view streams independently of teleport confirmation.
-    replies.push(PlayerPosition::spawn(0).into());
+    replies.push(PlayerPosition::at(position, yaw, pitch, 0).into());
     Ok(Outcome {
         replies,
         close: false,
         encryption: None,
     })
+}
+
+/// Best-effort persistence of a player's state and inventory when leaving Play.
+pub(crate) fn save_session(session: &Session, play: &PlayService) {
+    let Some(play_session) = &session.play else {
+        return;
+    };
+    if let Err(error) = play.save_player(&play_session.player, &session.inventory) {
+        tracing::warn!(
+            uuid = %play_session.player.uuid,
+            %error,
+            "failed to save playerdata"
+        );
+    }
 }
 
 fn play(session: &mut Session) -> io::Result<&mut PlaySession> {
