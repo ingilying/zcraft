@@ -7,7 +7,26 @@ use super::{
     HEIGHT, MIN_Y, PLAINS_BIOME_ID, SECTION_COUNT, WORLD_LIMIT, pack_entries, put_heightmaps_with,
     put_single_palette, put_varint,
 };
-use std::sync::Arc;
+use crate::game::ItemStack;
+use std::{collections::BTreeMap, sync::Arc};
+
+pub const CHEST_SLOTS: usize = 27;
+
+/// Per-block persistent entity data stored inside a `Chunk` (Anvil `block_entities`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockEntity {
+    Chest {
+        items: Box<[Option<ItemStack>; CHEST_SLOTS]>,
+    },
+}
+
+impl BlockEntity {
+    pub fn empty_chest() -> Self {
+        Self::Chest {
+            items: Box::new([None; CHEST_SLOTS]),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockPos(pub [i32; 3]);
@@ -312,21 +331,42 @@ fn pack_small_entries(entries: &[u64; 64], bits: u8, out: &mut Vec<u8>) {
     }
 }
 
-/// Complete 16x384x16 chunk composed of 24 sections.
+/// Complete 16x384x16 chunk composed of 24 sections plus optional block entities.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     sections: Box<[ChunkSection; SECTION_COUNT]>,
+    block_entities: BTreeMap<[i32; 3], BlockEntity>,
 }
 
 impl Chunk {
     pub fn empty(biome_id: i32) -> Self {
         Self {
             sections: Box::new(std::array::from_fn(|_| ChunkSection::empty(biome_id))),
+            block_entities: BTreeMap::new(),
         }
     }
 
     pub fn from_sections(sections: Box<[ChunkSection; SECTION_COUNT]>) -> Self {
-        Self { sections }
+        Self {
+            sections,
+            block_entities: BTreeMap::new(),
+        }
+    }
+
+    pub fn block_entities(&self) -> &BTreeMap<[i32; 3], BlockEntity> {
+        &self.block_entities
+    }
+
+    pub fn block_entity(&self, pos: [i32; 3]) -> Option<&BlockEntity> {
+        self.block_entities.get(&pos)
+    }
+
+    pub fn set_block_entity(&mut self, pos: [i32; 3], entity: BlockEntity) {
+        self.block_entities.insert(pos, entity);
+    }
+
+    pub fn remove_block_entity(&mut self, pos: [i32; 3]) -> Option<BlockEntity> {
+        self.block_entities.remove(&pos)
     }
 
     #[inline]

@@ -3,7 +3,8 @@
 //! - `region/r.<rx>.<rz>.mca`: 32x32 chunk region files (lazy single-chunk load & atomic batch save)
 //! - `playerdata/<uuid>.dat`: GZip-compressed NBT per-player state & inventory
 use super::{
-    BiomeStorage, BlockStorage, Chunk, ChunkSection, MIN_Y, PLAINS_BIOME_ID, SECTION_COUNT,
+    BiomeStorage, BlockEntity, BlockStorage, CHEST_SLOTS, Chunk, ChunkSection, MIN_Y,
+    PLAINS_BIOME_ID, SECTION_COUNT,
     clock::PersistedClock,
     generator::{FlatGeneratorConfig, FlatLayerConfig},
     nbt::{
@@ -38,11 +39,18 @@ const REGION_CHUNKS: usize = 1024;
 const HEADER_BYTES: usize = SECTOR_BYTES * 2;
 const LOWEST_SECTION_Y: i32 = MIN_Y / 16; // -4
 
+/// Generator descriptor parsed from `level.dat`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadedGenerator {
+    Flat(FlatGeneratorConfig),
+    Overworld { seed: i64 },
+}
+
 /// Loaded `level.dat` snapshot.
 #[derive(Debug, Clone)]
 pub struct LoadedLevel {
     pub clock: PersistedClock,
-    pub flat: Option<FlatGeneratorConfig>,
+    pub generator: Option<LoadedGenerator>,
     pub spawn: Option<[f64; 3]>,
 }
 
@@ -130,14 +138,19 @@ impl AnvilStorage {
             _ => None,
         };
 
-        let flat = parse_flat_settings(data);
-        Ok(Some(LoadedLevel { clock, flat, spawn }))
+        let generator = parse_generator_settings(data);
+        Ok(Some(LoadedLevel {
+            clock,
+            generator,
+            spawn,
+        }))
     }
 
     pub fn save_level(
         &self,
         clock: PersistedClock,
         flat: Option<&FlatGeneratorConfig>,
+        overworld_seed: Option<i64>,
         spawn: [f64; 3],
     ) -> io::Result<()> {
         let level_name = self
@@ -167,7 +180,7 @@ impl AnvilStorage {
         data.insert("LastPlayed".into(), Tag::Long(now_ms));
         data.insert("initialized".into(), Tag::Byte(1));
 
-        if let Some(flat_cfg) = flat {
+        let gen_compound = if let Some(flat_cfg) = flat {
             let mut layers = Vec::with_capacity(flat_cfg.layers.len());
             for layer in &flat_cfg.layers {
                 let mut lc = Compound::new();
@@ -180,10 +193,20 @@ impl AnvilStorage {
             settings.insert("layers".into(), Tag::List(layers));
             settings.insert("zcraft_base_y".into(), Tag::Int(flat_cfg.base_y));
 
-            let mut gen_compound = Compound::new();
-            gen_compound.insert("type".into(), Tag::String("minecraft:flat".into()));
-            gen_compound.insert("settings".into(), Tag::Compound(settings));
+            let mut gc = Compound::new();
+            gc.insert("type".into(), Tag::String("minecraft:flat".into()));
+            gc.insert("settings".into(), Tag::Compound(settings));
+            Some((0i64, gc))
+        } else if let Some(seed) = overworld_seed {
+            let mut gc = Compound::new();
+            gc.insert("type".into(), Tag::String("minecraft:noise".into()));
+            gc.insert("settings".into(), Tag::String("minecraft:overworld".into()));
+            Some((seed, gc))
+        } else {
+            None
+        };
 
+        if let Some((seed, gen_compound)) = gen_compound {
             let mut overworld = Compound::new();
             overworld.insert("type".into(), Tag::String("minecraft:overworld".into()));
             overworld.insert("generator".into(), Tag::Compound(gen_compound));
@@ -193,8 +216,8 @@ impl AnvilStorage {
 
             let mut world_gen = Compound::new();
             world_gen.insert("bonus_chest".into(), Tag::Byte(0));
-            world_gen.insert("generate_features".into(), Tag::Byte(0));
-            world_gen.insert("seed".into(), Tag::Long(0));
+            world_gen.insert("generate_features".into(), Tag::Byte(1));
+            world_gen.insert("seed".into(), Tag::Long(seed));
             world_gen.insert("dimensions".into(), Tag::Compound(dimensions));
             data.insert("WorldGenSettings".into(), Tag::Compound(world_gen));
         }
@@ -434,44 +457,47 @@ fn internal_to_vanilla_slot(slot: usize) -> Option<i8> {
     }
 }
 
-fn parse_flat_settings(data: &Compound) -> Option<FlatGeneratorConfig> {
-    let generator = data
-        .get("WorldGenSettings")?
-        .as_compound()?
+fn parse_generator_settings(data: &Compound) -> Option<LoadedGenerator> {
+    let world_gen = data.get("WorldGenSettings")?.as_compound()?;
+    let seed = world_gen.get("seed").and_then(Tag::as_long).unwrap_or(0);
+    let generator = world_gen
         .get("dimensions")?
         .as_compound()?
         .get("minecraft:overworld")?
         .as_compound()?
         .get("generator")?
         .as_compound()?;
-    if generator.get("type")?.as_str()? != "minecraft:flat" {
-        return None;
+    match generator.get("type")?.as_str()? {
+        "minecraft:noise" => Some(LoadedGenerator::Overworld { seed }),
+        "minecraft:flat" => {
+            let settings = generator.get("settings")?.as_compound()?;
+            let biome = settings
+                .get("biome")
+                .and_then(Tag::as_str)
+                .unwrap_or("minecraft:plains")
+                .to_string();
+            let base_y = settings
+                .get("zcraft_base_y")
+                .and_then(Tag::as_int)
+                .unwrap_or(MIN_Y);
+            let raw_layers = settings.get("layers")?.as_list()?;
+            let mut layers = Vec::with_capacity(raw_layers.len());
+            for entry in raw_layers {
+                let map = entry.as_compound()?;
+                let block = map.get("block")?.as_str()?.to_string();
+                let height = u16::try_from(map.get("height")?.as_int()?).ok()?;
+                layers.push(FlatLayerConfig { block, height });
+            }
+            let cfg = FlatGeneratorConfig {
+                base_y,
+                biome,
+                layers,
+            };
+            cfg.validate().ok()?;
+            Some(LoadedGenerator::Flat(cfg))
+        }
+        _ => None,
     }
-    let settings = generator.get("settings")?.as_compound()?;
-    let biome = settings
-        .get("biome")
-        .and_then(Tag::as_str)
-        .unwrap_or("minecraft:plains")
-        .to_string();
-    let base_y = settings
-        .get("zcraft_base_y")
-        .and_then(Tag::as_int)
-        .unwrap_or(MIN_Y);
-    let raw_layers = settings.get("layers")?.as_list()?;
-    let mut layers = Vec::with_capacity(raw_layers.len());
-    for entry in raw_layers {
-        let map = entry.as_compound()?;
-        let block = map.get("block")?.as_str()?.to_string();
-        let height = u16::try_from(map.get("height")?.as_int()?).ok()?;
-        layers.push(FlatLayerConfig { block, height });
-    }
-    let cfg = FlatGeneratorConfig {
-        base_y,
-        biome,
-        layers,
-    };
-    cfg.validate().ok()?;
-    Some(cfg)
 }
 
 fn region_slot(cx: i32, cz: i32) -> usize {
@@ -677,6 +703,37 @@ fn encode_chunk_anvil(cx: i32, cz: i32, chunk: &Chunk) -> io::Result<Vec<u8>> {
         sections.push(Tag::Compound(sec_map));
     }
 
+    let mut be_list = Vec::with_capacity(chunk.block_entities().len());
+    for (&[x, y, z], entity) in chunk.block_entities() {
+        let BlockEntity::Chest { items } = entity;
+        let mut items_nbt = Vec::new();
+        for (slot, stack) in items.iter().enumerate() {
+            let Some(stack) = stack else {
+                continue;
+            };
+            let Some(def) = item_by_id(stack.item) else {
+                continue;
+            };
+            let mut item_map = Compound::new();
+            item_map.insert("Slot".into(), Tag::Byte(slot as i8));
+            item_map.insert("id".into(), Tag::String(def.name.clone()));
+            item_map.insert("count".into(), Tag::Int(i32::from(stack.count)));
+            if stack.damage > 0 {
+                let mut components = Compound::new();
+                components.insert("minecraft:damage".into(), Tag::Int(stack.damage as i32));
+                item_map.insert("components".into(), Tag::Compound(components));
+            }
+            items_nbt.push(Tag::Compound(item_map));
+        }
+        let mut be_map = Compound::new();
+        be_map.insert("id".into(), Tag::String("minecraft:chest".into()));
+        be_map.insert("x".into(), Tag::Int(x));
+        be_map.insert("y".into(), Tag::Int(y));
+        be_map.insert("z".into(), Tag::Int(z));
+        be_map.insert("Items".into(), Tag::List(items_nbt));
+        be_list.push(Tag::Compound(be_map));
+    }
+
     let mut root = Compound::new();
     root.insert("DataVersion".into(), Tag::Int(DATA_VERSION_1_21_1));
     root.insert("xPos".into(), Tag::Int(cx));
@@ -684,6 +741,9 @@ fn encode_chunk_anvil(cx: i32, cz: i32, chunk: &Chunk) -> io::Result<Vec<u8>> {
     root.insert("yPos".into(), Tag::Int(LOWEST_SECTION_Y));
     root.insert("Status".into(), Tag::String("minecraft:full".into()));
     root.insert("sections".into(), Tag::List(sections));
+    if !be_list.is_empty() {
+        root.insert("block_entities".into(), Tag::List(be_list));
+    }
 
     let raw_nbt = write_named_nbt("", &root)?;
     let mut encoder = ZlibEncoder::new(
@@ -844,7 +904,62 @@ fn decode_chunk_sections(root: &Compound) -> Chunk {
         }
         sections[sec_idx] = ChunkSection::from_dense(blocks, biomes);
     }
-    Chunk::from_sections(sections)
+    let mut chunk = Chunk::from_sections(sections);
+    if let Some(be_list) = root.get("block_entities").and_then(Tag::as_list) {
+        for be_tag in be_list {
+            let Some(be_map) = be_tag.as_compound() else {
+                continue;
+            };
+            if be_map.get("id").and_then(Tag::as_str) != Some("minecraft:chest") {
+                continue;
+            }
+            let (Some(x), Some(y), Some(z)) = (
+                be_map.get("x").and_then(Tag::as_int),
+                be_map.get("y").and_then(Tag::as_int),
+                be_map.get("z").and_then(Tag::as_int),
+            ) else {
+                continue;
+            };
+            let mut items = Box::new([None; CHEST_SLOTS]);
+            if let Some(raw_items) = be_map.get("Items").and_then(Tag::as_list) {
+                for item_tag in raw_items {
+                    let Some(item_map) = item_tag.as_compound() else {
+                        continue;
+                    };
+                    let Some(slot) = item_map
+                        .get("Slot")
+                        .and_then(Tag::as_byte)
+                        .and_then(|s| usize::try_from(s).ok())
+                        .filter(|&s| s < CHEST_SLOTS)
+                    else {
+                        continue;
+                    };
+                    let Some(id_str) = item_map.get("id").and_then(Tag::as_str) else {
+                        continue;
+                    };
+                    let Some(def) = item_by_name(id_str) else {
+                        continue;
+                    };
+                    let count = item_map
+                        .get("count")
+                        .and_then(Tag::as_int)
+                        .or_else(|| item_map.get("Count").and_then(Tag::as_byte).map(i32::from))
+                        .unwrap_or(1)
+                        .clamp(1, i32::from(def.max_stack)) as u8;
+                    let damage = item_map
+                        .get("components")
+                        .and_then(Tag::as_compound)
+                        .and_then(|c| c.get("minecraft:damage"))
+                        .and_then(Tag::as_int)
+                        .unwrap_or(0)
+                        .max(0) as u32;
+                    items[slot] = ItemStack::with_damage(def.id, count, damage);
+                }
+            }
+            chunk.set_block_entity([x, y, z], BlockEntity::Chest { items });
+        }
+    }
+    chunk
 }
 
 #[cfg(test)]
@@ -868,11 +983,14 @@ mod tests {
             thunder_time: 9_000,
         };
         storage
-            .save_level(clock, Some(generator.config()), [8.5, 65.0, 8.5])
+            .save_level(clock, Some(generator.config()), None, [8.5, 65.0, 8.5])
             .unwrap();
         let loaded_level = storage.load_level().unwrap().unwrap();
         assert_eq!(loaded_level.clock, clock);
-        assert_eq!(loaded_level.flat.as_ref(), Some(generator.config()));
+        assert_eq!(
+            loaded_level.generator,
+            Some(LoadedGenerator::Flat(generator.config().clone()))
+        );
 
         // 2. Lazy single-chunk load/save across regions with block state properties & biomes
         let mut c0 = (*generator.generate_chunk(0, 0)).clone();

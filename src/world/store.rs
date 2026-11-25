@@ -186,10 +186,58 @@ impl ChunkStore {
         }
         let changed = Arc::make_mut(chunk).set_block(lx, y, lz, state);
         if changed {
+            if !is_chest_state(state) {
+                Arc::make_mut(chunk).remove_block_entity(pos.0);
+            }
             self.dirty.insert(coords);
             self.touch(coords);
         }
         changed
+    }
+
+    pub(crate) fn chest_items(
+        &mut self,
+        pos: BlockPos,
+    ) -> Option<[Option<crate::game::ItemStack>; super::CHEST_SLOTS]> {
+        let coords = pos.chunk();
+        let chunk = self.get_or_load(coords);
+        let (lx, y, lz) = pos.local();
+        if !is_chest_state(chunk.get_block(lx, y, lz)) {
+            return None;
+        }
+        match chunk.block_entity(pos.0) {
+            Some(super::BlockEntity::Chest { items }) => Some(**items),
+            None => Some([None; super::CHEST_SLOTS]),
+        }
+    }
+
+    pub(crate) fn update_chest(
+        &mut self,
+        pos: BlockPos,
+        mutate: impl FnOnce(&mut [Option<crate::game::ItemStack>; super::CHEST_SLOTS]) -> bool,
+    ) -> Option<[Option<crate::game::ItemStack>; super::CHEST_SLOTS]> {
+        let coords = pos.chunk();
+        let _ = self.get_or_load(coords);
+        let chunk = self.chunks.get_mut(&coords).expect("chunk just loaded");
+        let (lx, y, lz) = pos.local();
+        if !is_chest_state(chunk.get_block(lx, y, lz)) {
+            return None;
+        }
+        let mut items = match chunk.block_entity(pos.0) {
+            Some(super::BlockEntity::Chest { items }) => **items,
+            None => [None; super::CHEST_SLOTS],
+        };
+        if mutate(&mut items) {
+            Arc::make_mut(chunk).set_block_entity(
+                pos.0,
+                super::BlockEntity::Chest {
+                    items: Box::new(items),
+                },
+            );
+            self.dirty.insert(coords);
+            self.touch(coords);
+        }
+        Some(items)
     }
 
     pub(crate) fn drain_dirty(&mut self) -> Vec<([i32; 2], Arc<Chunk>)> {
@@ -203,6 +251,14 @@ impl ChunkStore {
     pub(crate) fn mark_dirty(&mut self, chunks: impl IntoIterator<Item = [i32; 2]>) {
         self.dirty.extend(chunks);
     }
+}
+
+pub(crate) fn is_chest_state(state: i32) -> bool {
+    crate::game::registry()
+        .state_by_id(state)
+        .is_some_and(|(_, def, _)| {
+            def.name == "minecraft:chest" || def.name == "minecraft:trapped_chest"
+        })
 }
 
 #[cfg(test)]

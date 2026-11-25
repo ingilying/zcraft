@@ -67,6 +67,16 @@ impl Inventory {
     pub fn carried(&self) -> Option<ItemStack> {
         self.carried
     }
+    pub fn set_slot(&mut self, slot: usize, item: Option<ItemStack>) {
+        if slot < SLOT_COUNT {
+            self.slots[slot] = item;
+            self.changed();
+        }
+    }
+    pub fn set_carried(&mut self, item: Option<ItemStack>) {
+        self.carried = item;
+        self.changed();
+    }
     pub fn state_id(&self) -> i32 {
         self.state_id
     }

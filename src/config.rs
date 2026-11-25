@@ -28,6 +28,14 @@ impl GameMode {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorldType {
+    #[default]
+    Flat,
+    Overworld,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -57,6 +65,12 @@ pub struct Config {
     /// When omitted, the world runs in memory only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub world_dir: Option<String>,
+    /// Terrain generator type: `flat` (default) or `overworld`.
+    #[serde(default)]
+    pub world_type: WorldType,
+    /// Optional world seed (used when `world_type = "overworld"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
     /// Optional Superflat generator preset (used when creating a new world or in memory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flat: Option<crate::world::FlatGeneratorConfig>,
@@ -129,6 +143,8 @@ impl Default for Config {
             resource_pack: None,
             ops: Vec::new(),
             world_dir: None,
+            world_type: WorldType::default(),
+            seed: None,
             flat: None,
         }
     }
@@ -164,7 +180,8 @@ impl Config {
              # Optional operator usernames or UUIDs (permission level 4):\n\
              # ops = [\"YourName\"]\n\n\
              # Optional Anvil world persistence directory (level.dat, region/*.mca, playerdata/*.dat):\n\
-             # world_dir = \"world\"\n\n\
+             # world_dir = \"world\"\n\
+             # Set world_type = \"overworld\" and optional seed = 2026 for natural terrain.\n\n\
              # Optional Superflat terrain preset (default: y=60 bedrock, 2x dirt, grass_block):\n\
              # [flat]\n\
              # base_y = -64\n\

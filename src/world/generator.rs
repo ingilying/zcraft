@@ -33,6 +33,11 @@ pub trait ChunkGenerator: Send + Sync + fmt::Debug {
     fn flat_config(&self) -> Option<&FlatGeneratorConfig> {
         None
     }
+
+    /// Optional Overworld noise seed for `level.dat` serialization.
+    fn overworld_seed(&self) -> Option<i64> {
+        None
+    }
 }
 
 /// One horizontal layer in a Superflat preset, stacked bottom-up from `base_y`.

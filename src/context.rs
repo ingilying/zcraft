@@ -17,13 +17,32 @@ impl ServerContext {
             configuration = configuration.with_resource_pack(pack.clone())?;
         }
         let world = if let Some(dir) = &config.world_dir {
-            std::sync::Arc::new(crate::world::World::open(dir, config.flat.clone())?)
-        } else if let Some(flat) = &config.flat {
-            std::sync::Arc::new(crate::world::World::with_generator(std::sync::Arc::new(
-                crate::world::FlatGenerator::from_config(flat.clone())?,
-            )))
+            std::sync::Arc::new(crate::world::World::open_with(
+                dir,
+                config.world_type,
+                config.seed,
+                config.flat.clone(),
+            )?)
         } else {
-            std::sync::Arc::new(crate::world::World::new())
+            match config.world_type {
+                crate::config::WorldType::Overworld => {
+                    let seed = config.seed.unwrap_or_else(rand::random);
+                    std::sync::Arc::new(crate::world::World::with_generator(std::sync::Arc::new(
+                        crate::world::OverworldGenerator::new(seed),
+                    )))
+                }
+                crate::config::WorldType::Flat => {
+                    if let Some(flat) = &config.flat {
+                        std::sync::Arc::new(crate::world::World::with_generator(
+                            std::sync::Arc::new(crate::world::FlatGenerator::from_config(
+                                flat.clone(),
+                            )?),
+                        ))
+                    } else {
+                        std::sync::Arc::new(crate::world::World::new())
+                    }
+                }
+            }
         };
         Ok(Self {
             status: StatusService::from_config(config)?,

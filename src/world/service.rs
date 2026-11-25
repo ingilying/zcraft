@@ -78,35 +78,61 @@ impl World {
         }
     }
 
-    /// Open (or initialize) a persisted Anvil world directory.
-    /// Existing `level.dat` generator settings take precedence over `flat_config`.
-    /// Chunks are loaded lazily from `region/*.mca` on demand (O(1) startup).
+    /// Open (or initialize) a persisted Anvil world directory (defaulting to Superflat).
     pub fn open(
         dir: impl AsRef<Path>,
+        flat_config: Option<FlatGeneratorConfig>,
+    ) -> io::Result<Self> {
+        Self::open_with(dir, crate::config::WorldType::Flat, None, flat_config)
+    }
+
+    /// Open (or initialize) a persisted Anvil world directory with explicit
+    /// generator type (`Flat` or `Overworld`) and optional seed.
+    /// Existing `level.dat` generator settings take precedence on reload.
+    pub fn open_with(
+        dir: impl AsRef<Path>,
+        world_type: crate::config::WorldType,
+        seed: Option<i64>,
         flat_config: Option<FlatGeneratorConfig>,
     ) -> io::Result<Self> {
         let storage = AnvilStorage::new(dir.as_ref());
         let loaded = storage.load_level()?;
 
-        let effective_flat = loaded
+        let generator: Arc<dyn ChunkGenerator> = match loaded
             .as_ref()
-            .and_then(|l| l.flat.clone())
-            .or(flat_config)
-            .unwrap_or_default();
-        let flat_gen = FlatGenerator::from_config(effective_flat)?;
+            .and_then(|l| l.generator.clone())
+        {
+            Some(super::LoadedGenerator::Overworld { seed }) => {
+                Arc::new(super::OverworldGenerator::new(seed))
+            }
+            Some(super::LoadedGenerator::Flat(cfg)) => Arc::new(FlatGenerator::from_config(cfg)?),
+            None => match world_type {
+                crate::config::WorldType::Overworld => {
+                    let seed = seed.unwrap_or_else(rand::random);
+                    Arc::new(super::OverworldGenerator::new(seed))
+                }
+                crate::config::WorldType::Flat => {
+                    Arc::new(FlatGenerator::from_config(flat_config.unwrap_or_default())?)
+                }
+            },
+        };
         let spawn = loaded
             .as_ref()
             .and_then(|l| l.spawn)
-            .unwrap_or_else(|| flat_gen.spawn_position());
+            .unwrap_or_else(|| generator.spawn_position());
         let clock = loaded
             .as_ref()
             .map_or_else(WorldClock::new, |l| WorldClock::from_persisted(l.clock));
 
         if loaded.is_none() {
-            storage.save_level(clock.persisted_state(), Some(flat_gen.config()), spawn)?;
+            storage.save_level(
+                clock.persisted_state(),
+                generator.flat_config(),
+                generator.overworld_seed(),
+                spawn,
+            )?;
         }
 
-        let generator: Arc<dyn ChunkGenerator> = Arc::new(flat_gen);
         let placeholder_terrain = generator
             .default_terrain_payload()
             .cloned()
@@ -132,6 +158,10 @@ impl World {
         self.generator.flat_config()
     }
 
+    pub fn overworld_seed(&self) -> Option<i64> {
+        self.generator.overworld_seed()
+    }
+
     /// Placeholder terrain buffer used by `ChunkStream::pump` before
     /// `prepare_chunk` fills in the authoritative per-chunk payload.
     pub fn terrain(&self) -> &Arc<[u8]> {
@@ -151,6 +181,33 @@ impl World {
             .lock()
             .expect("chunk store poisoned")
             .get_block(pos)
+    }
+
+    pub fn chest_items(
+        &self,
+        pos: BlockPos,
+    ) -> Option<[Option<crate::game::ItemStack>; super::CHEST_SLOTS]> {
+        if !pos.valid() {
+            return None;
+        }
+        self.store
+            .lock()
+            .expect("chunk store poisoned")
+            .chest_items(pos)
+    }
+
+    pub fn update_chest(
+        &self,
+        pos: BlockPos,
+        mutate: impl FnOnce(&mut [Option<crate::game::ItemStack>; super::CHEST_SLOTS]) -> bool,
+    ) -> Option<[Option<crate::game::ItemStack>; super::CHEST_SLOTS]> {
+        if !pos.valid() {
+            return None;
+        }
+        self.store
+            .lock()
+            .expect("chunk store poisoned")
+            .update_chest(pos, mutate)
     }
 
     /// Persist `level.dat` and all dirty chunks to Anvil `region/*.mca`.
@@ -177,7 +234,12 @@ impl World {
         let dirty_coords: Vec<[i32; 2]> = dirty.iter().map(|(c, _)| *c).collect();
 
         let write_result = (|| -> io::Result<usize> {
-            storage.save_level(clock_state, self.generator.flat_config(), self.spawn)?;
+            storage.save_level(
+                clock_state,
+                self.generator.flat_config(),
+                self.generator.overworld_seed(),
+                self.spawn,
+            )?;
             storage.save_chunks(&dirty)
         })();
 

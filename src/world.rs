@@ -24,16 +24,20 @@ mod clock;
 mod generator;
 mod light;
 mod nbt;
+mod overworld;
 mod service;
 mod store;
-pub use anvil::{AnvilStorage, SavedPlayer};
-pub use chunk::{BiomeStorage, BlockPos, BlockStorage, Chunk, ChunkSection};
+pub use anvil::{AnvilStorage, LoadedGenerator, SavedPlayer};
+pub use chunk::{
+    BiomeStorage, BlockEntity, BlockPos, BlockStorage, CHEST_SLOTS, Chunk, ChunkSection,
+};
 pub use clock::{
     DAY_LENGTH, INITIAL_DAY_TIME, PersistedClock, TICK_INTERVAL, TICKS_PER_SECOND,
     TIME_SYNC_INTERVAL, TickEvents, TimeSnapshot, WeatherEvent, WeatherSnapshot, WorldClock,
 };
 pub use generator::{ChunkGenerator, FlatGenerator, FlatGeneratorConfig, FlatLayerConfig};
 pub(crate) use light::{Neighborhood, affected_light_chunks, chunk_light, is_uniform_template};
+pub use overworld::{OverworldGenerator, SEA_LEVEL};
 pub use service::{SaveSummary, World, WorldMutation};
 pub(crate) use store::ChunkStore;
 
