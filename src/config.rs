@@ -122,6 +122,37 @@ impl Default for Config {
 }
 
 impl Config {
+    fn default_toml() -> io::Result<String> {
+        #[derive(Serialize)]
+        struct OptionalDefaults {
+            resource_pack: ResourcePackConfig,
+        }
+
+        let defaults = toml::to_string_pretty(&Self::default()).map_err(io::Error::other)?;
+        let optional = toml::to_string_pretty(&OptionalDefaults {
+            resource_pack: ResourcePackConfig {
+                id: "00000000-0000-0000-0000-000000000001".into(),
+                url: "https://example.org/pack.zip".into(),
+                sha1: "0123456789012345678901234567890123456789".into(),
+                required: false,
+                prompt: Some("Load server resource pack?".into()),
+            },
+        })
+        .map_err(io::Error::other)?;
+        let commented_optional = optional
+            .lines()
+            .map(|line| format!("# {line}\n"))
+            .collect::<String>();
+        Ok(format!(
+            "# ZCraft server configuration. Restart after editing.\n\
+             # io_timeout_seconds is a complete read/write deadline (1..=86400).\n\
+             # compression_threshold is in bytes; -1 disables compression.\n\n\
+             {defaults}\n\
+             # Optional server resource pack (uncomment and configure to enable):\n\
+             {commented_optional}"
+        ))
+    }
+
     /// Read existing files unchanged; publish defaults atomically only if absent.
     pub fn load_or_create(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
@@ -133,13 +164,7 @@ impl Config {
                     if fs::symlink_metadata(path).is_ok() {
                         return Err(error);
                     }
-                    let defaults =
-                        toml::to_string_pretty(&Self::default()).map_err(io::Error::other)?;
-                    let contents = format!(
-                        "# ZCraft server configuration. Restart after editing.\n\
-                         # io_timeout_seconds is a complete read/write deadline (1..=86400).\n\
-                         # compression_threshold is in bytes; -1 disables compression.\n\n{defaults}"
-                    );
+                    let contents = Self::default_toml()?;
                     let parent = path
                         .parent()
                         .filter(|p| !p.as_os_str().is_empty())

@@ -174,7 +174,7 @@ Configuration 解码、状态校验或读取超时错误会尽力发送明确的
 11 个动态注册表及 Update Tags；如配置资源包则等待协商完成，再发送 Finish Configuration，
 收到确认才切换为 Play。同时接收客户端语言、视距、皮肤部件设置和可选插件消息。
 
-默认不请求资源包。可在 `zcraft.toml` 末尾添加以下配置（替换 URL、UUID 及 SHA-1）：
+默认不请求资源包。自动生成的 `zcraft.toml` 末尾已包含注释掉的 `[resource_pack]` 模板，取消注释并替换 URL、UUID 及 SHA-1 即可启用：
 
 ```toml
 [resource_pack]

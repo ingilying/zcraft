@@ -19,8 +19,37 @@ fn missing_file_generates_roundtrippable_defaults() {
     assert!(contents.contains("max_view_distance = 2"));
     assert!(contents.contains("game_mode = \"spectator\""));
     assert!(contents.contains("offline_mode = false"));
+    assert!(contents.contains("# [resource_pack]"));
+    assert!(contents.contains("# id = "));
+    assert!(contents.contains("# url = "));
+    assert!(contents.contains("# sha1 = "));
+    assert!(contents.contains("# required = false"));
+    assert!(contents.contains("# prompt = "));
     assert_eq!(Config::load_or_create(&path).unwrap(), config);
-    assert_eq!(fs::read_to_string(path).unwrap(), contents);
+    assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+
+    // Uncommenting the optional resource_pack template produces a valid config.
+    let uncommented = contents
+        .lines()
+        .map(|line| {
+            if line.starts_with("# [resource_pack]")
+                || line.starts_with("# id = ")
+                || line.starts_with("# url = ")
+                || line.starts_with("# sha1 = ")
+                || line.starts_with("# required = ")
+                || line.starts_with("# prompt = ")
+            {
+                line.strip_prefix("# ").unwrap()
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let enabled_path = dir.path().join("enabled.toml");
+    fs::write(&enabled_path, uncommented).unwrap();
+    let enabled = Config::load_or_create(&enabled_path).unwrap();
+    assert!(enabled.resource_pack.is_some());
 }
 
 #[test]
