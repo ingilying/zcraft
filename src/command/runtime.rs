@@ -330,6 +330,45 @@ impl CommandHost for RuntimeHost<'_> {
     fn execution(&mut self) -> Option<&mut dyn ExecutionControl> {
         Some(self)
     }
+    fn world_time(&mut self) -> io::Result<(i64, i64)> {
+        self.host.world_time()
+    }
+    fn set_time(&mut self, day_time: i64) -> io::Result<i64> {
+        self.host.set_time(day_time)
+    }
+    fn set_weather(&mut self, raining: bool, thundering: bool, duration: u32) -> io::Result<()> {
+        self.host.set_weather(raining, thundering, duration)
+    }
+    fn set_block(&mut self, pos: [i32; 3], state: i32) -> io::Result<bool> {
+        self.host.set_block(pos, state)
+    }
+    fn fill_blocks(&mut self, from: [i32; 3], to: [i32; 3], state: i32) -> io::Result<usize> {
+        self.host.fill_blocks(from, to, state)
+    }
+    fn teleport_player(
+        &mut self,
+        uuid: Uuid,
+        position: [f64; 3],
+        yaw: Option<f32>,
+        pitch: Option<f32>,
+    ) -> io::Result<bool> {
+        self.host.teleport_player(uuid, position, yaw, pitch)
+    }
+    fn give_item(&mut self, uuid: Uuid, item: i32, count: u32) -> io::Result<bool> {
+        self.host.give_item(uuid, item, count)
+    }
+    fn set_game_mode(&mut self, uuid: Uuid, mode: crate::config::GameMode) -> io::Result<bool> {
+        self.host.set_game_mode(uuid, mode)
+    }
+    fn set_op(&mut self, target: &str, op: bool) -> io::Result<CommandResult> {
+        self.host.set_op(target, op)
+    }
+    fn kick_player(&mut self, uuid: Uuid, reason: &str) -> io::Result<bool> {
+        self.host.kick_player(uuid, reason)
+    }
+    fn request_shutdown(&mut self) -> io::Result<bool> {
+        self.host.request_shutdown()
+    }
 }
 impl ExecutionControl for RuntimeHost<'_> {
     fn enqueue(&mut self, input: &str) -> Result<(), ExecutionFailure> {

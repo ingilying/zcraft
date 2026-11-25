@@ -1,6 +1,6 @@
 use crate::{
     context::{Context, ServerContext},
-    handler::{Dispatcher, Session, login::LoginService, status::StatusService},
+    handler::{Dispatcher, Session},
     players::Inbox,
     protocol::{Clientbound, State, decode, packets::login::SetCompression},
     transport::Transport,
@@ -29,20 +29,7 @@ pub async fn serve(
     config: Config,
     shutdown: impl Future<Output = ()>,
 ) -> io::Result<()> {
-    config.validate()?;
-    let mut configuration = crate::handler::configuration::ConfigurationService::new();
-    if let Some(pack) = &config.resource_pack {
-        configuration = configuration.with_resource_pack(pack.clone())?;
-    }
-    let server = Arc::new(ServerContext {
-        status: StatusService::from_config(&config)?,
-        login: LoginService::from_config(&config).await?,
-        configuration,
-        play: crate::handler::play::PlayService::with_options(
-            config.max_view_distance,
-            config.game_mode,
-        )?,
-    });
+    let server = Arc::new(ServerContext::from_config(&config).await?);
     serve_validated(listener, config, server, shutdown).await
 }
 
@@ -322,6 +309,9 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
             Ok(ConnectionEvent::Tick) => crate::handler::play::tick(&mut session, Instant::now()),
             Ok(ConnectionEvent::Chunks) => {
                 crate::handler::play::stream_chunks(&mut session, &server.play, Instant::now())
+            }
+            Ok(ConnectionEvent::Broadcast(crate::players::Delivery::Control(control))) => {
+                crate::handler::play::apply_control(&mut session, &server.play, control)
             }
             Ok(ConnectionEvent::Broadcast(delivery)) => {
                 let writing_until = Instant::now() + deadline;

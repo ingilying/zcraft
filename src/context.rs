@@ -9,6 +9,25 @@ pub struct ServerContext {
 }
 
 impl ServerContext {
+    /// Assemble all default services from a validated server configuration.
+    pub async fn from_config(config: &crate::config::Config) -> std::io::Result<Self> {
+        config.validate()?;
+        let mut configuration = crate::handler::configuration::ConfigurationService::new();
+        if let Some(pack) = &config.resource_pack {
+            configuration = configuration.with_resource_pack(pack.clone())?;
+        }
+        Ok(Self {
+            status: StatusService::from_config(config)?,
+            login: LoginService::from_config(config).await?,
+            configuration,
+            play: crate::handler::play::PlayService::with_options(
+                config.max_view_distance,
+                config.game_mode,
+            )?
+            .with_ops(config.ops.clone()),
+        })
+    }
+
     /// Execute a trusted server command without a player connection. Permission
     /// and source are assigned by the caller, never taken from a client packet.
     pub fn execute_command(
@@ -81,6 +100,113 @@ impl<H: crate::command::CommandHost> crate::command::CommandHost for ServerComma
         &mut self,
     ) -> std::io::Result<Vec<crate::command::arguments::EntitySnapshot>> {
         Ok(self.server.command_entities())
+    }
+    fn world_time(&mut self) -> std::io::Result<(i64, i64)> {
+        Ok(self.server.play.world_time())
+    }
+    fn set_time(&mut self, day_time: i64) -> std::io::Result<i64> {
+        let packet = self.server.play.set_day_time(day_time);
+        let _ = self.server.players().broadcast(&packet.into());
+        Ok(packet.time_of_day)
+    }
+    fn set_weather(
+        &mut self,
+        raining: bool,
+        thundering: bool,
+        duration: u32,
+    ) -> std::io::Result<()> {
+        for packet in self.server.play.set_weather(raining, thundering, duration) {
+            let _ = self.server.players().broadcast(&packet);
+        }
+        Ok(())
+    }
+    fn set_block(&mut self, pos: [i32; 3], state: i32) -> std::io::Result<bool> {
+        self.server
+            .play
+            .set_block(self.server.players(), crate::world::BlockPos(pos), state)
+    }
+    fn fill_blocks(&mut self, from: [i32; 3], to: [i32; 3], state: i32) -> std::io::Result<usize> {
+        self.server.play.fill_blocks(
+            self.server.players(),
+            crate::world::BlockPos(from),
+            crate::world::BlockPos(to),
+            state,
+        )
+    }
+    fn teleport_player(
+        &mut self,
+        uuid: uuid::Uuid,
+        position: [f64; 3],
+        yaw: Option<f32>,
+        pitch: Option<f32>,
+    ) -> std::io::Result<bool> {
+        Ok(self.server.players().send_control(
+            uuid,
+            crate::players::PlayerControl::Teleport {
+                position,
+                yaw,
+                pitch,
+            },
+        ))
+    }
+    fn give_item(&mut self, uuid: uuid::Uuid, item: i32, count: u32) -> std::io::Result<bool> {
+        Ok(self
+            .server
+            .players()
+            .send_control(uuid, crate::players::PlayerControl::Give { item, count }))
+    }
+    fn set_game_mode(
+        &mut self,
+        uuid: uuid::Uuid,
+        mode: crate::config::GameMode,
+    ) -> std::io::Result<bool> {
+        Ok(self
+            .server
+            .players()
+            .send_control(uuid, crate::players::PlayerControl::SetGameMode(mode)))
+    }
+    fn set_op(&mut self, target: &str, op: bool) -> std::io::Result<crate::command::CommandResult> {
+        let online = self.server.players().find_player_by_name(target);
+        let key = online
+            .as_ref()
+            .map(|(_, name)| name.as_str())
+            .unwrap_or(target);
+        if uuid::Uuid::parse_str(key).is_err() && !crate::auth::valid_username(key) {
+            return Ok(crate::command::CommandResult::failure(
+                "Invalid player name or UUID.",
+            ));
+        }
+        let changed = if op {
+            self.server.play.add_op(key)
+        } else {
+            self.server.play.remove_op(key)
+        };
+        if let Some((uuid, _)) = online {
+            self.server
+                .players()
+                .send_control(uuid, crate::players::PlayerControl::RefreshCommands);
+        }
+        if !changed {
+            return Ok(crate::command::CommandResult::failure(if op {
+                format!("{key} is already an operator.")
+            } else {
+                format!("{key} is not an operator.")
+            }));
+        }
+        Ok(crate::command::CommandResult::message(if op {
+            format!("Made {key} a server operator.")
+        } else {
+            format!("Made {key} no longer a server operator.")
+        }))
+    }
+    fn kick_player(&mut self, uuid: uuid::Uuid, reason: &str) -> std::io::Result<bool> {
+        Ok(self
+            .server
+            .players()
+            .send_control(uuid, crate::players::PlayerControl::Kick(reason.into())))
+    }
+    fn request_shutdown(&mut self) -> std::io::Result<bool> {
+        Ok(self.server.play.request_shutdown())
     }
 }
 

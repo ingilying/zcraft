@@ -99,6 +99,78 @@ pub trait CommandHost {
     fn execution(&mut self) -> Option<&mut dyn ExecutionControl> {
         None
     }
+    fn world_time(&mut self) -> io::Result<(i64, i64)> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "World clock is unavailable.",
+        ))
+    }
+    fn set_time(&mut self, _day_time: i64) -> io::Result<i64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "World clock is unavailable.",
+        ))
+    }
+    fn set_weather(&mut self, _raining: bool, _thundering: bool, _duration: u32) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Weather control is unavailable.",
+        ))
+    }
+    fn set_block(&mut self, _pos: [i32; 3], _state: i32) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Block editing is unavailable.",
+        ))
+    }
+    fn fill_blocks(&mut self, _from: [i32; 3], _to: [i32; 3], _state: i32) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Block editing is unavailable.",
+        ))
+    }
+    fn teleport_player(
+        &mut self,
+        _uuid: Uuid,
+        _position: [f64; 3],
+        _yaw: Option<f32>,
+        _pitch: Option<f32>,
+    ) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Player teleportation is unavailable.",
+        ))
+    }
+    fn give_item(&mut self, _uuid: Uuid, _item: i32, _count: u32) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Inventory modification is unavailable.",
+        ))
+    }
+    fn set_game_mode(&mut self, _uuid: Uuid, _mode: crate::config::GameMode) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Game mode switching is unavailable.",
+        ))
+    }
+    fn set_op(&mut self, _target: &str, _op: bool) -> io::Result<CommandResult> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Operator management is unavailable.",
+        ))
+    }
+    fn kick_player(&mut self, _uuid: Uuid, _reason: &str) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Player kicking is unavailable.",
+        ))
+    }
+    fn request_shutdown(&mut self) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Server shutdown is unavailable.",
+        ))
+    }
 }
 
 /// Custom types can be used for server-only nodes, or provide a verified

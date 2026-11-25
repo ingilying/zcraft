@@ -217,18 +217,26 @@ fn wire_tree_uses_validated_arguments_and_permission_filter() {
                 let parser = r.varint().unwrap();
                 types.push(parser);
                 match parser {
-                    0 => {}
+                    0 | 8 | 10 | 12 | 14 => {}
                     3 => {
-                        assert_eq!(r.take(1).unwrap(), [3]);
-                        assert_eq!(
-                            r.take(8).unwrap(),
-                            [&(-5i32).to_be_bytes()[..], &5i32.to_be_bytes()[..]].concat()
-                        );
+                        let range_flags = r.take(1).unwrap()[0];
+                        if range_flags & 1 != 0 {
+                            r.take(4).unwrap();
+                        }
+                        if range_flags & 2 != 0 {
+                            r.take(4).unwrap();
+                        }
                     }
                     5 => {
                         assert!((0..=2).contains(&r.varint().unwrap()));
                     }
-                    _ => panic!("unexpected parser"),
+                    6 => {
+                        let _ = r.take(1).unwrap()[0];
+                    }
+                    other => panic!("unexpected parser {other}"),
+                }
+                if flags & 0x10 != 0 {
+                    let _ = r.string(64).unwrap();
                 }
             }
         }
