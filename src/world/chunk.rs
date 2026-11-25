@@ -477,9 +477,56 @@ impl Chunk {
         let sections = self.encode_sections();
         put_varint(sections.len() as i32, &mut out);
         out.extend_from_slice(&sections);
-        put_varint(0, &mut out); // Block entity count.
+        let block_entities = self.collect_wire_block_entities();
+        put_varint(block_entities.len() as i32, &mut out);
+        for (packed_xz, y, type_id) in block_entities {
+            out.push(packed_xz);
+            out.extend_from_slice(&y.to_be_bytes());
+            put_varint(type_id, &mut out);
+            // Empty anonymous TAG_Compound (0x0a 0x00): sufficient for vanilla
+            // 1.21.1 client BlockEntity rendering (beds, chests, shulkers, etc.).
+            out.extend_from_slice(&[0x0a, 0x00]);
+        }
         out.extend_from_slice(light);
         out.into()
+    }
+
+    fn collect_wire_block_entities(&self) -> Vec<(u8, i16, i32)> {
+        let mut out = Vec::new();
+        for (sec_idx, section) in self.sections.iter().enumerate() {
+            if section.is_empty() {
+                continue;
+            }
+            let base_y = MIN_Y + (sec_idx * 16) as i32;
+            match section.blocks() {
+                BlockStorage::Single(state) => {
+                    if let Some(type_id) = wire_block_entity_type(*state) {
+                        for ly in 0..16 {
+                            let y = (base_y + ly) as i16;
+                            for lz in 0..16u8 {
+                                for lx in 0..16u8 {
+                                    out.push(((lx << 4) | lz, y, type_id));
+                                }
+                            }
+                        }
+                    }
+                }
+                BlockStorage::Dense(arr) => {
+                    for (idx, &state) in arr.iter().enumerate() {
+                        if state == crate::game::AIR_STATE {
+                            continue;
+                        }
+                        if let Some(type_id) = wire_block_entity_type(state) {
+                            let ly = (idx / 256) as i32;
+                            let lz = ((idx / 16) % 16) as u8;
+                            let lx = (idx % 16) as u8;
+                            out.push(((lx << 4) | lz, (base_y + ly) as i16, type_id));
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Compute block differences between `old` and `self` for reconciliation.
@@ -511,6 +558,33 @@ impl Chunk {
             }
         }
         changes
+    }
+}
+
+/// Official Java 1.21.1 `minecraft:block_entity_type` protocol IDs for blocks
+/// whose client rendering depends on a `BlockEntity` existing in `ChunkData`.
+fn wire_block_entity_type(state: i32) -> Option<i32> {
+    let (_, def, _) = crate::game::registry().state_by_id(state)?;
+    let path = def.name.strip_prefix("minecraft:").unwrap_or(&def.name);
+    match path {
+        "chest" => Some(1),
+        "trapped_chest" => Some(2),
+        "ender_chest" => Some(3),
+        "enchanting_table" => Some(12),
+        "end_portal" => Some(13),
+        "beacon" => Some(14),
+        "end_gateway" => Some(21),
+        "conduit" => Some(25),
+        "bell" => Some(30),
+        "campfire" | "soul_campfire" => Some(32),
+        "decorated_pot" => Some(40),
+        _ if path.ends_with("_bed") => Some(24),
+        _ if path.ends_with("shulker_box") => Some(23),
+        _ if path.ends_with("_banner") => Some(19),
+        _ if path.ends_with("_hanging_sign") => Some(8),
+        _ if path.ends_with("_sign") => Some(7),
+        _ if path.ends_with("_head") || path.ends_with("_skull") => Some(15),
+        _ => None,
     }
 }
 
@@ -554,6 +628,23 @@ mod tests {
                 (BlockPos([-15, 63, 34]), crate::game::AIR_STATE),
                 (BlockPos([-15, 64, 34]), crate::game::GLASS_STATE),
             ]
+        );
+    }
+
+    #[test]
+    fn chunk_payload_emits_block_entities_for_beds_and_chests() {
+        let mut chunk = Chunk::empty(PLAINS_BIOME_ID);
+        let black_bed = crate::game::block_by_name("black_bed")
+            .unwrap()
+            .default_state;
+        let chest = crate::game::block_by_name("chest").unwrap().default_state;
+        chunk.set_block(3, 64, 5, black_bed);
+        chunk.set_block(7, 65, 9, chest);
+
+        let entities = chunk.collect_wire_block_entities();
+        assert_eq!(
+            entities,
+            vec![((3 << 4) | 5, 64, 24), ((7 << 4) | 9, 65, 1)]
         );
     }
 }
