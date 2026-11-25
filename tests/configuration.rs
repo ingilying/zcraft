@@ -513,7 +513,7 @@ async fn public_reconfiguration_api_requires_ack_then_repeats_configuration_and_
             .await
             .is_err()
     );
-    let packet = zcraft::protocol::packets::play::TimeUpdate.into();
+    let packet = zcraft::protocol::packets::play::TimeUpdate::default().into();
     assert_eq!(server.players().online_count(), 0);
     assert_eq!(server.players().broadcast(&packet).unwrap().queued, 0);
     session.play_initialized();

@@ -18,8 +18,13 @@
 //!   Light bits cover the dimension's sections plus one boundary at each end;
 //!   arrays follow set bits in ascending order, with 2048 bytes per nibble array.
 
+mod clock;
 mod edits;
 mod light;
+pub use clock::{
+    DAY_LENGTH, INITIAL_DAY_TIME, TICK_INTERVAL, TICKS_PER_SECOND, TIME_SYNC_INTERVAL,
+    WeatherSnapshot, WorldClock,
+};
 pub use edits::BlockPos;
 pub(crate) use edits::{BlockWorld, Snapshot, changed_blocks, chunk_payload_with_light};
 pub(crate) use light::{Neighborhood, affected_light_chunks, chunk_light, has_any_edits};

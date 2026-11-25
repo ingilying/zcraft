@@ -446,6 +446,7 @@ impl Players {
         if !matches!(
             packet,
             Clientbound::TimeUpdate(_)
+                | Clientbound::GameEvent(_)
                 | Clientbound::WorldBorder(_)
                 | Clientbound::DefaultSpawnPosition(_)
         ) {
@@ -896,11 +897,12 @@ mod tests {
 
     #[test]
     fn broadcast_allowlist_has_fixed_bounded_encodings() {
-        use crate::protocol::packets::play::DefaultSpawnPosition;
+        use crate::protocol::packets::play::{DefaultSpawnPosition, GameEvent};
 
         let players = Players::new(0);
         for (packet, size) in [
-            (Clientbound::from(TimeUpdate), 17),
+            (Clientbound::from(TimeUpdate::default()), 17),
+            (Clientbound::from(GameEvent::start_raining()), 6),
             (Clientbound::from(WorldBorder), 40),
             (Clientbound::from(DefaultSpawnPosition), 13),
         ] {
@@ -1263,7 +1265,7 @@ mod tests {
         let healthy_inbox = healthy.inbox();
         for index in 0..BROADCAST_QUEUE_CAPACITY {
             let packet = if index % 2 == 0 {
-                TimeUpdate.into()
+                TimeUpdate::default().into()
             } else {
                 WorldBorder.into()
             };
@@ -1279,7 +1281,7 @@ mod tests {
                 packet.encode().unwrap()
             );
         }
-        let packet = TimeUpdate.into();
+        let packet = TimeUpdate::default().into();
         assert_eq!(
             players.broadcast(&packet).unwrap(),
             BroadcastReport {
@@ -1313,7 +1315,7 @@ mod tests {
         let first = players.reserve(Uuid::nil()).unwrap();
         let stale = first.inbox();
         first.enter_play();
-        let packet = TimeUpdate.into();
+        let packet = TimeUpdate::default().into();
         assert_eq!(players.broadcast(&packet).unwrap().queued, 1);
         first.pause();
         assert_eq!(players.online_count(), 1);

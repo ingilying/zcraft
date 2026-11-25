@@ -37,6 +37,7 @@ const TELEPORT_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct PlayService {
     terrain: Arc<[u8]>,
     blocks: Option<Arc<world::BlockWorld>>,
+    clock: std::sync::Mutex<world::WorldClock>,
     game_mode: GameMode,
     commands: crate::command::CommandRegistry,
     max_view_distance: i32,
@@ -56,11 +57,47 @@ impl PlayService {
         Ok(Self {
             terrain: world::chunk_payload(),
             blocks: (game_mode == GameMode::Creative).then(Arc::default),
+            clock: std::sync::Mutex::new(world::WorldClock::new()),
             game_mode,
             commands: crate::command::CommandRegistry::default(),
             max_view_distance,
             next_entity: AtomicI32::new(1),
         })
+    }
+
+    /// Advance the world clock and weather cycle by one 20 TPS tick.
+    pub fn tick_world(&self) -> Vec<Clientbound> {
+        self.clock.lock().expect("world clock poisoned").tick()
+    }
+
+    pub fn world_time(&self) -> (i64, i64) {
+        let clock = self.clock.lock().expect("world clock poisoned");
+        (clock.world_age(), clock.day_time())
+    }
+
+    pub fn weather(&self) -> world::WeatherSnapshot {
+        self.clock.lock().expect("world clock poisoned").weather()
+    }
+
+    pub fn set_day_time(&self, day_time: i64) -> TimeUpdate {
+        self.clock
+            .lock()
+            .expect("world clock poisoned")
+            .set_day_time(day_time)
+    }
+
+    pub fn set_weather(&self, raining: bool, thundering: bool, duration: u32) -> Vec<Clientbound> {
+        self.clock
+            .lock()
+            .expect("world clock poisoned")
+            .set_weather(raining, thundering, duration)
+    }
+
+    fn initial_environment_packets(&self) -> Vec<Clientbound> {
+        self.clock
+            .lock()
+            .expect("world clock poisoned")
+            .initial_packets()
     }
 
     /// Install a validated immutable registry before serving connections.
@@ -168,12 +205,14 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         PlayerInfo { profile, game_mode }.into(),
         PlayerAbilities(game_mode).into(),
         DefaultSpawnPosition.into(),
-        TimeUpdate.into(),
+    ];
+    replies.extend(ctx.server.play.initial_environment_packets());
+    replies.extend([
         WorldBorder.into(),
         CenterChunk([0, 0]).into(),
-        GameEvent.into(),
+        GameEvent::level_chunks_load_start().into(),
         DeclareCommands::new(ctx.server.play.commands(), &command_source).into(),
-    ];
+    ]);
     if game_mode == GameMode::Creative {
         replies.extend([
             Clientbound::from(InventoryContent(Box::new(ctx.session.inventory.clone()))),

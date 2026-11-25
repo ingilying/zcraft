@@ -170,26 +170,80 @@ impl Encode for ChunkBatchFinished {
     }
 }
 
-/// Clientbound 0x22, level_chunks_load_start (reason 13).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GameEvent;
+/// Clientbound 0x22 (`game_event`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameEvent {
+    pub event: u8,
+    value_bits: u32,
+}
+
+impl GameEvent {
+    pub const START_RAINING: u8 = 1;
+    pub const STOP_RAINING: u8 = 2;
+    pub const RAIN_LEVEL_CHANGE: u8 = 7;
+    pub const THUNDER_LEVEL_CHANGE: u8 = 8;
+    pub const LEVEL_CHUNKS_LOAD_START: u8 = 13;
+
+    pub fn new(event: u8, value: f32) -> Self {
+        Self {
+            event,
+            value_bits: value.to_bits(),
+        }
+    }
+
+    pub fn value(self) -> f32 {
+        f32::from_bits(self.value_bits)
+    }
+
+    pub fn level_chunks_load_start() -> Self {
+        Self::new(Self::LEVEL_CHUNKS_LOAD_START, 0.0)
+    }
+
+    pub fn start_raining() -> Self {
+        Self::new(Self::START_RAINING, 0.0)
+    }
+
+    pub fn stop_raining() -> Self {
+        Self::new(Self::STOP_RAINING, 0.0)
+    }
+
+    pub fn rain_level(level: f32) -> Self {
+        Self::new(Self::RAIN_LEVEL_CHANGE, level.clamp(0.0, 1.0))
+    }
+
+    pub fn thunder_level(level: f32) -> Self {
+        Self::new(Self::THUNDER_LEVEL_CHANGE, level.clamp(0.0, 1.0))
+    }
+}
 
 impl Encode for GameEvent {
     fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
-        out.push(13);
-        out.extend_from_slice(&0f32.to_be_bytes());
+        out.push(self.event);
+        out.extend_from_slice(&self.value_bits.to_be_bytes());
         Ok(())
     }
 }
 
-/// Clientbound 0x64. Negative time freezes the client daylight cycle at noon.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TimeUpdate;
+/// Clientbound 0x64. Positive `time_of_day` advances on the client; negative freezes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeUpdate {
+    pub world_age: i64,
+    pub time_of_day: i64,
+}
+
+impl Default for TimeUpdate {
+    fn default() -> Self {
+        Self {
+            world_age: 0,
+            time_of_day: crate::world::INITIAL_DAY_TIME,
+        }
+    }
+}
 
 impl Encode for TimeUpdate {
     fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
-        out.extend_from_slice(&0i64.to_be_bytes());
-        out.extend_from_slice(&(-6000i64).to_be_bytes());
+        out.extend_from_slice(&self.world_age.to_be_bytes());
+        out.extend_from_slice(&self.time_of_day.to_be_bytes());
         Ok(())
     }
 }
@@ -656,11 +710,27 @@ mod tests {
         assert_eq!(f32_field(&mut reader), 0.05);
         assert_eq!(f32_field(&mut reader), 0.1);
         reader.finish().unwrap();
-        assert_eq!(encoded(&GameEvent), [13, 0, 0, 0, 0]);
-        let bytes = encoded(&TimeUpdate);
+        assert_eq!(
+            encoded(&GameEvent::level_chunks_load_start()),
+            [13, 0, 0, 0, 0]
+        );
+        assert_eq!(encoded(&GameEvent::start_raining()), [1, 0, 0, 0, 0]);
+        assert_eq!(encoded(&GameEvent::stop_raining()), [2, 0, 0, 0, 0]);
+        assert_eq!(
+            encoded(&GameEvent::rain_level(0.5)),
+            [7, 0x3f, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            encoded(&GameEvent::thunder_level(1.0)),
+            [8, 0x3f, 0x80, 0x00, 0x00]
+        );
+        let bytes = encoded(&TimeUpdate {
+            world_age: 40,
+            time_of_day: 6040,
+        });
         let mut reader = Reader::new(&bytes);
-        assert_eq!(reader.i64().unwrap(), 0);
-        assert_eq!(reader.i64().unwrap(), -6000);
+        assert_eq!(reader.i64().unwrap(), 40);
+        assert_eq!(reader.i64().unwrap(), 6040);
         reader.finish().unwrap();
         let bytes = encoded(&WorldBorder);
         let mut reader = Reader::new(&bytes);

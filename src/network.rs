@@ -86,10 +86,20 @@ async fn serve_validated(
     let compression_threshold = usize::try_from(config.compression_threshold).ok();
     let slots = Arc::new(Semaphore::new(config.max_connections));
     let mut tasks = JoinSet::new();
+    let mut world_tick = tokio::time::interval_at(
+        Instant::now() + crate::world::TICK_INTERVAL,
+        crate::world::TICK_INTERVAL,
+    );
+    world_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     tokio::pin!(shutdown);
     let result = loop {
         tokio::select! {
             _ = &mut shutdown => break Ok(()),
+            _ = world_tick.tick() => {
+                for packet in server.play.tick_world() {
+                    let _ = server.players().broadcast(&packet);
+                }
+            }
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 if let Err(error) = result { tracing::warn!(%error, "connection task failed"); }
             }
@@ -418,7 +428,7 @@ mod tests {
         });
         // Wait until the write starts, then let it stall in the one-byte buffer.
         assert_eq!(peer.read_u8().await.unwrap(), 20);
-        let packet = TimeUpdate.into();
+        let packet = TimeUpdate::default().into();
         for _ in 0..BROADCAST_QUEUE_CAPACITY {
             assert_eq!(players.broadcast(&packet).unwrap().queued, 1);
         }
