@@ -59,7 +59,7 @@ impl BlockWorld {
     }
 }
 
-fn base(y: i32) -> i32 {
+pub(super) fn base(y: i32) -> i32 {
     match y {
         60 => crate::game::BEDROCK_STATE,
         61 | 62 => crate::game::DIRT_STATE,
@@ -71,6 +71,11 @@ fn base(y: i32) -> i32 {
 impl Blocks {
     pub(crate) fn snapshot(&self, chunk: [i32; 2]) -> Snapshot {
         self.chunks.get(&chunk).cloned()
+    }
+    pub(crate) fn neighborhood(&self, [cx, cz]: [i32; 2]) -> Neighborhood {
+        std::array::from_fn(|dz| {
+            std::array::from_fn(|dx| self.snapshot([cx + dx as i32 - 1, cz + dz as i32 - 1]))
+        })
     }
     pub(crate) fn get(&self, pos: BlockPos) -> i32 {
         self.chunks
@@ -113,7 +118,7 @@ impl Blocks {
     }
 }
 
-fn state_at(edits: &Edits, index: u32) -> i32 {
+pub(super) fn state_at(edits: &Edits, index: u32) -> i32 {
     edits
         .get(&index)
         .copied()
@@ -147,8 +152,7 @@ pub(crate) fn changed_blocks(
 
 // Heights are first air above the highest qualifying block, relative to min_y.
 fn heights(edits: &Edits, qualifies: impl Fn(i32) -> bool) -> [u16; 256] {
-    let mut result = [128; 256];
-    // The permanent bedrock layer bounds the fallback search.
+    let mut result = [0; 256];
     for (col, height) in result.iter_mut().enumerate() {
         for y in (60..=SURFACE_Y).rev() {
             if qualifies(state_at(edits, ((y - MIN_Y) as u32) * 256 + col as u32)) {
@@ -166,58 +170,27 @@ fn heights(edits: &Edits, qualifies: impl Fn(i32) -> bool) -> [u16; 256] {
     result
 }
 
-pub(crate) fn sky_heights(edits: &Snapshot) -> [u16; 256] {
-    match edits {
-        Some(edits) => heights(edits, |state| {
-            crate::game::block_by_state(state).is_some_and(|block| !block.skylight)
-        }),
-        None => [(SURFACE_Y + 1 - MIN_Y) as u16; 256],
-    }
-}
-
-pub(crate) fn light_payload(top: &[u16; 256]) -> Arc<[u8]> {
-    let min = usize::from(*top.iter().min().unwrap());
-    let max = usize::from(*top.iter().max().unwrap());
-    let mut sky = 0u64;
-    let mut arrays = Vec::new();
-    for section in 1..LIGHT_SECTION_COUNT {
-        let bottom = (section - 1) * 16;
-        if bottom + 16 <= min {
-            continue;
+pub(crate) fn chunk_payload_with_light(neighborhood: &Neighborhood) -> Arc<[u8]> {
+    let mut out = Vec::with_capacity(45 * 1024);
+    let sections = match neighborhood[1][1].as_deref() {
+        Some(edits) => {
+            let top = heights(edits, |s| s != 0);
+            put_heightmaps_with(&mut out, &top);
+            edited_sections(edits)
         }
-        sky |= 1 << section;
-        let start = arrays.len();
-        put_varint(LIGHT_BYTES as i32, &mut arrays);
-        if bottom >= max {
-            arrays.resize(arrays.len() + LIGHT_BYTES, 0xff);
-        } else {
-            arrays.reserve(LIGHT_BYTES);
-            for y in bottom..bottom + 16 {
-                for pair in top.as_chunks::<2>().0 {
-                    arrays.push(
-                        if y >= usize::from(pair[0]) { 0x0f } else { 0 }
-                            | if y >= usize::from(pair[1]) { 0xf0 } else { 0 },
-                    );
-                }
-            }
+        None => {
+            put_heightmaps(&mut out);
+            section_data()
         }
-        debug_assert_eq!(arrays.len() - start, LIGHT_BYTES + 2);
-    }
-    let mut out = Vec::with_capacity(arrays.len() + 32);
-    put_bitset(sky, &mut out);
-    put_bitset(0, &mut out);
-    put_bitset(ALL_LIGHT_SECTIONS ^ sky, &mut out);
-    put_bitset(ALL_LIGHT_SECTIONS, &mut out);
-    put_varint(sky.count_ones() as i32, &mut out);
-    out.extend(arrays);
+    };
+    put_varint(sections.len() as i32, &mut out);
+    out.extend(sections);
     put_varint(0, &mut out);
+    out.extend_from_slice(&chunk_light(neighborhood));
     out.into()
 }
 
-pub(crate) fn edited_payload(edits: &Arc<Edits>) -> Arc<[u8]> {
-    let top = heights(edits, |s| s != 0);
-    let mut out = Vec::with_capacity(45 * 1024);
-    put_heightmaps_with(&mut out, &top);
+fn edited_sections(edits: &Edits) -> Vec<u8> {
     let mut sections = Vec::new();
     for section in 0..SECTION_COUNT {
         let offset = (section * 4096) as u32;
@@ -248,31 +221,35 @@ pub(crate) fn edited_payload(edits: &Arc<Edits>) -> Arc<[u8]> {
         }
         if palette.len() == 1 {
             put_single_palette(palette[0], &mut sections);
-        } else {
-            // The supported terrain and edit whitelist have at most six states.
-            sections.push(4);
+        } else if palette.len() <= 256 {
+            let bits = ((palette.len() - 1).ilog2() as u8 + 1).max(4);
+            sections.push(bits);
             put_varint(palette.len() as i32, &mut sections);
             for state in palette {
                 put_varint(state, &mut sections);
             }
-            put_varint(256, &mut sections);
-            for row in indices.as_chunks::<16>().0 {
-                let value = row
-                    .iter()
-                    .enumerate()
-                    .fold(0, |n, (i, s)| n | (s << (4 * i)));
-                sections.extend(value.to_be_bytes());
-            }
+            pack_entries(&indices, bits, &mut sections);
+        } else {
+            let direct: [u64; 4096] = std::array::from_fn(|i| states[i] as u64);
+            sections.push(15);
+            pack_entries(&direct, 15, &mut sections);
         }
         put_single_palette(PLAINS_BIOME_ID, &mut sections);
     }
-    put_varint(sections.len() as i32, &mut out);
-    out.extend(sections);
-    put_varint(0, &mut out);
-    out.extend_from_slice(&light_payload(&heights(edits, |state| {
-        crate::game::block_by_state(state).is_some_and(|block| !block.skylight)
-    })));
-    out.into()
+    sections
+}
+
+fn pack_entries(entries: &[u64; 4096], bits: u8, out: &mut Vec<u8>) {
+    let per_long = 64 / usize::from(bits);
+    let longs = entries.len().div_ceil(per_long);
+    put_varint(longs as i32, out);
+    for chunk in entries.chunks(per_long) {
+        let mut value = 0u64;
+        for (i, &entry) in chunk.iter().enumerate() {
+            value |= entry << (i * usize::from(bits));
+        }
+        out.extend(value.to_be_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -298,5 +275,108 @@ mod tests {
         }
         assert!(!world.set(BlockPos::from_index([0, 0], MAX_CHUNK_EDITS as u32), 1));
         assert_eq!(world.count, MAX_CHUNK_EDITS);
+    }
+
+    fn decode_light(payload: &[u8]) -> (u64, Vec<&[u8]>, u64, Vec<&[u8]>) {
+        let mut r = crate::protocol::Reader::new(payload);
+        let read_mask = |r: &mut crate::protocol::Reader<'_>| -> u64 {
+            let len = r.varint().unwrap();
+            assert!(len <= 1);
+            if len == 1 { r.i64().unwrap() as u64 } else { 0 }
+        };
+        let sky_mask = read_mask(&mut r);
+        let block_mask = read_mask(&mut r);
+        let _empty_sky = read_mask(&mut r);
+        let _empty_block = read_mask(&mut r);
+        let sky_count = r.varint().unwrap() as usize;
+        let mut sky_arrays = Vec::with_capacity(sky_count);
+        for _ in 0..sky_count {
+            let len = r.varint().unwrap() as usize;
+            sky_arrays.push(r.take(len).unwrap());
+        }
+        let block_count = r.varint().unwrap() as usize;
+        let mut block_arrays = Vec::with_capacity(block_count);
+        for _ in 0..block_count {
+            let len = r.varint().unwrap() as usize;
+            block_arrays.push(r.take(len).unwrap());
+        }
+        r.finish().unwrap();
+        (sky_mask, sky_arrays, block_mask, block_arrays)
+    }
+
+    fn light_at(mask: u64, arrays: &[&[u8]], x: usize, y: i32, z: usize) -> u8 {
+        let sec = ((y - MIN_Y) / 16 + 1) as u32;
+        if (mask & (1u64 << sec)) == 0 {
+            return 0;
+        }
+        let arr_idx = (mask & ((1u64 << sec) - 1)).count_ones() as usize;
+        let sample = ((y - MIN_Y) as usize % 16) * 256 + z * 16 + x;
+        let byte = arrays[arr_idx][sample / 2];
+        if sample.is_multiple_of(2) {
+            byte & 0x0f
+        } else {
+            byte >> 4
+        }
+    }
+
+    #[test]
+    fn broken_bedrock_and_overhangs_receive_skylight_and_wide_palettes_encode() {
+        let mut world = Blocks::default();
+        // Punch through grass, dirt, and bedrock at (8, 60..=63, 8).
+        for y in 60..=63 {
+            assert!(world.set(BlockPos([8, y, 8]), 0));
+        }
+        // Carve a sideways alcove at (9, 61, 8) under intact grass/dirt.
+        assert!(world.set(BlockPos([9, 61, 8]), 0));
+
+        let payload = chunk_light(&world.neighborhood([0, 0]));
+        let (sky_mask, sky_arrays, block_mask, _) = decode_light(&payload);
+        assert_eq!(block_mask, 0);
+        assert_eq!(light_at(sky_mask, &sky_arrays, 8, 60, 8), 15);
+        assert_eq!(light_at(sky_mask, &sky_arrays, 8, 59, 8), 15);
+        assert_eq!(light_at(sky_mask, &sky_arrays, 9, 61, 8), 14);
+
+        // >16 distinct block states in one section must encode without error.
+        let mut wide = Blocks::default();
+        for i in 0..20 {
+            assert!(wide.set(BlockPos([i % 16, 64 + i / 16, 0]), i + 1));
+        }
+        let wide_payload = chunk_payload_with_light(&wide.neighborhood([0, 0]));
+        assert!(!wide_payload.is_empty());
+    }
+
+    #[test]
+    fn block_light_emits_attenuates_and_crosses_chunk_borders() {
+        let mut world = Blocks::default();
+        let glowstone = crate::game::block_by_name("glowstone")
+            .unwrap()
+            .default_state;
+        let torch = crate::game::block_by_name("torch").unwrap().default_state;
+        let tinted_glass = crate::game::block_by_name("tinted_glass")
+            .unwrap()
+            .default_state;
+
+        // Place glowstone (level 15) on the east edge of chunk [0, 0] at (15, 64, 8).
+        assert!(world.set(BlockPos([15, 64, 8]), glowstone));
+        // Place tinted_glass (opacity 15) on its west side at (14, 64, 8).
+        assert!(world.set(BlockPos([14, 64, 8]), tinted_glass));
+        // Place torch (level 14) at (2, 64, 2).
+        assert!(world.set(BlockPos([2, 64, 2]), torch));
+
+        let c0 = chunk_light(&world.neighborhood([0, 0]));
+        let (_, _, b0_mask, b0_arr) = decode_light(&c0);
+        assert_eq!(light_at(b0_mask, &b0_arr, 15, 64, 8), 15);
+        assert_eq!(light_at(b0_mask, &b0_arr, 14, 64, 8), 0); // tinted_glass blocks light
+        assert_eq!(light_at(b0_mask, &b0_arr, 15, 65, 8), 14);
+        assert_eq!(light_at(b0_mask, &b0_arr, 2, 64, 2), 14);
+        assert_eq!(light_at(b0_mask, &b0_arr, 3, 64, 2), 13);
+
+        // Neighboring chunk [1, 0] receives cross-border block light at local x=0 (world x=16).
+        let c1 = chunk_light(&world.neighborhood([1, 0]));
+        let (_, _, b1_mask, b1_arr) = decode_light(&c1);
+        assert_eq!(light_at(b1_mask, &b1_arr, 0, 64, 8), 14);
+        assert_eq!(light_at(b1_mask, &b1_arr, 1, 64, 8), 13);
+        assert_eq!(light_at(b1_mask, &b1_arr, 13, 64, 8), 1);
+        assert_eq!(light_at(b1_mask, &b1_arr, 14, 64, 8), 0);
     }
 }

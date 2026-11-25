@@ -35,6 +35,10 @@ pub struct BlockStateDefinition {
     pub collision: bool,
     /// True when vanilla propagates skylight through this state.
     pub skylight: bool,
+    /// Vanilla block-light emission level (0..=15).
+    pub light_emission: u8,
+    /// Vanilla light attenuation / opacity level (0..=15).
+    pub light_block: u8,
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolRule {

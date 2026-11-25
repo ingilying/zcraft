@@ -17,7 +17,7 @@ use std::{collections::HashMap, io, sync::Arc};
 #[derive(Debug)]
 pub(super) struct CreativeSession {
     world: Arc<BlockWorld>,
-    pending_chunks: HashMap<[i32; 2], Snapshot>,
+    pending_chunks: HashMap<[i32; 2], (Snapshot, Arc<[u8]>)>,
 }
 
 impl CreativeSession {
@@ -31,21 +31,25 @@ impl CreativeSession {
     pub(super) fn prepare_chunks(&mut self, packets: &mut [Clientbound]) {
         for packet in packets {
             if let Clientbound::ChunkData(data) = packet {
-                let snapshot = self.world.lock().snapshot(data.0);
-                if let Some(edits) = &snapshot {
-                    data.1 = world::edited_payload(edits);
+                let neighborhood = self.world.lock().neighborhood(data.0);
+                let light = world::chunk_light(&neighborhood);
+                if world::has_any_edits(&neighborhood) {
+                    data.1 = world::chunk_payload_with_light(&neighborhood);
                 }
-                self.pending_chunks.insert(data.0, snapshot);
+                let center = neighborhood[1][1].clone();
+                self.pending_chunks.insert(data.0, (center, light));
             }
         }
     }
 
     pub(super) fn chunk_sent(&mut self, slot: &Reservation, chunk: [i32; 2]) -> io::Result<()> {
-        let old = self.pending_chunks.remove(&chunk).expect("prepared chunk");
+        let (old, old_light) = self.pending_chunks.remove(&chunk).expect("prepared chunk");
         let blocks = self.world.lock();
-        let new = blocks.snapshot(chunk);
-        let changes = world::changed_blocks(chunk, &old, &new);
-        let updates = updates(chunk, changes, &old, &new)?;
+        let neighborhood = blocks.neighborhood(chunk);
+        let new = &neighborhood[1][1];
+        let changes = world::changed_blocks(chunk, &old, new);
+        let new_light = world::chunk_light(&neighborhood);
+        let updates = updates(chunk, changes, &old_light, new_light)?;
         // The edit lock spans both reconciliation and subscription. A write
         // can never slip in between the two; no lock spans a socket write.
         slot.watch_blocks(chunk, updates);
@@ -57,20 +61,20 @@ type Bodies = Arc<[Arc<[u8]>]>;
 fn updates(
     chunk: [i32; 2],
     changes: Vec<(BlockPos, i32)>,
-    old: &Snapshot,
-    new: &Snapshot,
+    old_light: &Arc<[u8]>,
+    new_light: Arc<[u8]>,
 ) -> io::Result<Bodies> {
-    if changes.is_empty() {
+    let light_changed = new_light != *old_light;
+    if changes.is_empty() && !light_changed {
         return Ok(Arc::from([]));
     }
-    let mut bodies = Vec::with_capacity(changes.len() + 1);
+    let mut bodies = Vec::with_capacity(changes.len() + usize::from(light_changed));
     for (pos, state) in changes {
         bodies.push(Clientbound::from(BlockUpdate(pos, state)).encode()?.into());
     }
-    let top = world::sky_heights(new);
-    if top != world::sky_heights(old) {
+    if light_changed {
         bodies.push(
-            Clientbound::from(LightUpdate(chunk, world::light_payload(&top)))
+            Clientbound::from(LightUpdate(chunk, new_light))
                 .encode()?
                 .into(),
         );
@@ -163,15 +167,29 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
             ([Some(support), place], edit)
         }
     };
-    let ack = Clientbound::from(BlockAck(sequence)).encode()?.into();
+    let ack: Arc<[u8]> = Clientbound::from(BlockAck(sequence)).encode()?.into();
     if state.pending_teleport.is_none()
         && let Some((pos, material)) = edit
     {
         let chunk = pos.chunk();
-        let old = blocks.snapshot(chunk);
+        let affected = world::affected_light_chunks(pos);
+        let old_lights: Vec<_> = affected
+            .iter()
+            .map(|&nc| (nc, world::chunk_light(&blocks.neighborhood(nc))))
+            .collect();
         if blocks.set(pos, material) {
-            let data = updates(chunk, vec![(pos, material)], &old, &blocks.snapshot(chunk))?;
-            slot.publish_blocks(chunk, data, ack);
+            for (nc, old_light) in old_lights {
+                let new_light = world::chunk_light(&blocks.neighborhood(nc));
+                if nc == chunk {
+                    let data = updates(chunk, vec![(pos, material)], &old_light, new_light)?;
+                    slot.publish_blocks(chunk, data, ack.clone());
+                } else if new_light != old_light {
+                    let body = Clientbound::from(LightUpdate(nc, new_light))
+                        .encode()?
+                        .into();
+                    slot.publish_light(nc, body);
+                }
+            }
             return Ok(Outcome::empty());
         }
     }

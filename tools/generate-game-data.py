@@ -103,14 +103,15 @@ def main() -> None:
         runtime = {}
         for line in oracle.stdout.splitlines():
             fields = line.split("\t")
-            if len(fields) != 11:
+            if len(fields) != 13:
                 continue
-            state, block, hardness, correct, air, liquid, occludes, replaceable, collision, skylight, item = fields
+            state, block, hardness, correct, air, liquid, occludes, replaceable, collision, skylight, emission, light_block, item = fields
             runtime[int(state)] = {
                 "block": block, "hardness": float(hardness), "correct_tool": correct == "true",
                 "air": air == "true", "liquid": liquid == "true", "occludes": occludes == "true",
                 "replaceable": replaceable == "true", "collision": collision == "true",
-                "skylight": skylight == "true", "item": item,
+                "skylight": skylight == "true", "light_emission": int(emission),
+                "light_block": int(light_block), "item": item,
             }
         state_count = sum(len(block["states"]) for block in blocks_report.values())
         if len(runtime) != state_count:

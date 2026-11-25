@@ -16,9 +16,10 @@ async fn mutation_during_chunk_write_is_reconciled_before_later_updates() {
     creative.chunk_sent(&slot, chunk).unwrap();
     {
         let mut blocks = world.lock();
-        let old = blocks.snapshot(chunk);
+        let old_light = world::chunk_light(&blocks.neighborhood(chunk));
         assert!(blocks.set(pos, 0));
-        let bodies = updates(chunk, vec![(pos, 0)], &old, &blocks.snapshot(chunk)).unwrap();
+        let new_light = world::chunk_light(&blocks.neighborhood(chunk));
+        let bodies = updates(chunk, vec![(pos, 0)], &old_light, new_light).unwrap();
         slot.publish_blocks(
             chunk,
             bodies,

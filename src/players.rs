@@ -637,6 +637,15 @@ impl Reservation {
         }
     }
 
+    pub(crate) fn publish_light(&self, chunk: Chunk, light: Arc<[u8]>) {
+        let mut registry = lock(&self.0.registry);
+        let viewers: Vec<_> = registry.block_watchers.at(chunk).collect();
+        let updates: Arc<[Arc<[u8]>]> = Arc::from([light]);
+        for viewer in viewers {
+            registry.enqueue_terrain(viewer, chunk, updates.clone(), None);
+        }
+    }
+
     pub(crate) fn correct_blocks(&self, corrections: Vec<(Chunk, Arc<[u8]>)>, ack: Arc<[u8]>) {
         let mut registry = lock(&self.0.registry);
         let uuid = self.0.uuid;

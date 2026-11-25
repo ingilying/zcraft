@@ -19,10 +19,10 @@
 //!   arrays follow set bits in ascending order, with 2048 bytes per nibble array.
 
 mod edits;
+mod light;
 pub use edits::BlockPos;
-pub(crate) use edits::{
-    BlockWorld, Snapshot, changed_blocks, edited_payload, light_payload, sky_heights,
-};
+pub(crate) use edits::{BlockWorld, Snapshot, changed_blocks, chunk_payload_with_light};
+pub(crate) use light::{Neighborhood, affected_light_chunks, chunk_light, has_any_edits};
 
 use std::io;
 

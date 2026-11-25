@@ -53,11 +53,14 @@ class GameDataOracle {
             boolean collision = !(Boolean) shape.getClass().getMethod("c").invoke(shape);
             boolean skylight = (Boolean) state.getClass().getMethod("a", blockGetter, blockPos)
                     .invoke(state, emptyWorld, zero);
+            int lightEmission = (Integer) state.getClass().getMethod("h").invoke(state);
+            int lightBlock = (Integer) state.getClass().getMethod("b", blockGetter, blockPos)
+                    .invoke(state, emptyWorld, zero);
             output.println(id + "\t" + blockName + "\t" + field(state, "n") + "\t"
                     + field(state, "o") + "\t" + field(state, "h") + "\t"
                     + field(state, "j") + "\t" + field(state, "p") + "\t"
                     + field(state, "y") + "\t" + collision + "\t" + skylight + "\t"
-                    + itemName);
+                    + lightEmission + "\t" + lightBlock + "\t" + itemName);
         }
     }
 }
