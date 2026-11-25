@@ -23,6 +23,11 @@ pub struct Player {
     pub on_ground: bool,
     pub sneaking: bool,
     pub sprinting: bool,
+    pub health: f32,
+    pub food: i32,
+    pub saturation: f32,
+    pub fall_distance: f64,
+    pub dead: bool,
 }
 
 impl Player {
@@ -38,11 +43,51 @@ impl Player {
             on_ground: false,
             sneaking: false,
             sprinting: false,
+            health: 20.0,
+            food: 20,
+            saturation: 5.0,
+            fall_distance: 0.0,
+            dead: false,
         }
     }
 
     pub fn is_creative(&self) -> bool {
         self.game_mode == GameMode::Creative
+    }
+
+    pub fn is_survival(&self) -> bool {
+        self.game_mode == GameMode::Survival
+    }
+
+    pub fn can_interact(&self) -> bool {
+        matches!(self.game_mode, GameMode::Creative | GameMode::Survival)
+    }
+
+    /// Apply damage in Survival mode. Returns `true` if health decreased.
+    pub fn apply_damage(&mut self, amount: f32) -> bool {
+        if !self.is_survival() || self.dead || amount <= 0.0 || !amount.is_finite() {
+            return false;
+        }
+        self.health = (self.health - amount).max(0.0);
+        if self.health <= 0.0 {
+            self.dead = true;
+            self.fall_distance = 0.0;
+        }
+        true
+    }
+
+    pub fn respawn_at(&mut self, pos: [f64; 3]) {
+        self.position = pos;
+        self.yaw = 0.0;
+        self.pitch = 0.0;
+        self.on_ground = false;
+        self.sneaking = false;
+        self.sprinting = false;
+        self.health = 20.0;
+        self.food = 20;
+        self.saturation = 5.0;
+        self.fall_distance = 0.0;
+        self.dead = false;
     }
 
     pub fn eye_position(&self) -> [f64; 3] {

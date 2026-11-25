@@ -103,6 +103,7 @@ async fn serve_validated(
                 for packet in server.play.tick_world() {
                     let _ = server.players().broadcast(&packet);
                 }
+                server.play.tick_drops(server.players());
                 ticks_since_save += 1;
                 if ticks_since_save >= AUTOSAVE_TICKS {
                     ticks_since_save = 0;

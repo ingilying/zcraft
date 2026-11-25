@@ -14,6 +14,7 @@ impl Players {
             .filter_map(|slot| slot.visible.as_ref())
             .map(|peer| {
                 let mode = match peer.game_mode {
+                    GameMode::Survival => EntityGameMode::Survival,
                     GameMode::Creative => EntityGameMode::Creative,
                     GameMode::Spectator => EntityGameMode::Spectator,
                 };
@@ -32,6 +33,18 @@ impl Players {
                     game_mode: Some(mode),
                 }
             })
+            .collect()
+    }
+
+    /// Snapshot ready Survival/Creative players eligible to pick up item entities.
+    pub(crate) fn pickup_candidates(&self) -> Vec<(uuid::Uuid, i32, [f64; 3])> {
+        lock(&self.registry)
+            .players
+            .values()
+            .filter(|slot| slot.receiving && !slot.lagged)
+            .filter_map(|slot| slot.visible.as_ref())
+            .filter(|peer| matches!(peer.game_mode, GameMode::Survival | GameMode::Creative))
+            .map(|peer| (peer.uuid, peer.id, peer.pose.position.map(f64::from_bits)))
             .collect()
     }
 }

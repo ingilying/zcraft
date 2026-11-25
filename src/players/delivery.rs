@@ -81,16 +81,16 @@ impl Delivery {
                 bodies[0] = Some(peer.info);
                 if spawn {
                     bodies[1] = Some(encode(
-                        SpawnPlayer {
+                        SpawnEntity::Player(SpawnPlayer {
                             id: peer.id,
                             uuid: peer.uuid,
                             pose: peer.pose,
-                        }
+                        })
                         .into(),
                     )?);
                 }
             }
-            Self::Spawn(packet) => bodies[0] = Some(encode(packet.into())?),
+            Self::Spawn(packet) => bodies[0] = Some(encode(SpawnEntity::Player(packet).into())?),
             Self::Despawn(id) => bodies[0] = Some(encode(RemoveEntities(vec![id]).into())?),
             Self::Remove { uuid, id } => {
                 if let Some(id) = id {

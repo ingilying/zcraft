@@ -79,7 +79,7 @@ fn invalid_files_are_reported_and_never_overwritten() {
         "max_connections = -1",
         "max_view_distance = 1",
         "max_view_distance = 17",
-        "game_mode = 'survival'",
+        "game_mode = 'adventure'",
         "compression_threshold = -2",
         "compression_threshold = 2097152",
         "io_timeout_seconds = 0",

@@ -393,3 +393,44 @@ async fn overworld_seed_and_edits_persist_via_anvil_level_dat() {
     assert_eq!(reopened.block_at(sample_pos), natural_state);
     assert_eq!(reopened.block_at(edit_pos), zcraft::game::GLASS_STATE);
 }
+
+#[test]
+fn survival_player_health_food_damage_respawn_and_persistence() {
+    let dir = tempfile::tempdir().unwrap();
+    let world_dir = dir.path().join("survival");
+    let world = World::open(&world_dir, None).unwrap();
+
+    let uuid = Uuid::from_u128(0x5047_1001);
+    let mut player = Player::at_spawn(1, uuid, "Survivor".into(), GameMode::Survival);
+    assert!(player.is_survival());
+    assert!(player.can_interact());
+    assert_eq!(player.health, 20.0);
+
+    // Non-lethal damage.
+    assert!(player.apply_damage(6.0));
+    assert_eq!(player.health, 14.0);
+    assert!(!player.dead);
+
+    // Persist mid-health survival player and reload.
+    player.food = 15;
+    player.saturation = 2.5;
+    let inv = Inventory::default();
+    world.save_player(&player, &inv).unwrap();
+
+    let loaded = world.load_player(uuid).unwrap().unwrap();
+    assert_eq!(loaded.game_mode, GameMode::Survival);
+    assert_eq!(loaded.health, 14.0);
+    assert_eq!(loaded.food, 15);
+    assert_eq!(loaded.saturation, 2.5);
+
+    // Lethal damage + respawn.
+    assert!(player.apply_damage(20.0));
+    assert_eq!(player.health, 0.0);
+    assert!(player.dead);
+    assert!(!player.apply_damage(5.0)); // dead player ignores further damage
+
+    player.respawn_at([8.5, 65.0, 8.5]);
+    assert!(!player.dead);
+    assert_eq!(player.health, 20.0);
+    assert_eq!(player.food, 20);
+}

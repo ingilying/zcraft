@@ -7,6 +7,9 @@ use crate::{
         packets::{
             play::{GameEvent, TimeUpdate},
             play_blocks::{BlockUpdate, LightUpdate},
+            play_entities::{
+                CollectItem, EntityMetadata, EntityVelocity, RemoveEntities, SpawnEntity,
+            },
         },
     },
     world::{self, TimeSnapshot, WeatherEvent, World, WorldMutation},
@@ -20,8 +23,21 @@ use std::{
     },
 };
 
+const MAX_ITEM_DROPS: usize = 512;
+
+#[derive(Debug, Clone)]
+struct ItemDrop {
+    id: i32,
+    position: [f64; 3],
+    velocity: [f64; 3],
+    stack: crate::game::ItemStack,
+    pickup_delay: u16,
+    age: u16,
+}
+
 pub struct PlayService {
     world: Arc<World>,
+    drops: Mutex<Vec<ItemDrop>>,
     ops: Mutex<HashSet<String>>,
     shutdown: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     pub(super) game_mode: GameMode,
@@ -51,6 +67,7 @@ impl PlayService {
         world::validate_view_distance(max_view_distance)?;
         Ok(Self {
             world,
+            drops: Mutex::new(Vec::new()),
             ops: Mutex::new(HashSet::new()),
             shutdown: Mutex::new(None),
             game_mode,
@@ -156,6 +173,114 @@ impl PlayService {
         let count = mutation.block_changes.len();
         publish_mutation(players, mutation)?;
         Ok(count)
+    }
+
+    /// Spawn a dropped `ItemEntity` in the world and broadcast it to players.
+    pub fn spawn_item_drop(
+        &self,
+        players: &crate::players::Players,
+        position: [f64; 3],
+        velocity: [f64; 3],
+        stack: crate::game::ItemStack,
+        pickup_delay: u16,
+    ) -> io::Result<()> {
+        let id = self.allocate_entity_id()?;
+        let uuid = uuid::Uuid::from_u128(rand::random());
+        let mut evicted = None;
+        {
+            let mut drops = self.drops.lock().expect("item drops poisoned");
+            if drops.len() >= MAX_ITEM_DROPS {
+                evicted = Some(drops.remove(0).id);
+            }
+            drops.push(ItemDrop {
+                id,
+                position,
+                velocity,
+                stack,
+                pickup_delay,
+                age: 0,
+            });
+        }
+        if let Some(old_id) = evicted {
+            let _ = players.broadcast(&RemoveEntities(vec![old_id]).into());
+        }
+        let _ = players.broadcast(&SpawnEntity::item(id, uuid, position, velocity).into());
+        let _ = players.broadcast(&EntityMetadata::Item { id, stack }.into());
+        let _ = players.broadcast(&EntityVelocity::new(id, velocity).into());
+        Ok(())
+    }
+
+    /// Advance dropped item physics, expiration, and proximity pickup (20 TPS).
+    pub fn tick_drops(&self, players: &crate::players::Players) {
+        let candidates = players.pickup_candidates();
+        let mut collected: Vec<(uuid::Uuid, i32, i32, crate::game::ItemStack)> = Vec::new();
+        let mut expired: Vec<i32> = Vec::new();
+        {
+            let mut drops = self.drops.lock().expect("item drops poisoned");
+            drops.retain_mut(|drop| {
+                drop.age = drop.age.saturating_add(1);
+                if drop.age >= 6000 || drop.position[1] < f64::from(world::MIN_Y) - 10.0 {
+                    expired.push(drop.id);
+                    return false;
+                }
+                drop.pickup_delay = drop.pickup_delay.saturating_sub(1);
+
+                // Simple gravity + ground stop.
+                drop.velocity[1] = (drop.velocity[1] - 0.04).max(-1.0);
+                for axis in 0..3 {
+                    drop.position[axis] += drop.velocity[axis];
+                    drop.velocity[axis] *= 0.98;
+                }
+                let below = world::BlockPos([
+                    drop.position[0].floor() as i32,
+                    (drop.position[1] - 0.1).floor() as i32,
+                    drop.position[2].floor() as i32,
+                ]);
+                if below.valid()
+                    && crate::game::block_by_state(self.world.block_at(below))
+                        .is_some_and(|d| d.collision)
+                {
+                    drop.position[1] = f64::from(below.0[1] + 1) + 0.125;
+                    drop.velocity[1] = 0.0;
+                    drop.velocity[0] *= 0.6;
+                    drop.velocity[2] *= 0.6;
+                }
+
+                if drop.pickup_delay == 0 {
+                    for &(uuid, player_id, ppos) in &candidates {
+                        let dx = ppos[0] - drop.position[0];
+                        let dy = (ppos[1] + 0.9) - drop.position[1];
+                        let dz = ppos[2] - drop.position[2];
+                        if dx * dx + dy * dy + dz * dz <= 2.25 {
+                            collected.push((uuid, drop.id, player_id, drop.stack));
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+        }
+        if !expired.is_empty() {
+            let _ = players.broadcast(&RemoveEntities(expired).into());
+        }
+        for (uuid, drop_id, player_id, stack) in collected {
+            players.send_control(
+                uuid,
+                crate::players::PlayerControl::Give {
+                    item: stack.item,
+                    count: u32::from(stack.count),
+                },
+            );
+            let _ = players.broadcast(
+                &CollectItem {
+                    collected_id: drop_id,
+                    collector_id: player_id,
+                    count: i32::from(stack.count),
+                }
+                .into(),
+            );
+            let _ = players.broadcast(&RemoveEntities(vec![drop_id]).into());
+        }
     }
 
     /// Advance the world clock and weather cycle by one 20 TPS tick and map

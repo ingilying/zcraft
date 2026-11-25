@@ -16,7 +16,7 @@ macro_rules! ignored {
         }
     )*};
 }
-ignored!(IgnoredClientCommand, IgnoredAdvancementTab, IgnoredSpectate);
+ignored!(IgnoredAdvancementTab, IgnoredSpectate);
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PlayClientInformation(pub ClientInformation);

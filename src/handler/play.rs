@@ -68,24 +68,31 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         tracing::error!(uuid = %profile.uuid, %error, "failed to load playerdata; rejecting login to prevent overwrite");
         error
     })?;
-    let (position, yaw, pitch, on_ground, game_mode) = if let Some(saved) = saved {
-        ctx.session.inventory = saved.inventory;
-        (
-            saved.position,
-            saved.yaw,
-            saved.pitch,
-            saved.on_ground,
-            saved.game_mode,
-        )
-    } else {
-        (
-            world.spawn_position(),
-            0.0,
-            0.0,
-            false,
-            ctx.server.play.game_mode,
-        )
-    };
+    let (position, yaw, pitch, on_ground, game_mode, health, food, saturation) =
+        if let Some(saved) = saved {
+            ctx.session.inventory = saved.inventory;
+            (
+                saved.position,
+                saved.yaw,
+                saved.pitch,
+                saved.on_ground,
+                saved.game_mode,
+                saved.health,
+                saved.food,
+                saved.saturation,
+            )
+        } else {
+            (
+                world.spawn_position(),
+                0.0,
+                0.0,
+                false,
+                ctx.server.play.game_mode,
+                20.0,
+                20,
+                5.0,
+            )
+        };
     let spawn_chunk = world::chunk_at(position[0], position[2]);
     let mut chunks = ChunkStream::at(spawn_chunk, view_distance, now);
     if let Some(slot) = &ctx.session.reservation {
@@ -104,6 +111,10 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
     player.yaw = yaw;
     player.pitch = pitch;
     player.on_ground = on_ground;
+    player.health = health;
+    player.food = food;
+    player.saturation = saturation;
+    player.dead = health <= 0.0;
     ctx.session.play = Some(PlaySession {
         player,
         pending_teleport: Some((0, now)),
@@ -133,7 +144,10 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         GameEvent::level_chunks_load_start().into(),
         DeclareCommands::new(ctx.server.play.commands(), &command_source).into(),
     ]);
-    if game_mode == GameMode::Creative {
+    if game_mode == GameMode::Survival {
+        replies.push(UpdateHealth::new(health, food, saturation).into());
+    }
+    if game_mode != GameMode::Spectator {
         replies.extend([
             Clientbound::from(InventoryContent::player(&ctx.session.inventory)),
             SelectedSlot(ctx.session.inventory.selected()).into(),
@@ -334,8 +348,33 @@ fn movement(
     if state.pending_teleport.is_some() {
         return Ok(Outcome::empty());
     }
+    let old_y = state.player.position[1];
     if let Some([x, y, z]) = position {
         if !crate::game::Player::position_in_bounds([x, y, z]) {
+            if state.player.is_survival() && y < f64::from(world::MIN_Y) - 4.0 {
+                // Void damage below the world floor.
+                let mut replies = Vec::new();
+                if state.player.apply_damage(4.0) {
+                    let hurt = Clientbound::from(HurtAnimation::new(state.player.entity_id, 0.0));
+                    if let Some(slot) = slot {
+                        let _ = slot.broadcast_to_viewers(&hurt);
+                    }
+                    replies.push(hurt);
+                    replies.push(
+                        UpdateHealth::new(
+                            state.player.health,
+                            state.player.food,
+                            state.player.saturation,
+                        )
+                        .into(),
+                    );
+                }
+                return Ok(Outcome {
+                    replies,
+                    close: false,
+                    encryption: None,
+                });
+            }
             let id = state.next_teleport;
             state.next_teleport = id
                 .checked_add(1)
@@ -362,6 +401,38 @@ fn movement(
         state.player.pitch = pitch;
     }
     state.player.on_ground = on_ground;
+    let mut replies = Vec::new();
+    if state.player.is_survival() && !state.player.dead {
+        let [px, py, pz] = state.player.position;
+        let feet_pos = world::BlockPos([px.floor() as i32, py.floor() as i32, pz.floor() as i32]);
+        let feet_state = ctx.server.play.world().block_at(feet_pos);
+        let in_liquid = crate::game::block_by_state(feet_state).is_some_and(|d| d.liquid);
+        if in_liquid {
+            state.player.fall_distance = 0.0;
+        } else if on_ground {
+            let fall = std::mem::take(&mut state.player.fall_distance);
+            if fall > 3.0 {
+                let damage = (fall - 3.0).floor() as f32;
+                if state.player.apply_damage(damage) {
+                    let hurt = Clientbound::from(HurtAnimation::new(state.player.entity_id, 0.0));
+                    if let Some(slot) = slot {
+                        let _ = slot.broadcast_to_viewers(&hurt);
+                    }
+                    replies.push(hurt);
+                    replies.push(
+                        UpdateHealth::new(
+                            state.player.health,
+                            state.player.food,
+                            state.player.saturation,
+                        )
+                        .into(),
+                    );
+                }
+            }
+        } else if py < old_y {
+            state.player.fall_distance += old_y - py;
+        }
+    }
     let pose = state.player.pose();
     if let Some(slot) = slot {
         if old_view != state.chunks.view() {
@@ -369,7 +440,11 @@ fn movement(
         }
         slot.update_pose(pose);
     }
-    Ok(Outcome::empty())
+    Ok(Outcome {
+        replies,
+        close: false,
+        encryption: None,
+    })
 }
 pub async fn handle_position(ctx: &mut Context<'_>, p: Position) -> io::Result<Outcome> {
     movement(ctx, Some([p.x, p.y, p.z]), None, p.on_ground)
@@ -484,14 +559,63 @@ pub async fn handle_action(ctx: &mut Context<'_>, packet: EntityAction) -> io::R
         state.player.sprinting,
     );
     if changed && let Some(slot) = &ctx.session.reservation {
-        let packet = Clientbound::from(crate::protocol::packets::play_entities::EntityMetadata {
-            id: entity_id,
-            sneaking,
-            sprinting,
-        });
+        let packet = Clientbound::from(
+            crate::protocol::packets::play_entities::EntityMetadata::Player {
+                id: entity_id,
+                sneaking,
+                sprinting,
+            },
+        );
         slot.broadcast_to_viewers(&packet)?;
     }
     Ok(Outcome::empty())
+}
+
+pub async fn handle_client_command(
+    ctx: &mut Context<'_>,
+    packet: ClientCommand,
+) -> io::Result<Outcome> {
+    if packet.action != 0 {
+        return Ok(Outcome::empty());
+    }
+    let spawn = ctx.server.play.world().spawn_position();
+    let is_flat = ctx.server.play.world().flat_config().is_some();
+    let state = play(ctx.session)?;
+    if !state.player.dead {
+        return Ok(Outcome::empty());
+    }
+    let tp_id = state.next_teleport;
+    state.next_teleport = tp_id
+        .checked_add(1)
+        .ok_or_else(|| invalid("teleport ID exhausted"))?;
+    state.pending_teleport = Some((tp_id, Instant::now()));
+    state.player.respawn_at(spawn);
+    state.chunks.follow(spawn[0], spawn[2]);
+    let game_mode = state.player.game_mode;
+    let health = state.player.health;
+    let food = state.player.food;
+    let saturation = state.player.saturation;
+    let pose = state.player.pose();
+    let view = state.chunks.view();
+    if let Some(slot) = &ctx.session.reservation {
+        slot.set_view(view.0, view.1);
+        slot.update_pose(pose);
+    }
+    let mut replies = vec![
+        Respawn { game_mode, is_flat }.into(),
+        PlayerAbilities(game_mode).into(),
+        UpdateHealth::new(health, food, saturation).into(),
+        PlayerPosition::at(spawn, 0.0, 0.0, tp_id).into(),
+    ];
+    if game_mode != GameMode::Spectator {
+        replies.push(InventoryContent::player(&ctx.session.inventory).into());
+        replies.push(SelectedSlot(ctx.session.inventory.selected()).into());
+    }
+    Ok(Outcome {
+        replies,
+        close: false,
+        encryption: None,
+    })
 }
 
 pub async fn handle_arm_animation(

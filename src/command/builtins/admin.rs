@@ -214,10 +214,14 @@ pub(super) fn register_gamemode(b: &mut CommandRegistryBuilder) {
         )
         .unwrap();
     for (name, mode) in [
+        ("survival", GameMode::Survival),
         ("creative", GameMode::Creative),
         ("spectator", GameMode::Spectator),
     ] {
         let self_exec: Executor = match mode {
+            GameMode::Survival => {
+                |call, host| execute_gamemode(call, host, GameMode::Survival, false)
+            }
             GameMode::Creative => {
                 |call, host| execute_gamemode(call, host, GameMode::Creative, false)
             }
@@ -226,6 +230,9 @@ pub(super) fn register_gamemode(b: &mut CommandRegistryBuilder) {
             }
         };
         let target_exec: Executor = match mode {
+            GameMode::Survival => {
+                |call, host| execute_gamemode(call, host, GameMode::Survival, true)
+            }
             GameMode::Creative => {
                 |call, host| execute_gamemode(call, host, GameMode::Creative, true)
             }
@@ -252,6 +259,7 @@ fn execute_gamemode(
     has_targets: bool,
 ) -> io::Result<CommandResult> {
     let label = match mode {
+        GameMode::Survival => "survival",
         GameMode::Creative => "creative",
         GameMode::Spectator => "spectator",
     };

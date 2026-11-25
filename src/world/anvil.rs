@@ -62,6 +62,9 @@ pub struct SavedPlayer {
     pub pitch: f32,
     pub on_ground: bool,
     pub game_mode: GameMode,
+    pub health: f32,
+    pub food: i32,
+    pub saturation: f32,
     pub inventory: Inventory,
 }
 
@@ -333,9 +336,25 @@ impl AnvilStorage {
         };
         let on_ground = root.get("OnGround").and_then(Tag::as_byte).unwrap_or(0) != 0;
         let game_mode = match root.get("playerGameType").and_then(Tag::as_int) {
+            Some(0) => GameMode::Survival,
             Some(1) => GameMode::Creative,
             _ => GameMode::Spectator,
         };
+        let health = root
+            .get("Health")
+            .and_then(Tag::as_float)
+            .unwrap_or(20.0)
+            .clamp(0.0, 20.0);
+        let food = root
+            .get("foodLevel")
+            .and_then(Tag::as_int)
+            .unwrap_or(20)
+            .clamp(0, 20);
+        let saturation = root
+            .get("foodSaturationLevel")
+            .and_then(Tag::as_float)
+            .unwrap_or(5.0)
+            .clamp(0.0, 20.0);
         let selected = root
             .get("SelectedItemSlot")
             .and_then(Tag::as_int)
@@ -383,6 +402,9 @@ impl AnvilStorage {
             pitch,
             on_ground,
             game_mode,
+            health,
+            food,
+            saturation,
             inventory,
         }))
     }
@@ -407,6 +429,9 @@ impl AnvilStorage {
             "playerGameType".into(),
             Tag::Int(i32::from(player.game_mode.wire_id())),
         );
+        root.insert("Health".into(), Tag::Float(player.health));
+        root.insert("foodLevel".into(), Tag::Int(player.food));
+        root.insert("foodSaturationLevel".into(), Tag::Float(player.saturation));
         root.insert(
             "SelectedItemSlot".into(),
             Tag::Int(i32::from(inventory.selected())),

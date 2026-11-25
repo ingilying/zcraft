@@ -27,6 +27,7 @@ type PendingChunk = (Arc<Chunk>, Arc<[u8]>);
 pub(super) struct CreativeSession {
     world: Arc<World>,
     pending_chunks: HashMap<[i32; 2], PendingChunk>,
+    mining: Option<(BlockPos, tokio::time::Instant)>,
 }
 
 impl CreativeSession {
@@ -34,6 +35,7 @@ impl CreativeSession {
         Self {
             world,
             pending_chunks: HashMap::new(),
+            mining: None,
         }
     }
 
@@ -87,7 +89,7 @@ enum Action {
     Dig {
         pos: BlockPos,
         face: u8,
-        start: bool,
+        kind: i32,
     },
     Place {
         support: BlockPos,
@@ -101,22 +103,101 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
     let session = &mut *ctx.session;
     let state = session
         .play
-        .as_ref()
+        .as_mut()
         .ok_or_else(|| crate::protocol::invalid("Play session not initialized"))?;
-    if !state.player.is_creative() {
+    if !state.player.can_interact() || state.player.dead {
         return Ok(reply(vec![BlockAck(sequence).into()]));
     }
     let Some(slot) = session.reservation.as_ref() else {
         return Ok(reply(vec![BlockAck(sequence).into()]));
     };
+    let is_survival = state.player.is_survival();
+    let world = state.blocks.world.clone();
+    let ack: Arc<[u8]> = Clientbound::from(BlockAck(sequence)).encode()?.into();
+
+    // Handle Survival mining start/cancel without triggering block correction.
+    if is_survival && let Action::Dig { pos, face, kind } = action {
+        if kind == 1 {
+            state.blocks.mining = None;
+            slot.correct_blocks(Vec::new(), ack);
+            return Ok(Outcome::empty());
+        }
+        if kind == 0 {
+            let valid = pos.valid() && state.chunks.tracks(pos.chunk());
+            let reachable = valid && state.player.in_reach(pos);
+            let current = world.block_at(pos);
+            if face < 6
+                && reachable
+                && current != crate::game::AIR_STATE
+                && let Some(def) = crate::game::block_by_state(current)
+                && def.hardness > 0.0
+            {
+                state.blocks.mining = Some((pos, tokio::time::Instant::now()));
+                slot.correct_blocks(Vec::new(), ack);
+                return Ok(Outcome::empty());
+            }
+        }
+    }
+
     let valid = |pos: BlockPos| pos.valid() && state.chunks.tracks(pos.chunk());
     let reachable = |pos: BlockPos| valid(pos) && state.player.in_reach(pos);
-    let world = &state.blocks.world;
+    let mut survival_dig_drop: Option<(BlockPos, crate::game::ItemStack)> = None;
+    let mut survival_damage_tool = false;
+    let mut survival_consume_hand: Option<Hand> = None;
+
     let (positions, edit) = match action {
-        Action::Dig { pos, face, start } => {
+        Action::Dig { pos, face, kind } => {
             let current = world.block_at(pos);
-            let edit = if start && face < 6 && reachable(pos) && current != crate::game::AIR_STATE {
-                Some((pos, crate::game::AIR_STATE))
+            let edit = if !is_survival {
+                if kind == 0 && face < 6 && reachable(pos) && current != crate::game::AIR_STATE {
+                    Some((pos, crate::game::AIR_STATE))
+                } else {
+                    None
+                }
+            } else if face < 6 && reachable(pos) && current != crate::game::AIR_STATE {
+                crate::game::registry().state_by_id(current).and_then(
+                    |(block_idx, block_def, state_def)| {
+                        if state_def.hardness < 0.0 {
+                            return None;
+                        }
+                        let tool_item = session.inventory.hand(Hand::Main).map(|s| s.item);
+                        let can_harvest = !state_def.correct_tool
+                            || crate::game::registry().correct_for_drops(tool_item, block_idx);
+                        let allowed = if state_def.hardness == 0.0 {
+                            kind == 0 || kind == 2
+                        } else if kind == 2 {
+                            let speed = if can_harvest {
+                                crate::game::registry()
+                                    .tool_speed(tool_item, block_idx)
+                                    .max(1.0)
+                            } else {
+                                1.0
+                            };
+                            let expected = f64::from(state_def.hardness)
+                                * if can_harvest { 1.5 } else { 5.0 }
+                                / f64::from(speed);
+                            state.blocks.mining.take().is_some_and(|(mpos, started)| {
+                                mpos == pos && started.elapsed().as_secs_f64() >= expected * 0.7
+                            })
+                        } else {
+                            false
+                        };
+                        if !allowed {
+                            return None;
+                        }
+                        if state_def.hardness > 0.0 {
+                            survival_damage_tool = true;
+                        }
+                        if can_harvest
+                            && let Some(item_name) = block_def.item.as_deref()
+                            && let Some(item_def) = crate::game::item_by_name(item_name)
+                            && let Some(stack) = crate::game::ItemStack::new(item_def.id, 1)
+                        {
+                            survival_dig_drop = Some((pos, stack));
+                        }
+                        Some((pos, crate::game::AIR_STATE))
+                    },
+                )
             } else {
                 None
             };
@@ -154,7 +235,7 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
                         target_state,
                     },
                 )?;
-                match placement {
+                let resolved = match placement {
                     crate::game::PlacementResult::MergeSupport(material) => {
                         let placed = crate::game::block_by_state(material)?;
                         (!placed.collision || !state.player.intersects_block(support))
@@ -171,12 +252,15 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
                             && (!placed.collision || !state.player.intersects_block(pos)))
                         .then_some((pos, material))
                     }
+                };
+                if resolved.is_some() && is_survival {
+                    survival_consume_hand = Some(hand);
                 }
+                resolved
             });
             ([Some(support), place], edit)
         }
     };
-    let ack: Arc<[u8]> = Clientbound::from(BlockAck(sequence)).encode()?.into();
     if state.pending_teleport.is_none()
         && let Some((pos, material)) = edit
         && let Some(mutation) = world.set_block(pos, material)
@@ -193,6 +277,34 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
         }
         let data = encode_chunk_updates(chunk, mutation.block_changes, center_light)?;
         slot.publish_blocks(chunk, data, ack);
+
+        let mut inv_changed = false;
+        if survival_damage_tool {
+            inv_changed |=
+                session.inventory.damage_hand(Hand::Main) == crate::game::ClickResult::Changed;
+        }
+        if let Some(hand) = survival_consume_hand {
+            inv_changed |=
+                session.inventory.drop_hand(hand, false) == crate::game::ClickResult::Changed;
+        }
+        if let Some((drop_pos, stack)) = survival_dig_drop {
+            let drop_xyz = [
+                f64::from(drop_pos.0[0]) + 0.5,
+                f64::from(drop_pos.0[1]) + 0.5,
+                f64::from(drop_pos.0[2]) + 0.5,
+            ];
+            ctx.server.play.spawn_item_drop(
+                ctx.server.players(),
+                drop_xyz,
+                [0.0, 0.2, 0.0],
+                stack,
+                10,
+            )?;
+        }
+        if inv_changed {
+            sync_equipment(ctx)?;
+            return inventory(ctx);
+        }
         return Ok(Outcome::empty());
     }
     let mut corrections = Vec::new();
@@ -223,17 +335,38 @@ pub async fn handle_dig(ctx: &mut Context<'_>, p: PlayerDigging) -> io::Result<O
             Action::Dig {
                 pos: p.pos,
                 face: p.face,
-                start: p.action == 0,
+                kind: p.action,
             },
             p.sequence,
         ),
-        3 => {
-            ctx.session.inventory.drop_hand(Hand::Main, true);
-            sync_equipment(ctx)?;
-            inventory(ctx)
-        }
-        4 => {
-            ctx.session.inventory.drop_hand(Hand::Main, false);
+        3 | 4 => {
+            let all = p.action == 3;
+            let dropped = ctx.session.inventory.hand(Hand::Main).map(|mut s| {
+                if !all {
+                    s.count = 1;
+                }
+                s
+            });
+            if ctx.session.inventory.drop_hand(Hand::Main, all) == crate::game::ClickResult::Changed
+                && let Some(stack) = dropped
+            {
+                let (eye, yaw, pitch) = {
+                    let st = play(ctx.session)?;
+                    (st.player.eye_position(), st.player.yaw, st.player.pitch)
+                };
+                let yaw_rad = f64::from(yaw).to_radians();
+                let pitch_rad = f64::from(pitch).to_radians();
+                let vx = -yaw_rad.sin() * pitch_rad.cos() * 0.3;
+                let vy = -pitch_rad.sin() * 0.3 + 0.1;
+                let vz = yaw_rad.cos() * pitch_rad.cos() * 0.3;
+                ctx.server.play.spawn_item_drop(
+                    ctx.server.players(),
+                    eye,
+                    [vx, vy, vz],
+                    stack,
+                    40,
+                )?;
+            }
             sync_equipment(ctx)?;
             inventory(ctx)
         }
@@ -250,7 +383,8 @@ pub async fn handle_dig(ctx: &mut Context<'_>, p: PlayerDigging) -> io::Result<O
 pub async fn handle_place(ctx: &mut Context<'_>, p: BlockPlace) -> io::Result<Outcome> {
     // Right-clicking a chest while not sneaking opens its 27-slot container.
     if let Ok(state) = play(ctx.session)
-        && state.player.is_creative()
+        && state.player.can_interact()
+        && !state.player.dead
         && !state.player.sneaking
         && state.pending_teleport.is_none()
         && state.player.in_reach(p.pos)
@@ -339,7 +473,7 @@ pub async fn handle_use_item(ctx: &mut Context<'_>, p: UseItem) -> io::Result<Ou
             .session
             .play
             .as_ref()
-            .is_some_and(|state| state.player.is_creative())
+            .is_some_and(|state| state.player.can_interact())
     {
         // Future food/tools/projectiles dispatch through item categories here. Even a
         // no-op use is acknowledged in the same FIFO as block predictions.
@@ -371,7 +505,7 @@ fn sync_equipment(ctx: &mut Context<'_>) -> io::Result<()> {
 }
 
 fn inventory(ctx: &mut Context<'_>) -> io::Result<Outcome> {
-    if play(ctx.session)?.player.is_creative() {
+    if play(ctx.session)?.player.can_interact() {
         Ok(reply(vec![
             InventoryContent::player(&ctx.session.inventory).into(),
         ]))
@@ -410,7 +544,7 @@ pub async fn handle_inventory_click(
     ctx: &mut Context<'_>,
     p: InventoryClickPacket,
 ) -> io::Result<Outcome> {
-    if !play(ctx.session)?.player.is_creative() {
+    if !play(ctx.session)?.player.can_interact() {
         return Ok(Outcome::empty());
     }
     if p.window != 0 {

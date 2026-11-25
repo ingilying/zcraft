@@ -14,6 +14,7 @@ pub const DEFAULT_COMPRESSION_THRESHOLD: i32 = 256;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GameMode {
+    Survival,
     #[default]
     Spectator,
     Creative,
@@ -22,6 +23,7 @@ pub enum GameMode {
 impl GameMode {
     pub(crate) fn wire_id(self) -> u8 {
         match self {
+            Self::Survival => 0,
             Self::Creative => 1,
             Self::Spectator => 3,
         }

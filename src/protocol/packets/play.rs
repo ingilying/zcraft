@@ -47,14 +47,104 @@ pub struct PlayerAbilities(pub GameMode);
 
 impl Encode for PlayerAbilities {
     fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
-        out.push(if self.0 == GameMode::Creative {
-            0x0d
-        } else {
-            0x07
+        out.push(match self.0 {
+            GameMode::Survival => 0x00,
+            GameMode::Creative => 0x0d,
+            GameMode::Spectator => 0x07,
         });
         out.extend_from_slice(&0.05f32.to_be_bytes());
         out.extend_from_slice(&0.1f32.to_be_bytes());
         Ok(())
+    }
+}
+
+/// Clientbound 0x5d: Set Health (health, food, saturation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateHealth {
+    health_bits: u32,
+    food: i32,
+    saturation_bits: u32,
+}
+
+impl UpdateHealth {
+    pub fn new(health: f32, food: i32, saturation: f32) -> Self {
+        Self {
+            health_bits: health.to_bits(),
+            food,
+            saturation_bits: saturation.to_bits(),
+        }
+    }
+}
+
+impl Encode for UpdateHealth {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        out.extend_from_slice(&self.health_bits.to_be_bytes());
+        put_varint(self.food, out);
+        out.extend_from_slice(&self.saturation_bits.to_be_bytes());
+        Ok(())
+    }
+}
+
+/// Clientbound 0x24: Hurt Animation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HurtAnimation {
+    id: i32,
+    yaw_bits: u32,
+}
+
+impl HurtAnimation {
+    pub fn new(id: i32, yaw: f32) -> Self {
+        Self {
+            id,
+            yaw_bits: yaw.to_bits(),
+        }
+    }
+}
+
+impl Encode for HurtAnimation {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        put_varint(self.id, out);
+        out.extend_from_slice(&self.yaw_bits.to_be_bytes());
+        Ok(())
+    }
+}
+
+/// Clientbound 0x47: Respawn (Java 1.21.1 / protocol 767).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Respawn {
+    pub game_mode: GameMode,
+    pub is_flat: bool,
+}
+
+impl Encode for Respawn {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        put_varint(0, out); // Overworld dimension type ID.
+        put_string("minecraft:overworld", out)?;
+        out.extend_from_slice(&0i64.to_be_bytes()); // Hashed seed.
+        out.push(self.game_mode.wire_id());
+        out.push(0xff); // Previous game mode = -1.
+        out.push(0); // is_debug = false.
+        out.push(u8::from(self.is_flat));
+        out.push(0); // has_death_location = false.
+        put_varint(0, out); // Portal cooldown.
+        out.push(0x00); // data_kept = 0 (fresh respawn after death).
+        Ok(())
+    }
+}
+
+/// Serverbound 0x09: Client Command (`0` = Perform Respawn, `1` = Request Stats).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientCommand {
+    pub action: i32,
+}
+
+impl Decode for ClientCommand {
+    fn decode(reader: &mut Reader<'_>) -> io::Result<Self> {
+        let action = reader.varint()?;
+        if !(0..=1).contains(&action) {
+            return Err(invalid("invalid client command action"));
+        }
+        Ok(Self { action })
     }
 }
 

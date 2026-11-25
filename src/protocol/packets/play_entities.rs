@@ -6,8 +6,9 @@ use crate::{
 use std::io;
 use uuid::Uuid;
 
-// minecraft-data 1.21.1 entity registry. Players use Add Entity in 767.
+// minecraft-data 1.21.1 entity registry.
 const PLAYER_ENTITY_TYPE: i32 = 128;
+const ITEM_ENTITY_TYPE: i32 = 58;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntityPose {
@@ -153,27 +154,140 @@ impl Encode for EntityAnimation {
     }
 }
 
-/// Clientbound 0x58: Set Entity Metadata (flags + Pose for sneaking/sprinting).
+#[derive(Debug, PartialEq, Eq)]
+pub enum SpawnEntity {
+    Player(SpawnPlayer),
+    Item {
+        id: i32,
+        uuid: Uuid,
+        position_bits: [u64; 3],
+        velocity_scaled: [i16; 3],
+    },
+}
+
+impl SpawnEntity {
+    pub fn item(id: i32, uuid: Uuid, position: [f64; 3], velocity: [f64; 3]) -> Self {
+        Self::Item {
+            id,
+            uuid,
+            position_bits: position.map(f64::to_bits),
+            velocity_scaled: velocity.map(|v| (v.clamp(-3.9, 3.9) * 8000.0).round() as i16),
+        }
+    }
+}
+
+impl Encode for SpawnEntity {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        match self {
+            Self::Player(player) => player.encode(out),
+            Self::Item {
+                id,
+                uuid,
+                position_bits,
+                velocity_scaled,
+            } => {
+                put_varint(*id, out);
+                out.extend_from_slice(uuid.as_bytes());
+                put_varint(ITEM_ENTITY_TYPE, out);
+                for coord in position_bits {
+                    out.extend_from_slice(&coord.to_be_bytes());
+                }
+                out.extend_from_slice(&[0, 0, 0, 0]); // pitch, yaw, head_yaw, data
+                for scaled in velocity_scaled {
+                    out.extend_from_slice(&scaled.to_be_bytes());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Clientbound 0x5a: Set Entity Velocity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityVelocity {
+    id: i32,
+    velocity_scaled: [i16; 3],
+}
+
+impl EntityVelocity {
+    pub fn new(id: i32, velocity: [f64; 3]) -> Self {
+        Self {
+            id,
+            velocity_scaled: velocity.map(|v| (v.clamp(-3.9, 3.9) * 8000.0).round() as i16),
+        }
+    }
+}
+
+impl Encode for EntityVelocity {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        put_varint(self.id, out);
+        for scaled in self.velocity_scaled {
+            out.extend_from_slice(&scaled.to_be_bytes());
+        }
+        Ok(())
+    }
+}
+
+/// Clientbound 0x6f: Pickup Item animation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectItem {
+    pub collected_id: i32,
+    pub collector_id: i32,
+    pub count: i32,
+}
+
+impl Encode for CollectItem {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        put_varint(self.collected_id, out);
+        put_varint(self.collector_id, out);
+        put_varint(self.count, out);
+        Ok(())
+    }
+}
+
+/// Clientbound 0x58: Set Entity Metadata (player sneak/sprint or dropped item stack).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EntityMetadata {
-    pub id: i32,
-    pub sneaking: bool,
-    pub sprinting: bool,
+pub enum EntityMetadata {
+    Player {
+        id: i32,
+        sneaking: bool,
+        sprinting: bool,
+    },
+    Item {
+        id: i32,
+        stack: ItemStack,
+    },
 }
 
 impl Encode for EntityMetadata {
     fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
-        put_varint(self.id, out);
-        // Index 0: Entity shared flags (type 0 = Byte).
-        let flags = (u8::from(self.sneaking) << 1) | (u8::from(self.sprinting) << 3);
-        out.push(0);
-        put_varint(0, out);
-        out.push(flags);
-        // Index 6: Entity Pose (type 21 = Pose VarInt; 0 = STANDING, 5 = CROUCHING).
-        out.push(6);
-        put_varint(21, out);
-        put_varint(if self.sneaking { 5 } else { 0 }, out);
-        out.push(0xff); // Metadata terminator.
+        match *self {
+            Self::Player {
+                id,
+                sneaking,
+                sprinting,
+            } => {
+                put_varint(id, out);
+                // Index 0: Entity shared flags (type 0 = Byte).
+                let flags = (u8::from(sneaking) << 1) | (u8::from(sprinting) << 3);
+                out.push(0);
+                put_varint(0, out);
+                out.push(flags);
+                // Index 6: Entity Pose (type 21 = Pose VarInt; 0 = STANDING, 5 = CROUCHING).
+                out.push(6);
+                put_varint(21, out);
+                put_varint(if sneaking { 5 } else { 0 }, out);
+                out.push(0xff);
+            }
+            Self::Item { id, stack } => {
+                put_varint(id, out);
+                // Index 8: ItemEntity item stack (type 7 = Slot).
+                out.push(8);
+                put_varint(7, out);
+                put_item_stack(Some(stack), out);
+                out.push(0xff);
+            }
+        }
         Ok(())
     }
 }
@@ -211,11 +325,11 @@ mod tests {
         let uuid = Uuid::from_bytes([0xAB; 16]);
         let encode = |packet: Clientbound| packet.encode().unwrap();
         let spawn = encode(
-            SpawnPlayer {
+            SpawnEntity::Player(SpawnPlayer {
                 id: 300,
                 uuid,
                 pose,
-            }
+            })
             .into(),
         );
         assert_eq!(&spawn[..3], &[0x01, 0xAC, 2]);
@@ -256,7 +370,7 @@ mod tests {
         );
         assert_eq!(
             encode(
-                EntityMetadata {
+                EntityMetadata::Player {
                     id: 5,
                     sneaking: true,
                     sprinting: true,

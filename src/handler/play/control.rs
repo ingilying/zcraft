@@ -7,7 +7,7 @@ use crate::{
     protocol::{
         invalid,
         packets::{
-            play::{GameEvent, PlayerAbilities, PlayerPosition},
+            play::{GameEvent, PlayerAbilities, PlayerPosition, UpdateHealth},
             play_blocks::{InventoryContent, SelectedSlot},
             play_chat::DeclareCommands,
         },
@@ -80,7 +80,17 @@ pub(crate) fn apply_control(
                 GameEvent::change_game_mode(mode).into(),
                 PlayerAbilities(mode).into(),
             ];
-            if mode == GameMode::Creative {
+            if mode == GameMode::Survival {
+                replies.push(
+                    UpdateHealth::new(
+                        state.player.health,
+                        state.player.food,
+                        state.player.saturation,
+                    )
+                    .into(),
+                );
+            }
+            if mode != GameMode::Spectator {
                 replies.push(InventoryContent::player(&session.inventory).into());
                 replies.push(SelectedSlot(session.inventory.selected()).into());
             }
