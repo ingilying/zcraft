@@ -10,7 +10,7 @@ use tokio::time::Instant;
 
 const STREAM_INTERVAL: Duration = Duration::from_millis(50);
 const FEEDBACK_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_BATCH: usize = 8;
+const MAX_BATCH: usize = 16;
 const MAX_UNLOAD: usize = 32;
 
 type Chunk = [i32; 2];

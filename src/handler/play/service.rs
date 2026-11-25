@@ -48,7 +48,7 @@ pub struct PlayService {
 
 impl PlayService {
     pub fn new() -> io::Result<Self> {
-        Self::with_max_view_distance(world::VIEW_DISTANCE)
+        Self::with_max_view_distance(world::DEFAULT_VIEW_DISTANCE)
     }
 
     pub fn with_max_view_distance(max_view_distance: i32) -> io::Result<Self> {
@@ -202,11 +202,12 @@ impl PlayService {
             });
         }
         if let Some(old_id) = evicted {
-            let _ = players.broadcast(&RemoveEntities(vec![old_id]).into());
+            let _ = players.broadcast_entity_packet(&RemoveEntities(vec![old_id]).into());
         }
-        let _ = players.broadcast(&SpawnEntity::item(id, uuid, position, velocity).into());
-        let _ = players.broadcast(&EntityMetadata::Item { id, stack }.into());
-        let _ = players.broadcast(&EntityVelocity::new(id, velocity).into());
+        let _ = players
+            .broadcast_entity_packet(&SpawnEntity::item(id, uuid, position, velocity).into());
+        let _ = players.broadcast_entity_packet(&EntityMetadata::Item { id, stack }.into());
+        let _ = players.broadcast_entity_packet(&EntityVelocity::new(id, velocity).into());
         Ok(())
     }
 
@@ -261,7 +262,7 @@ impl PlayService {
             });
         }
         if !expired.is_empty() {
-            let _ = players.broadcast(&RemoveEntities(expired).into());
+            let _ = players.broadcast_entity_packet(&RemoveEntities(expired).into());
         }
         for (uuid, drop_id, player_id, stack) in collected {
             players.send_control(
@@ -271,7 +272,7 @@ impl PlayService {
                     count: u32::from(stack.count),
                 },
             );
-            let _ = players.broadcast(
+            let _ = players.broadcast_entity_packet(
                 &CollectItem {
                     collected_id: drop_id,
                     collector_id: player_id,
@@ -279,7 +280,7 @@ impl PlayService {
                 }
                 .into(),
             );
-            let _ = players.broadcast(&RemoveEntities(vec![drop_id]).into());
+            let _ = players.broadcast_entity_packet(&RemoveEntities(vec![drop_id]).into());
         }
     }
 

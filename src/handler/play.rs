@@ -126,6 +126,12 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         open_container: None,
         next_window_id: 1,
     });
+    tracing::info!(
+        player = %profile.name,
+        uuid = %profile.uuid,
+        game_mode = ?game_mode,
+        "joined the game"
+    );
     let mut replies = vec![
         JoinGame {
             entity_id,
@@ -169,6 +175,11 @@ pub(crate) fn save_session(session: &Session, play: &PlayService) {
     let Some(play_session) = &session.play else {
         return;
     };
+    tracing::info!(
+        player = %play_session.player.name,
+        uuid = %play_session.player.uuid,
+        "left the game"
+    );
     if let Err(error) = play.save_player(&play_session.player, &session.inventory) {
         tracing::warn!(
             uuid = %play_session.player.uuid,
@@ -375,20 +386,25 @@ fn movement(
                     encryption: None,
                 });
             }
+            let spawn = ctx.server.play.world().spawn_position();
             let id = state.next_teleport;
             state.next_teleport = id
                 .checked_add(1)
                 .ok_or_else(|| invalid("teleport ID exhausted"))?;
             state.pending_teleport = Some((id, Instant::now()));
-            state.player.reset_to_spawn();
-            state.chunks.follow(world::SPAWN_X, world::SPAWN_Z);
+            state.player.position = spawn;
+            state.player.yaw = 0.0;
+            state.player.pitch = 0.0;
+            state.player.on_ground = false;
+            state.player.fall_distance = 0.0;
+            state.chunks.follow(spawn[0], spawn[2]);
             if let Some(slot) = slot
                 && old_view != state.chunks.view()
             {
                 state.update_view(slot);
             }
             return Ok(Outcome {
-                replies: vec![PlayerPosition::spawn(id).into()],
+                replies: vec![PlayerPosition::at(spawn, 0.0, 0.0, id).into()],
                 close: false,
                 encryption: None,
             });
@@ -578,8 +594,14 @@ pub async fn handle_client_command(
     if packet.action != 0 {
         return Ok(Outcome::empty());
     }
-    let spawn = ctx.server.play.world().spawn_position();
-    let is_flat = ctx.server.play.world().flat_config().is_some();
+    let world = ctx.server.play.world().clone();
+    let spawn = world.spawn_position();
+    let is_flat = world.flat_config().is_some();
+    let view_distance = ctx
+        .server
+        .play
+        .view_distance(ctx.session.client_information.as_ref());
+    let now = Instant::now();
     let state = play(ctx.session)?;
     if !state.player.dead {
         return Ok(Outcome::empty());
@@ -588,29 +610,39 @@ pub async fn handle_client_command(
     state.next_teleport = tp_id
         .checked_add(1)
         .ok_or_else(|| invalid("teleport ID exhausted"))?;
-    state.pending_teleport = Some((tp_id, Instant::now()));
+    state.pending_teleport = Some((tp_id, now));
     state.player.respawn_at(spawn);
-    state.chunks.follow(spawn[0], spawn[2]);
+
+    // Respawn (0x47) clears the client's chunk cache, so reset ChunkStream and
+    // re-stream the initial spawn batch before teleporting the player.
+    let spawn_chunk = world::chunk_at(spawn[0], spawn[2]);
+    state.chunks = ChunkStream::at(spawn_chunk, view_distance, now);
+    state.blocks = blocks::CreativeSession::new(world.clone());
+    let mut first_batch = state.chunks.pump(world.terrain(), now);
+    state.blocks.prepare_chunks(&mut first_batch);
+
     let game_mode = state.player.game_mode;
     let health = state.player.health;
     let food = state.player.food;
     let saturation = state.player.saturation;
     let pose = state.player.pose();
-    let view = state.chunks.view();
     if let Some(slot) = &ctx.session.reservation {
-        slot.set_view(view.0, view.1);
+        slot.set_view(spawn_chunk, view_distance);
         slot.update_pose(pose);
     }
     let mut replies = vec![
         Respawn { game_mode, is_flat }.into(),
         PlayerAbilities(game_mode).into(),
         UpdateHealth::new(health, food, saturation).into(),
-        PlayerPosition::at(spawn, 0.0, 0.0, tp_id).into(),
+        CenterChunk(spawn_chunk).into(),
+        GameEvent::level_chunks_load_start().into(),
     ];
     if game_mode != GameMode::Spectator {
         replies.push(InventoryContent::player(&ctx.session.inventory).into());
         replies.push(SelectedSlot(ctx.session.inventory.selected()).into());
     }
+    replies.extend(first_batch);
+    replies.push(PlayerPosition::at(spawn, 0.0, 0.0, tp_id).into());
     Ok(Outcome {
         replies,
         close: false,

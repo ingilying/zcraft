@@ -356,6 +356,38 @@ impl Players {
         Ok(report)
     }
 
+    /// Broadcast an entity lifecycle packet (`SpawnEntity`, `EntityMetadata`,
+    /// `EntityVelocity`, `CollectItem`, `RemoveEntities`, `HurtAnimation`) to
+    /// all ready players in Play.
+    pub(crate) fn broadcast_entity_packet(&self, packet: &Clientbound) -> io::Result<()> {
+        if !matches!(
+            packet,
+            Clientbound::SpawnEntity(_)
+                | Clientbound::EntityMetadata(_)
+                | Clientbound::EntityVelocity(_)
+                | Clientbound::CollectItem(_)
+                | Clientbound::RemoveEntities(_)
+                | Clientbound::HurtAnimation(_)
+        ) {
+            return Err(invalid("packet is not a supported entity broadcast"));
+        }
+        let body: Arc<[u8]> = packet.encode()?.into();
+        let mut registry = lock(&self.registry);
+        let mut lagged = Vec::new();
+        for (&uuid, slot) in &mut registry.players {
+            if !slot.receiving || slot.lagged {
+                continue;
+            }
+            if !slot.enqueue(Delivery::Packet(body.clone())) {
+                lagged.push(uuid);
+            }
+        }
+        for uuid in lagged {
+            registry.deactivate(uuid);
+        }
+        Ok(())
+    }
+
     /// Enqueue a server-initiated control action for a ready Play player.
     pub(crate) fn send_control(&self, uuid: Uuid, control: PlayerControl) -> bool {
         let mut registry = lock(&self.registry);

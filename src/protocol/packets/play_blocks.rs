@@ -98,6 +98,10 @@ fn item_stack(r: &mut Reader<'_>) -> io::Result<IncomingStack> {
     if !(0..=64).contains(&added) {
         return Err(invalid("invalid added component count"));
     }
+    let removed = r.varint()?;
+    if !(0..=64).contains(&removed) {
+        return Err(invalid("invalid removed component count"));
+    }
     let mut damage = 0;
     for _ in 0..added {
         match r.varint()? {
@@ -110,10 +114,6 @@ fn item_stack(r: &mut Reader<'_>) -> io::Result<IncomingStack> {
             }
             _ => return Err(invalid("unsupported item component")),
         }
-    }
-    let removed = r.varint()?;
-    if !(0..=64).contains(&removed) {
-        return Err(invalid("invalid removed component count"));
     }
     for _ in 0..removed {
         r.varint()?;
@@ -131,12 +131,12 @@ pub(crate) fn put_item_stack(stack: Option<ItemStack>, out: &mut Vec<u8>) {
     if let Some(stack) = stack {
         put_varint(i32::from(stack.count), out);
         put_varint(stack.item, out);
-        put_varint(i32::from(stack.damage > 0), out);
+        put_varint(i32::from(stack.damage > 0), out); // addedComponentCount
+        put_varint(0, out); // removedComponentCount
         if stack.damage > 0 {
-            put_varint(3, out);
+            put_varint(3, out); // minecraft:damage
             put_varint(stack.damage as i32, out);
         }
-        put_varint(0, out)
     } else {
         put_varint(0, out)
     }
@@ -422,6 +422,13 @@ mod tests {
         let pickaxe = crate::game::item_by_name("wooden_pickaxe").unwrap().id;
         let damaged_stack = ItemStack::with_damage(pickaxe, 1, 7).unwrap();
         put_item_stack(Some(damaged_stack), &mut damaged);
+        // Verify exact protocol 767 Slot field order: count, id, added, removed, [type=3, value=7].
+        let mut expected_wire = Vec::new();
+        expected_wire.extend(39i16.to_be_bytes());
+        for v in [1, pickaxe, 1, 0, 3, 7] {
+            put_varint(v, &mut expected_wire);
+        }
+        assert_eq!(damaged, expected_wire);
         let mut r = Reader::new(&damaged);
         assert_eq!(
             CreativeSlot::decode(&mut r).unwrap().item,
