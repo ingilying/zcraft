@@ -60,12 +60,11 @@ impl BlockWorld {
 }
 
 fn base(y: i32) -> i32 {
-    use crate::game::BlockKind::*;
     match y {
-        60 => Bedrock.state(),
-        61 | 62 => Dirt.state(),
-        63 => GrassBlock.state(),
-        _ => Air.state(),
+        60 => crate::game::BEDROCK_STATE,
+        61 | 62 => crate::game::DIRT_STATE,
+        63 => crate::game::GRASS_BLOCK_STATE,
+        _ => crate::game::AIR_STATE,
     }
 }
 
@@ -170,7 +169,7 @@ fn heights(edits: &Edits, qualifies: impl Fn(i32) -> bool) -> [u16; 256] {
 pub(crate) fn sky_heights(edits: &Snapshot) -> [u16; 256] {
     match edits {
         Some(edits) => heights(edits, |state| {
-            crate::game::block_by_state(state).is_some_and(|block| block.blocks_skylight)
+            crate::game::block_by_state(state).is_some_and(|block| !block.skylight)
         }),
         None => [(SURFACE_Y + 1 - MIN_Y) as u16; 256],
     }
@@ -271,7 +270,7 @@ pub(crate) fn edited_payload(edits: &Arc<Edits>) -> Arc<[u8]> {
     out.extend(sections);
     put_varint(0, &mut out);
     out.extend_from_slice(&light_payload(&heights(edits, |state| {
-        crate::game::block_by_state(state).is_some_and(|block| block.blocks_skylight)
+        crate::game::block_by_state(state).is_some_and(|block| !block.skylight)
     })));
     out.into()
 }

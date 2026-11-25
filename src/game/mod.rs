@@ -1,15 +1,19 @@
-//! Small data-driven gameplay core. Protocol IDs live at the edge; handlers use
-//! stable typed definitions so adding blocks and items does not add packet logic.
-mod blocks;
+//! Data-driven Java 1.21.1 gameplay core. Protocol IDs live at the edge;
+//! generated definitions and shared behaviors replace per-item handler branches.
+mod data;
 mod inventory;
 mod items;
 
-pub use blocks::{
-    BlockDefinition, BlockKind, MiningLevel, MiningRequirement, ToolKind, block_by_name,
-    block_by_state, blocks,
+pub use data::{
+    BlockDefinition, BlockStateDefinition, GameRegistry, ItemDefinition, ToolRule, block_by_name,
+    block_by_state, blocks, item_by_id, item_by_name, items, registry,
 };
 pub use inventory::{ClickResult, Inventory, InventoryClick, SLOT_COUNT};
-pub use items::{
-    BlockItem, Hand, ItemCategory, ItemDefinition, ItemKind, ItemStack, ToolItem, item_by_id,
-    item_by_name, items,
-};
+pub use items::{Hand, ItemStack};
+
+pub const AIR_STATE: i32 = 0;
+pub const STONE_STATE: i32 = 1;
+pub const GRASS_BLOCK_STATE: i32 = 9;
+pub const DIRT_STATE: i32 = 10;
+pub const BEDROCK_STATE: i32 = 79;
+pub const GLASS_STATE: i32 = 519;

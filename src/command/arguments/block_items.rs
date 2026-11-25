@@ -40,17 +40,12 @@ impl BlockStateSpec {
         if self.name.namespace != "minecraft" {
             return Err(RegistryValueError::UnsupportedBlock);
         }
-        let id = crate::game::block_by_name(&self.name.path)
-            .ok_or(RegistryValueError::UnsupportedBlock)?
-            .state;
-        if !self.properties.is_empty()
-            && !(self.name.path == "grass_block"
-                && self.properties.len() == 1
-                && self.properties.get("snowy").is_some_and(|s| s == "false"))
-        {
-            return Err(RegistryValueError::UnsupportedProperty);
+        if crate::game::block_by_name(&self.name.path).is_none() {
+            return Err(RegistryValueError::UnsupportedBlock);
         }
-        Ok(id)
+        crate::game::registry()
+            .resolve_state(&self.name.path, &self.properties)
+            .ok_or(RegistryValueError::UnsupportedProperty)
     }
 }
 impl ItemSpec {
@@ -60,7 +55,7 @@ impl ItemSpec {
             return Err(RegistryValueError::UnsupportedItem);
         }
         crate::game::item_by_name(&self.name.path)
-            .map(|item| item.protocol_id)
+            .map(|item| item.id)
             .ok_or(RegistryValueError::UnsupportedItem)
     }
 }
@@ -196,11 +191,14 @@ fn suggest(ctx: &SuggestionContext<'_>, names: &[&str]) -> Vec<Suggestion> {
 fn suggest_blocks(ctx: &SuggestionContext<'_>) -> Vec<Suggestion> {
     let names: Vec<_> = crate::game::blocks()
         .iter()
-        .map(|block| block.name)
+        .filter_map(|block| block.name.strip_prefix("minecraft:"))
         .collect();
     suggest(ctx, &names)
 }
 fn suggest_items(ctx: &SuggestionContext<'_>) -> Vec<Suggestion> {
-    let names: Vec<_> = crate::game::items().iter().map(|item| item.name).collect();
+    let names: Vec<_> = crate::game::items()
+        .iter()
+        .filter_map(|item| item.name.strip_prefix("minecraft:"))
+        .collect();
     suggest(ctx, &names)
 }

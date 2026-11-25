@@ -114,24 +114,32 @@ async function run () {
   await change(b, target, 0, cursorB)
   move(b, 160.5, -160.5)
   await b.expect('unload_chunk', p => p.chunkX === 0 && p.chunkZ === 0, cursorB)
+  // Out-of-range item IDs are rejected; valid vanilla catalog items are accepted.
   cursorA = a.events.length
-  a.write('set_creative_slot', { slot: 38, item: { itemCount: 64, itemId: md.itemsByName.diamond_block.id, addedComponentCount: 0, removedComponentCount: 0, components: [], removeComponents: [] } })
-  const corrected = await a.expect('window_items', () => true, cursorA)
-  assert.equal(corrected.items[38].itemId, md.itemsByName.glass.id)
+  a.write('set_creative_slot', { slot: 38, item: stack(9999) })
+  const rejected = await a.expect('window_items', () => true, cursorA)
+  assert.equal(rejected.items[38].itemId, md.itemsByName.glass.id)
+  cursorA = a.events.length
+  a.write('set_creative_slot', { slot: 38, item: stack(md.itemsByName.iron_ore.id) })
+  await a.expect('window_items', p => p.items[38].itemId === md.itemsByName.iron_ore.id, cursorA)
+  const ironOre = md.blocksByName.iron_ore.defaultState
   slot(a, 2)
   place(a, support, 4)
-  await change(a, target, glass, cursorA)
+  await change(a, target, ironOre, cursorA)
   await ack(a, 4)
-  // Correct kind but insufficient level is denied; stone-tier pickaxe succeeds.
+  // Correct kind but insufficient tier is denied; stone-tier pickaxe succeeds.
   slot(a, 3)
   cursorA = a.events.length
   dig(a, target, 5)
-  await change(a, target, glass, cursorA)
+  await change(a, target, ironOre, cursorA)
   await ack(a, 5)
   slot(a, 4)
   dig(a, target, 6)
   await change(a, target, 0, cursorA)
   await ack(a, 6)
+  cursorA = a.events.length
+  a.write('set_creative_slot', { slot: 38, item: stack(md.itemsByName.glass.id) })
+  const corrected = await a.expect('window_items', p => p.items[38].itemId === md.itemsByName.glass.id, cursorA)
   slot(a, 2)
   place(a, support, 7)
   await change(a, target, glass, cursorA)

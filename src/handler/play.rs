@@ -176,7 +176,7 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
     ];
     if game_mode == GameMode::Creative {
         replies.extend([
-            Clientbound::from(InventoryContent(ctx.session.inventory.clone())),
+            Clientbound::from(InventoryContent(Box::new(ctx.session.inventory.clone()))),
             SelectedSlot(ctx.session.inventory.selected()).into(),
         ]);
     }

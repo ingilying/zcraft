@@ -55,10 +55,10 @@ const LIGHT_SECTION_COUNT: usize = SECTION_COUNT + 2;
 const SURFACE_Y: i32 = 63;
 const GROUND_SECTION: usize = ((SURFACE_Y - MIN_Y) / 16) as usize;
 const BLOCK_PALETTE: [i32; 4] = [
-    crate::game::BlockKind::Air.state(),
-    crate::game::BlockKind::Bedrock.state(),
-    crate::game::BlockKind::Dirt.state(),
-    crate::game::BlockKind::GrassBlock.state(),
+    crate::game::AIR_STATE,
+    crate::game::BEDROCK_STATE,
+    crate::game::DIRT_STATE,
+    crate::game::GRASS_BLOCK_STATE,
 ];
 const PLAINS_BIOME_ID: i32 = 0;
 const LIGHT_BYTES: usize = 2048;

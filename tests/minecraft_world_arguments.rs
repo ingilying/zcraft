@@ -198,14 +198,15 @@ fn selector_parser_rejects_unsupported_and_incompatible_semantics() {
     );
 }
 #[test]
-fn block_and_item_syntax_resolve_only_existing_capabilities() {
+fn block_and_item_syntax_resolve_against_generated_registry() {
     for (name, id) in [
         ("air", 0),
         ("stone", 1),
+        ("grass_block[snowy=true]", 8),
+        ("grass_block[snowy=false]", 9),
         ("dirt", 10),
         ("bedrock", 79),
         ("glass", 519),
-        ("grass_block[snowy=false]", 9),
     ] {
         assert_eq!(
             typed::<BlockStateSpec>(&BlockArgument, name)
@@ -214,18 +215,25 @@ fn block_and_item_syntax_resolve_only_existing_capabilities() {
             id
         );
     }
-    assert!(
-        typed::<BlockStateSpec>(&BlockArgument, "grass_block[snowy=true]")
-            .resolve_existing()
-            .is_err()
-    );
+    let oak_x = typed::<BlockStateSpec>(&BlockArgument, "oak_log[axis=x]")
+        .resolve_existing()
+        .unwrap();
+    let oak_y = typed::<BlockStateSpec>(&BlockArgument, "oak_log[axis=y]")
+        .resolve_existing()
+        .unwrap();
+    assert_ne!(oak_x, oak_y);
     assert!(
         typed::<BlockStateSpec>(&BlockArgument, "stone[wrong=value]")
             .resolve_existing()
             .is_err()
     );
     assert!(
-        typed::<BlockStateSpec>(&BlockArgument, "oak_log[axis=x]")
+        typed::<BlockStateSpec>(&BlockArgument, "oak_log[axis=diagonal]")
+            .resolve_existing()
+            .is_err()
+    );
+    assert!(
+        typed::<BlockStateSpec>(&BlockArgument, "minecraft:nonexistent_block")
             .resolve_existing()
             .is_err()
     );
@@ -245,6 +253,11 @@ fn block_and_item_syntax_resolve_only_existing_capabilities() {
     }
     assert!(
         typed::<ItemSpec>(&ItemArgument, "diamond")
+            .resolve_existing()
+            .is_ok()
+    );
+    assert!(
+        typed::<ItemSpec>(&ItemArgument, "minecraft:nonexistent_item")
             .resolve_existing()
             .is_err()
     );

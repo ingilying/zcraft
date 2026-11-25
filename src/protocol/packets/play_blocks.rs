@@ -95,21 +95,47 @@ fn item_stack(r: &mut Reader<'_>) -> io::Result<IncomingStack> {
     }
     let id = r.varint()?;
     let added = r.varint()?;
-    let removed = r.varint()?;
-    if added != 0 || removed != 0 {
-        return Err(invalid("item components are not supported"));
+    if !(0..=64).contains(&added) {
+        return Err(invalid("invalid added component count"));
     }
-    let Some(item) = item_by_id(id) else {
+    let mut damage = 0;
+    for _ in 0..added {
+        match r.varint()? {
+            3 => {
+                let value = r.varint()?;
+                if value < 0 {
+                    return Err(invalid("negative item damage"));
+                }
+                damage = value as u32;
+            }
+            _ => return Err(invalid("unsupported item component")),
+        }
+    }
+    let removed = r.varint()?;
+    if !(0..=64).contains(&removed) {
+        return Err(invalid("invalid removed component count"));
+    }
+    for _ in 0..removed {
+        r.varint()?;
+    }
+    if removed != 0 {
+        return Err(invalid("removed item components are not supported"));
+    }
+    if item_by_id(id).is_none() {
         return Ok(IncomingStack::Unsupported);
-    };
-    Ok(ItemStack::new(item.kind, count as u8)
+    }
+    Ok(ItemStack::with_damage(id, count as u8, damage)
         .map_or(IncomingStack::Unsupported, IncomingStack::Supported))
 }
 fn put_item_stack(stack: Option<ItemStack>, out: &mut Vec<u8>) {
     if let Some(stack) = stack {
         put_varint(i32::from(stack.count), out);
-        put_varint(stack.definition().protocol_id, out);
-        put_varint(0, out);
+        put_varint(stack.item, out);
+        put_varint(i32::from(stack.damage > 0), out);
+        if stack.damage > 0 {
+            put_varint(3, out);
+            put_varint(stack.damage as i32, out);
+        }
         put_varint(0, out)
     } else {
         put_varint(0, out)
@@ -209,7 +235,7 @@ impl Encode for LightUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InventoryContent(pub Inventory);
+pub struct InventoryContent(pub Box<Inventory>);
 impl Encode for InventoryContent {
     fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
         out.push(0);
@@ -268,7 +294,7 @@ mod tests {
     fn inventory_slots_are_bounded_typed_and_component_free() {
         let inventory = Inventory::default();
         let mut body = Vec::new();
-        InventoryContent(inventory.clone())
+        InventoryContent(Box::new(inventory.clone()))
             .encode(&mut body)
             .unwrap();
         let mut r = Reader::new(&body);
@@ -284,11 +310,12 @@ mod tests {
 
         let mut known = Vec::new();
         known.extend(36i16.to_be_bytes());
-        put_item_stack(ItemStack::new(crate::game::ItemKind::Stone, 12), &mut known);
+        let stone = crate::game::item_by_name("stone").unwrap().id;
+        put_item_stack(ItemStack::new(stone, 12), &mut known);
         let mut r = Reader::new(&known);
         assert_eq!(
             CreativeSlot::decode(&mut r).unwrap().item,
-            IncomingStack::Supported(ItemStack::new(crate::game::ItemKind::Stone, 12).unwrap())
+            IncomingStack::Supported(ItemStack::new(stone, 12).unwrap())
         );
         r.finish().unwrap();
 
@@ -303,6 +330,18 @@ mod tests {
                 .item,
             IncomingStack::Unsupported
         );
+
+        let mut damaged = Vec::new();
+        damaged.extend(39i16.to_be_bytes());
+        let pickaxe = crate::game::item_by_name("wooden_pickaxe").unwrap().id;
+        let damaged_stack = ItemStack::with_damage(pickaxe, 1, 7).unwrap();
+        put_item_stack(Some(damaged_stack), &mut damaged);
+        let mut r = Reader::new(&damaged);
+        assert_eq!(
+            CreativeSlot::decode(&mut r).unwrap().item,
+            IncomingStack::Supported(damaged_stack)
+        );
+        r.finish().unwrap();
 
         let mut component = Vec::new();
         component.extend(36i16.to_be_bytes());
@@ -319,7 +358,10 @@ mod tests {
         put_varint(1, &mut click);
         click.extend(38i16.to_be_bytes());
         put_item_stack(None, &mut click);
-        put_item_stack(ItemStack::new(crate::game::ItemKind::Glass, 64), &mut click);
+        put_item_stack(
+            ItemStack::new(crate::game::item_by_name("glass").unwrap().id, 64),
+            &mut click,
+        );
         let packet = InventoryClickPacket::decode(&mut Reader::new(&click)).unwrap();
         assert_eq!(packet.window, 0);
         assert_eq!(packet.state_id, 7);

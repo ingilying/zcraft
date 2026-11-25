@@ -57,5 +57,16 @@ The helper verifies the official SHA-1 before execution and runs the report in
 a temporary directory. Normal builds read this snapshot plus verified JAR JSON;
 they still never execute Java, start a game server, or accept an EULA.
 
+`game_data.json` is a compact gameplay metadata snapshot (1,060 blocks, 26,684
+block states, 1,333 items, and resolved block tags) generated from the same
+SHA-1-verified official 1.21.1 server bundler via Mojang's data generator and
+the read-only `tools/GameDataOracle.java` reflection oracle:
+
+```sh
+python3 tools/generate-game-data.py /path/to/server.jar
+```
+
+Normal builds embed `game_data.json` directly and never invoke Java.
+
 See [protocol-data.md](../../../docs/protocol-data.md) for the build/cache
 contract and current limitations.

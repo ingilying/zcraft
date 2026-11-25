@@ -133,14 +133,16 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
             let edit = if start
                 && face < 6
                 && reachable(pos)
-                && crate::game::block_by_state(current).is_some_and(|block| {
-                    block.hardness.is_some()
-                        && session
-                            .inventory
-                            .hand(Hand::Main)
-                            .is_some_and(|tool| tool.definition().can_mine(block))
-                }) {
-                Some((pos, crate::game::BlockKind::Air.state()))
+                && crate::game::registry()
+                    .state_by_id(current)
+                    .is_some_and(|(block, _, state)| {
+                        crate::game::registry().can_mine(
+                            session.inventory.hand(Hand::Main).map(|stack| stack.item),
+                            block,
+                            state,
+                        )
+                    }) {
+                Some((pos, crate::game::AIR_STATE))
             } else {
                 None
             };
@@ -156,16 +158,18 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
             let edit = place.and_then(|pos| {
                 let hand = Hand::from_wire(hand)?;
                 let stack = session.inventory.hand(hand)?;
-                let kind = stack.definition().placed_block()?;
+                let block = stack.definition().block?;
+                let material = crate::game::registry().default_state(block)?;
                 let support_block = crate::game::block_by_state(blocks.get(support))?;
                 let target_block = crate::game::block_by_state(blocks.get(pos))?;
+                let placed = crate::game::block_by_state(material)?;
                 (hit.iter().all(|f| (0.0..=1.0).contains(f))
                     && reachable(support)
                     && reachable(pos)
                     && !support_block.replaceable
                     && target_block.replaceable
-                    && (!kind.definition().collision || !intersects_player(state.position, pos)))
-                .then_some((pos, kind.state()))
+                    && (!placed.collision || !intersects_player(state.position, pos)))
+                .then_some((pos, material))
             });
             ([Some(support), place], edit)
         }
@@ -267,7 +271,7 @@ pub async fn handle_slot(ctx: &mut Context<'_>, p: HeldItemSlot) -> io::Result<O
 fn inventory(ctx: &mut Context<'_>) -> io::Result<Outcome> {
     if play(ctx.session)?.creative.is_some() {
         Ok(reply(vec![
-            InventoryContent(ctx.session.inventory.clone()).into(),
+            InventoryContent(Box::new(ctx.session.inventory.clone())).into(),
         ]))
     } else {
         Ok(Outcome::empty())

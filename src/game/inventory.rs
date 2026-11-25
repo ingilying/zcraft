@@ -1,4 +1,4 @@
-use super::{Hand, ItemKind, ItemStack};
+use super::{Hand, ItemStack, item_by_name};
 
 pub const SLOT_COUNT: usize = 46;
 const MAIN: std::ops::Range<usize> = 9..36;
@@ -28,15 +28,22 @@ pub struct Inventory {
 impl Default for Inventory {
     fn default() -> Self {
         let mut slots = [None; SLOT_COUNT];
-        slots[36] = ItemStack::new(ItemKind::Stone, 64);
-        slots[37] = ItemStack::new(ItemKind::Dirt, 64);
-        slots[38] = ItemStack::new(ItemKind::Glass, 64);
-        slots[39] = ItemStack::new(ItemKind::WoodenPickaxe, 1);
-        slots[40] = ItemStack::new(ItemKind::StonePickaxe, 1);
-        slots[41] = ItemStack::new(ItemKind::IronPickaxe, 1);
-        slots[42] = ItemStack::new(ItemKind::WoodenShovel, 1);
-        slots[43] = ItemStack::new(ItemKind::StoneShovel, 1);
-        slots[44] = ItemStack::new(ItemKind::IronShovel, 1);
+        for (slot, name, count) in [
+            (36, "stone", 64),
+            (37, "dirt", 64),
+            (38, "glass", 64),
+            (39, "wooden_pickaxe", 1),
+            (40, "stone_pickaxe", 1),
+            (41, "iron_pickaxe", 1),
+            (42, "wooden_shovel", 1),
+            (43, "stone_shovel", 1),
+            (44, "iron_shovel", 1),
+        ] {
+            slots[slot] = ItemStack::new(
+                item_by_name(name).expect("generated starter item").id,
+                count,
+            );
+        }
         Self {
             slots,
             carried: None,
@@ -88,6 +95,25 @@ impl Inventory {
             self.changed();
             ClickResult::Changed
         }
+    }
+    pub fn damage_hand(&mut self, hand: Hand) -> ClickResult {
+        let slot = match hand {
+            Hand::Main => 36 + usize::from(self.selected),
+            Hand::Off => OFFHAND,
+        };
+        let Some(mut stack) = self.slots[slot] else {
+            return ClickResult::Unchanged;
+        };
+        if stack.definition().max_damage == 0 {
+            return ClickResult::Unchanged;
+        }
+        if stack.damage_one() {
+            self.slots[slot] = None;
+        } else {
+            self.slots[slot] = Some(stack);
+        }
+        self.changed();
+        ClickResult::Changed
     }
     pub fn swap_hands(&mut self) -> ClickResult {
         let main = 36 + usize::from(self.selected);
@@ -174,6 +200,7 @@ impl Inventory {
                 match (self.carried, self.slots[slot]) {
                     (Some(mut held), Some(mut there))
                         if held.item == there.item
+                            && held.damage == there.damage
                             && there.count < there.definition().max_stack =>
                     {
                         let moved = (there.definition().max_stack - there.count).min(held.count);
@@ -191,16 +218,20 @@ impl Inventory {
                     (None, Some(mut there)) => {
                         let take = there.count.div_ceil(2);
                         there.count -= take;
-                        self.carried = ItemStack::new(there.item, take);
+                        self.carried = Some(ItemStack {
+                            count: take,
+                            ..there
+                        });
                         self.slots[slot] = (there.count > 0).then_some(there);
                     }
                     (Some(mut held), None) => {
-                        self.slots[slot] = ItemStack::new(held.item, 1);
+                        self.slots[slot] = Some(ItemStack { count: 1, ..held });
                         held.count -= 1;
                         self.carried = (held.count > 0).then_some(held);
                     }
                     (Some(mut held), Some(mut there))
                         if held.item == there.item
+                            && held.damage == there.damage
                             && there.count < there.definition().max_stack =>
                     {
                         there.count += 1;
@@ -233,6 +264,7 @@ impl Inventory {
         for target in targets.clone() {
             if let Some(mut there) = self.slots[target]
                 && there.item == stack.item
+                && there.damage == stack.damage
                 && there.count < there.definition().max_stack
             {
                 let moved = (there.definition().max_stack - there.count).min(stack.count);
@@ -298,6 +330,7 @@ impl Inventory {
             }
             if let Some(mut stack) = self.slots[slot]
                 && stack.item == carried.item
+                && stack.damage == carried.damage
             {
                 let moved = (max - carried.count).min(stack.count);
                 carried.count += moved;
@@ -353,14 +386,39 @@ mod tests {
             ClickResult::Rejected
         );
         assert_eq!(i, before);
+        let glass = item_by_name("glass").unwrap().id;
         assert_eq!(
-            i.set_creative(45, ItemStack::new(ItemKind::Glass, 2)),
+            i.set_creative(45, ItemStack::new(glass, 2)),
             ClickResult::Changed
         );
         assert_eq!(i.hand(Hand::Off).unwrap().count, 2);
         assert_eq!(i.swap_hands(), ClickResult::Changed);
-        assert_eq!(i.hand(Hand::Main).unwrap().item, ItemKind::Glass);
+        assert_eq!(i.hand(Hand::Main).unwrap().item, glass);
         assert_eq!(i.drop_hand(Hand::Main, false), ClickResult::Changed);
         assert_eq!(i.hand(Hand::Main).unwrap().count, 1);
+
+        let pickaxe = item_by_name("wooden_pickaxe").unwrap().id;
+        assert_eq!(
+            i.set_creative(9, ItemStack::with_damage(pickaxe, 1, 10)),
+            ClickResult::Changed
+        );
+        assert_eq!(
+            i.click(InventoryClick {
+                slot: 9,
+                button: 1,
+                mode: 0
+            }),
+            ClickResult::Changed
+        );
+        assert_eq!(i.carried.unwrap().damage, 10);
+        assert_eq!(
+            i.click(InventoryClick {
+                slot: 10,
+                button: 1,
+                mode: 0
+            }),
+            ClickResult::Changed
+        );
+        assert_eq!(i.slots[10].unwrap().damage, 10);
     }
 }

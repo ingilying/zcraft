@@ -6,11 +6,11 @@
 
 `src/game/` 是玩法层，不依赖网络包：
 
-- `blocks.rs`：稳定的 `BlockKind` 与 `BlockDefinition`。定义资源名、全局 block-state ID、硬度、所需工具种类/挖掘等级、可替换性、碰撞和遮挡天光属性。
-- `items.rs`：`ItemKind`、`ItemDefinition`、`ItemStack` 与 `ItemCategory`。方块物品携带 `BlockItem`，工具物品携带统一的 `ToolItem { kind, level }`。
+- `data.rs` + `assets/protocol/767/game_data.json`：从官方 Java 1.21.1 服务端提取的全量数据注册表（1,060 种方块、26,684 个方块状态、1,333 种物品及全部方块标签），提供 `BlockDefinition`、`BlockStateDefinition`、`ItemDefinition`、`ToolRule` 与运行时索引查询（硬度、所需工具规则、可替换性、碰撞、天光穿透、最大堆叠与最大耐久）。
+- `items.rs`：`Hand` 与 `ItemStack { item, count, damage }`，基于 `GameRegistry` 校验物品 ID、堆叠上限和耐久范围。
 - `inventory.rs`：46 格玩家容器、光标堆叠、主手选择、双手查询、状态 ID，以及服务端权威的点击状态机。
 
-当前方块物品是 stone、dirt、glass；工具包括木/石/铁等级的镐和锹；方块定义还包括地形所需的 air、grass_block、bedrock。增加简单方块物品时，只需增加方块定义和 `ItemCategory::Block` 注册，自动继承统一放置行为。增加工具时注册工具种类与等级，自动继承统一挖掘判定。需要朝向、含水或方块实体的内容，后续可扩展 `BlockItem` 的放置上下文，不需要修改协议解码。
+默认快捷栏初始包含 stone、dirt、glass 以及木/石/铁等级的镐和锹；创造模式可设置全部 1,333 种原版物品。方块物品自动从 `ItemDefinition::block` 继承统一放置行为，工具物品自动按原版 `tool_rules` 与方块标签（`#minecraft:mineable/*`）判定挖掘速度与等级门槛。需要朝向、含水或方块实体的内容，后续可扩展放置上下文，不需要修改协议解码。
 
 ## 背包
 
@@ -27,15 +27,15 @@
 - 创造模式设置受支持物品；
 - 过期 state ID、未知模式和客户端伪报 changed-slots 时完整重同步。
 
-背包属于连接的 `Session`，因此跨 Play→Configuration→Play 重配置保留；断线后当前仍不持久化到磁盘。客户端上报的物品变化和光标内容从不作为真实状态。物品组件暂不反序列化，带组件的输入被明确拒绝。
+背包属于连接的 `Session`，因此跨 Play→Configuration→Play 重配置保留；断线后当前仍不持久化到磁盘。客户端上报的物品变化和光标内容从不作为真实状态。物品数据组件当前仅支持 `minecraft:damage`（协议组件 ID 3），其余新增或移除组件会被明确拒绝。
 
 ## 放置、使用与挖掘
 
-放置从实际主手/副手的 `ItemCategory::Block` 取得目标方块，而不是按快捷栏位置或具体物品 ID 硬编码。所有方块物品统一验证手、命中坐标、距离、已发送区块、支撑方块、目标可替换性和玩家碰撞，再提交稀疏世界编辑。工具物品不会进入放置路径。
+放置从实际主手/副手物品的 `ItemDefinition::block` 取得目标方块默认状态，而不是按快捷栏位置或具体物品 ID 硬编码。所有方块物品统一验证手、命中坐标、距离、已发送区块、支撑方块、目标可替换性和玩家碰撞，再提交稀疏世界编辑。非方块物品不会进入放置路径。
 
-当前 `Use Item` 没有可用的空中使用行为，但已经保留统一类别分派点和预测序列确认；后续食物、投射物等可增加新的物品类别和对应执行器。
+当前 `Use Item` 没有可用的空中使用行为，但已经保留统一分派点和预测序列确认；后续食物、投射物等可在此扩展对应执行器。
 
-创造模式挖掘在 START 动作立即完成，但不绕过工具规则。方块通过 `MiningRequirement { tool, level }` 声明所需工具；主手必须是同一种 `ToolKind`，且 `MiningLevel` 大于等于最低等级。stone 需要木级镐，glass 需要石级镐，dirt/grass_block 需要木级锹；种类不匹配、等级不足、空手和方块物品都会失败。bedrock 的硬度和挖掘要求均为空，始终不可破坏。硬度数据继续为后续生存挖掘进度保留。
+创造模式挖掘在 START 动作立即完成，但不绕过工具规则。`GameRegistry::can_mine` 依据原版 `game_data.json` 中的方块硬度、工具挖掘标签（`#minecraft:mineable/pickaxe|shovel|axe|hoe`）和物品的 `tool_rules` 判定：不可破坏方块（`hardness < 0` 如基岩）始终拒绝；属于工具挖掘标签的方块要求主手物品具备对应加速规则，若方块需要正确工具（`correct_tool`）还要求满足 `correct_for_drops` 等级门槛。硬度、工具速度与耐久数据已就绪，为后续生存挖掘进度保留。
 
 所有成功和拒绝的方块操作继续遵守现有的预测序列确认、观察者广播、区块重载重放、稀疏编辑上限及天光重算规则。
 
