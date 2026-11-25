@@ -69,25 +69,32 @@ impl ChunkStream {
         (self.center, self.radius)
     }
 
+    /// Vanilla clients require a 1-chunk neighbor border around `view_distance`
+    /// before meshing and rendering the outermost visible chunks.
+    fn stream_radius(&self) -> i32 {
+        self.radius + 1
+    }
+
     pub(super) fn tracks(&self, [x, z]: Chunk) -> bool {
         let [cx, cz] = self.center;
-        (x - cx).abs().max((z - cz).abs()) <= self.radius
+        (x - cx).abs().max((z - cz).abs()) <= self.stream_radius()
             && self.loaded.contains(&[x, z])
             && !self.retiring.contains(&[x, z])
     }
 
     pub(super) fn retire_outside(&mut self) -> std::collections::HashSet<Chunk> {
         let [cx, cz] = self.center;
+        let limit = self.stream_radius();
         self.loaded
             .iter()
             .copied()
-            .filter(|&[x, z]| (x - cx).abs().max((z - cz).abs()) > self.radius)
+            .filter(|&[x, z]| (x - cx).abs().max((z - cz).abs()) > limit)
             .filter(|&chunk| self.retiring.insert(chunk))
             .collect()
     }
 
     fn desired_count(&self) -> usize {
-        (2 * self.radius + 1).pow(2) as usize
+        (2 * self.stream_radius() + 1).pow(2) as usize
     }
 
     pub(super) fn next_update(&self) -> Option<Instant> {
@@ -119,8 +126,9 @@ impl ChunkStream {
             replies.push(CenterChunk(self.center).into());
         }
         let [cx, cz] = self.center;
+        let limit = self.stream_radius();
         let mut outside = self.loaded.iter().filter(|&&[x, z]| {
-            (x - cx).abs().max((z - cz).abs()) > self.radius || self.retiring.contains(&[x, z])
+            (x - cx).abs().max((z - cz).abs()) > limit || self.retiring.contains(&[x, z])
         });
         replies.extend(
             outside
@@ -134,8 +142,8 @@ impl ChunkStream {
         }
 
         let mut missing = Vec::new();
-        for x in cx - self.radius..=cx + self.radius {
-            for z in cz - self.radius..=cz + self.radius {
+        for x in cx - limit..=cx + limit {
+            for z in cz - limit..=cz + limit {
                 if !self.loaded.contains(&[x, z]) {
                     missing.push([x, z]);
                 }
@@ -221,7 +229,7 @@ mod tests {
                 _ => {}
             }
             stream.packet_sent(packet, now);
-            assert!(stream.loaded.len() <= 33 * 33);
+            assert!(stream.loaded.len() <= 35 * 35);
         }
     }
 
@@ -256,8 +264,8 @@ mod tests {
         stream.follow(-0.5, 15.999);
         assert_eq!(stream.center, [-1, 0]);
         let now = settle(&mut stream, &terrain, now);
-        assert_eq!(stream.loaded.len(), 25);
-        assert_eq!(stream.loaded.intersection(&old).count(), 20);
+        assert_eq!(stream.loaded.len(), 49);
+        assert_eq!(stream.loaded.intersection(&old).count(), 42);
         stream.follow(-16.001, 16.0);
         stream.set_radius(3);
         let packets = stream.pump(&terrain, now + STREAM_INTERVAL);
@@ -348,7 +356,7 @@ mod tests {
         let mut a = ChunkStream::new(16, now);
         let mut b = ChunkStream::new(2, now);
         now = settle(&mut a, &terrain, now);
-        assert_eq!(a.loaded.len(), 1089);
+        assert_eq!(a.loaded.len(), 1225);
         for i in 1..=10 {
             for j in 0..10 {
                 a.follow(32000.0 * f64::from(i), -32000.0 * f64::from(j));
@@ -372,7 +380,8 @@ mod tests {
                     stream
                         .loaded
                         .iter()
-                        .all(|&[cx, cz]| (cx - x).abs().max((cz - z).abs()) <= stream.radius)
+                        .all(|&[cx, cz]| (cx - x).abs().max((cz - z).abs())
+                            <= stream.stream_radius())
                 );
             }
         }

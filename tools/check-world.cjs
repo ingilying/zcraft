@@ -22,8 +22,8 @@ let unloads = 0
 function key (x, z) { return `${x},${z}` }
 function expected (x, z) {
   const chunks = []
-  for (let dx = -2; dx <= 2; dx++) {
-    for (let dz = -2; dz <= 2; dz++) chunks.push(key(x + dx, z + dz))
+  for (let dx = -3; dx <= 3; dx++) {
+    for (let dz = -3; dz <= 3; dz++) chunks.push(key(x + dx, z + dz))
   }
   return chunks.sort()
 }
@@ -102,7 +102,7 @@ client.on('packet', (packet, meta) => {
       assert.equal(packet.batchSize, batchCount)
       assert(batchCount > 0 && batchCount <= 8)
       client.write('chunk_batch_received', { chunksPerTick: 20 })
-      if (step < route.length && loaded.size === 25) {
+      if (step < route.length && loaded.size === 49) {
         const [x, z] = route[step++]
         assert.equal(center, key(x, z))
         assert.deepEqual([...loaded].sort(), expected(x, z))
@@ -123,8 +123,8 @@ finishTimer = setTimeout(() => {
     assert(joined && positioned && spectatorAck)
     assert.equal(registries, 11)
     assert.equal(step, route.length)
-    assert.equal(chunks, 80)
-    assert.equal(unloads, 55)
+    assert.equal(chunks, 154)
+    assert.equal(unloads, 105)
     assert(heartbeats >= 3)
     assert(Date.now() - started > 30000)
     completed = true
