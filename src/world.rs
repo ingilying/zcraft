@@ -49,6 +49,7 @@ pub const SPAWN_X: f64 = 8.5;
 pub const SPAWN_Y: f64 = 65.0;
 pub const SPAWN_Z: f64 = 8.5;
 pub const VIEW_DISTANCE: i32 = 2;
+pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
 pub const MAX_VIEW_DISTANCE: i32 = 16;
 pub const WORLD_LIMIT: f64 = 29_999_984.0;
 

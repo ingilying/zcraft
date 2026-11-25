@@ -99,8 +99,14 @@ impl ChunkStore {
                 }
             }
         });
-        let chunk = loaded.unwrap_or_else(|| self.generator.generate_chunk(coords[0], coords[1]));
+        let (chunk, newly_generated) = match loaded {
+            Some(chunk) => (chunk, false),
+            None => (self.generator.generate_chunk(coords[0], coords[1]), true),
+        };
         self.chunks.insert(coords, chunk.clone());
+        if newly_generated && self.storage.is_some() {
+            self.dirty.insert(coords);
+        }
         self.touch(coords);
         self.evict_if_needed();
         chunk

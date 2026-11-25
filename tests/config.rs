@@ -16,7 +16,8 @@ fn missing_file_generates_roundtrippable_defaults() {
     let contents = fs::read_to_string(&path).unwrap();
     assert!(contents.contains("io_timeout_seconds = 10"));
     assert!(contents.contains("compression_threshold = 256"));
-    assert!(contents.contains("max_view_distance = 2"));
+    assert!(contents.contains("max_view_distance = 10"));
+    assert!(contents.contains("world_dir = \"world\""));
     assert!(contents.contains("game_mode = \"spectator\""));
     assert!(contents.contains("offline_mode = false"));
     assert!(contents.contains("# ops = [\"YourName\"]"));

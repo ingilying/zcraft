@@ -38,6 +38,9 @@ async fn anvil_superflat_world_survives_restart_via_save_all() {
         ..Config::default()
     };
     let server = ServerContext::from_config(&config).await.unwrap();
+    // New world immediately pre-generates and saves the spawn chunk area.
+    assert!(world_dir.join("level.dat").exists());
+    assert!(world_dir.join("region/r.0.0.mca").exists());
     let world = server.play.world();
     assert_eq!(
         world.block_at(BlockPos([0, -64, 0])),
@@ -86,7 +89,7 @@ async fn anvil_superflat_world_survives_restart_via_save_all() {
     };
     let result = server.execute_command(&console, "save-all").unwrap();
     assert!(result.success);
-    assert!(result.feedback[0].contains("2 chunk(s)"));
+    assert!(result.feedback[0].contains("chunk(s) flushed"));
     assert!(world_dir.join("level.dat").exists());
     assert!(world_dir.join("region/r.0.0.mca").exists());
     assert!(world_dir.join("region/r.-1.-1.mca").exists());
@@ -368,6 +371,9 @@ async fn overworld_seed_and_edits_persist_via_anvil_level_dat() {
         ..Config::default()
     };
     let server = ServerContext::from_config(&config).await.unwrap();
+    // New world immediately pre-generates and saves the spawn chunk area.
+    assert!(world_dir.join("level.dat").exists());
+    assert!(world_dir.join("region/r.0.0.mca").exists());
     let world = server.play.world();
     assert_eq!(world.overworld_seed(), Some(2026));
     assert_eq!(

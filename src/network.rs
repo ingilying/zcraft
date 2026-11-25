@@ -140,17 +140,20 @@ async fn serve_validated(
     };
     // Wait for any in-flight autosave, cancel connection tasks (whose drop
     // guards persist online players), then perform a final blocking world save.
+    tracing::info!("Stopping the server");
     if let Some(handle) = autosave
         && let Err(error) = handle.await
     {
         tracing::error!(%error, "in-flight autosave task failed during shutdown");
     }
+    tracing::info!("Saving players");
     tasks.shutdown().await;
     let save_result = if server.play.world().has_storage() {
+        tracing::info!("Saving worlds");
         let save_server = server.clone();
         match tokio::task::spawn_blocking(move || save_server.play.save_world()).await {
             Ok(Ok(summary)) => {
-                tracing::info!(chunks = summary.chunks_saved, "saved world on shutdown");
+                tracing::info!(chunks = summary.chunks_saved, "Saved world on shutdown");
                 Ok(())
             }
             Ok(Err(error)) => {
@@ -165,6 +168,7 @@ async fn serve_validated(
     } else {
         Ok(())
     };
+    tracing::info!("Server stopped");
     result.and(save_result)
 }
 

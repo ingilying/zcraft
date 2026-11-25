@@ -185,6 +185,7 @@ async fn start(
     start_config(Config {
         io_timeout: deadline,
         offline_mode: true,
+        world_dir: None,
         server_icon: concat!(env!("CARGO_MANIFEST_DIR"), "/server-icon.png").into(),
         ..Config::default()
     })
@@ -340,6 +341,7 @@ async fn configured_resource_pack_is_negotiated_on_the_wire() {
             let (mut stream, stop, server) = start_config(Config {
                 io_timeout: Duration::from_secs(1),
                 offline_mode: true,
+                world_dir: None,
                 server_icon: concat!(env!("CARGO_MANIFEST_DIR"), "/server-icon.png").into(),
                 resource_pack: Some(zcraft::config::ResourcePackConfig {
                     id: id.to_string(),

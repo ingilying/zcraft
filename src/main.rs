@@ -41,12 +41,20 @@ async fn run() -> io::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    let started = std::time::Instant::now();
+    tracing::info!("Starting ZCraft Minecraft server (Java 1.21.1 / protocol 767)");
     let path = std::env::var_os("ZCRAFT_CONFIG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| DEFAULT_CONFIG_PATH.into());
     let mut config = Config::load_or_create(&path)?;
     config.apply_overrides(env_override("ZCRAFT_BIND")?, env_override("ZCRAFT_MOTD")?)?;
-    tracing::info!(path = %path.display(), "configuration loaded");
+    tracing::info!(
+        path = %path.display(),
+        game_mode = ?config.game_mode,
+        view_distance = config.max_view_distance,
+        offline_mode = config.offline_mode,
+        "Loaded configuration"
+    );
     require_acceptance(DEFAULT_EULA_PATH)?;
     if config.offline_mode {
         tracing::warn!(
@@ -84,7 +92,11 @@ async fn run() -> io::Result<()> {
         }
     });
 
-    tracing::info!(address = %listener.local_addr()?, "ZCraft listening (Java 1.21.1 / 767)");
+    tracing::info!(address = %listener.local_addr()?, "Listening for Minecraft connections");
+    tracing::info!(
+        "Done ({:.2}s)! For help, type \"help\"",
+        started.elapsed().as_secs_f64()
+    );
     serve_with_context(listener, config, server, async {
         tokio::select! {
             res = tokio::signal::ctrl_c() => {

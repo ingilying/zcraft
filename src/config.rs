@@ -9,6 +9,7 @@ use std::{
 };
 
 pub const DEFAULT_CONFIG_PATH: &str = "zcraft.toml";
+pub const DEFAULT_WORLD_DIR: &str = "world";
 pub const DEFAULT_COMPRESSION_THRESHOLD: i32 = 256;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,7 +137,7 @@ impl Default for Config {
             motd: "ZCraft — Rust Minecraft Server".into(),
             server_icon: "server-icon.png".into(),
             max_players: 20,
-            max_view_distance: crate::world::VIEW_DISTANCE,
+            max_view_distance: crate::world::DEFAULT_VIEW_DISTANCE,
             game_mode: GameMode::default(),
             offline_mode: false,
             max_connections: 1024,
@@ -144,7 +145,7 @@ impl Default for Config {
             io_timeout: Duration::from_secs(10),
             resource_pack: None,
             ops: Vec::new(),
-            world_dir: None,
+            world_dir: Some(DEFAULT_WORLD_DIR.into()),
             world_type: WorldType::default(),
             seed: None,
             flat: None,
@@ -181,8 +182,6 @@ impl Config {
              {defaults}\n\
              # Optional operator usernames or UUIDs (permission level 4):\n\
              # ops = [\"YourName\"]\n\n\
-             # Optional Anvil world persistence directory (level.dat, region/*.mca, playerdata/*.dat):\n\
-             # world_dir = \"world\"\n\
              # Set world_type = \"overworld\" and optional seed = 2026 for natural terrain.\n\n\
              # Optional Superflat terrain preset (default: y=60 bedrock, 2x dirt, grass_block):\n\
              # [flat]\n\

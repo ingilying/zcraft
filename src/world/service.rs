@@ -95,27 +95,53 @@ impl World {
         seed: Option<i64>,
         flat_config: Option<FlatGeneratorConfig>,
     ) -> io::Result<Self> {
-        let storage = AnvilStorage::new(dir.as_ref());
+        let world_dir = dir.as_ref();
+        let storage = AnvilStorage::new(world_dir);
         let loaded = storage.load_level()?;
 
-        let generator: Arc<dyn ChunkGenerator> = match loaded
-            .as_ref()
-            .and_then(|l| l.generator.clone())
-        {
-            Some(super::LoadedGenerator::Overworld { seed }) => {
-                Arc::new(super::OverworldGenerator::new(seed))
-            }
-            Some(super::LoadedGenerator::Flat(cfg)) => Arc::new(FlatGenerator::from_config(cfg)?),
-            None => match world_type {
-                crate::config::WorldType::Overworld => {
-                    let seed = seed.unwrap_or_else(rand::random);
+        let generator: Arc<dyn ChunkGenerator> =
+            match loaded.as_ref().and_then(|l| l.generator.clone()) {
+                Some(super::LoadedGenerator::Overworld { seed }) => {
+                    tracing::info!(
+                        world = %world_dir.display(),
+                        world_type = "overworld",
+                        seed,
+                        "Preparing level"
+                    );
                     Arc::new(super::OverworldGenerator::new(seed))
                 }
-                crate::config::WorldType::Flat => {
-                    Arc::new(FlatGenerator::from_config(flat_config.unwrap_or_default())?)
+                Some(super::LoadedGenerator::Flat(cfg)) => {
+                    tracing::info!(
+                        world = %world_dir.display(),
+                        world_type = "flat",
+                        biome = %cfg.biome,
+                        "Preparing level"
+                    );
+                    Arc::new(FlatGenerator::from_config(cfg)?)
                 }
-            },
-        };
+                None => match world_type {
+                    crate::config::WorldType::Overworld => {
+                        let seed = seed.unwrap_or_else(rand::random);
+                        tracing::info!(
+                            world = %world_dir.display(),
+                            world_type = "overworld",
+                            seed,
+                            "Generating new level"
+                        );
+                        Arc::new(super::OverworldGenerator::new(seed))
+                    }
+                    crate::config::WorldType::Flat => {
+                        let cfg = flat_config.unwrap_or_default();
+                        tracing::info!(
+                            world = %world_dir.display(),
+                            world_type = "flat",
+                            biome = %cfg.biome,
+                            "Generating new level"
+                        );
+                        Arc::new(FlatGenerator::from_config(cfg)?)
+                    }
+                },
+            };
         let spawn = loaded
             .as_ref()
             .and_then(|l| l.spawn)
@@ -124,22 +150,13 @@ impl World {
             .as_ref()
             .map_or_else(WorldClock::new, |l| WorldClock::from_persisted(l.clock));
 
-        if loaded.is_none() {
-            storage.save_level(
-                clock.persisted_state(),
-                generator.flat_config(),
-                generator.overworld_seed(),
-                spawn,
-            )?;
-        }
-
         let placeholder_terrain = generator
             .default_terrain_payload()
             .cloned()
             .unwrap_or_else(|| Arc::from([]));
         let store = Mutex::new(ChunkStore::new(generator.clone(), Some(storage.clone())));
 
-        Ok(Self {
+        let world = Self {
             generator,
             storage: Some(storage),
             store,
@@ -147,7 +164,49 @@ impl World {
             save_lock: Mutex::new(()),
             spawn,
             placeholder_terrain,
-        })
+        };
+
+        if loaded.is_none() {
+            world.prepare_spawn_area()?;
+        }
+
+        Ok(world)
+    }
+
+    /// Pre-generate and persist the initial spawn chunk area (7x7 = 49 chunks)
+    /// when creating a brand new world, matching vanilla server initialization.
+    fn prepare_spawn_area(&self) -> io::Result<()> {
+        const SPAWN_CHUNK_RADIUS: i32 = 3;
+        let [scx, scz] = super::chunk_at(self.spawn[0], self.spawn[2]);
+        let side = (SPAWN_CHUNK_RADIUS * 2 + 1) as usize;
+        let total = side * side;
+        let started = std::time::Instant::now();
+        let mut generated = 0usize;
+        let mut last_bucket = 0usize;
+
+        {
+            let mut store = self.store.lock().expect("chunk store poisoned");
+            for dz in -SPAWN_CHUNK_RADIUS..=SPAWN_CHUNK_RADIUS {
+                for dx in -SPAWN_CHUNK_RADIUS..=SPAWN_CHUNK_RADIUS {
+                    let _ = store.get_or_load([scx + dx, scz + dz]);
+                    generated += 1;
+                    let pct = (generated * 100) / total;
+                    let bucket = pct / 25;
+                    if bucket > last_bucket && bucket < 4 {
+                        last_bucket = bucket;
+                        tracing::info!("Preparing spawn area: {}%", bucket * 25);
+                    }
+                }
+            }
+        }
+
+        let summary = self.save_all()?;
+        tracing::info!(
+            chunks = summary.chunks_saved,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Preparing spawn area: 100%"
+        );
+        Ok(())
     }
 
     pub fn generator(&self) -> &Arc<dyn ChunkGenerator> {
