@@ -50,6 +50,9 @@ pub struct Config {
     /// Optional vanilla resource pack, negotiated before entering Play.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_pack: Option<ResourcePackConfig>,
+    /// Operator usernames or UUIDs granted command permission level 4.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ops: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +120,7 @@ impl Default for Config {
             compression_threshold: DEFAULT_COMPRESSION_THRESHOLD,
             io_timeout: Duration::from_secs(10),
             resource_pack: None,
+            ops: Vec::new(),
         }
     }
 }
@@ -148,6 +152,8 @@ impl Config {
              # io_timeout_seconds is a complete read/write deadline (1..=86400).\n\
              # compression_threshold is in bytes; -1 disables compression.\n\n\
              {defaults}\n\
+             # Optional operator usernames or UUIDs (permission level 4):\n\
+             # ops = [\"YourName\"]\n\n\
              # Optional server resource pack (uncomment and configure to enable):\n\
              {commented_optional}"
         ))
@@ -235,6 +241,12 @@ impl Config {
         crate::world::validate_view_distance(self.max_view_distance)?;
         if let Some(pack) = &self.resource_pack {
             pack.validate()?;
+        }
+        for entry in &self.ops {
+            let valid_uuid = uuid::Uuid::parse_str(entry).is_ok();
+            if !valid_uuid && !crate::auth::valid_username(entry) {
+                return Err(invalid("ops entries must be valid usernames or UUIDs"));
+            }
         }
         Ok(())
     }

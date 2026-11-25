@@ -19,6 +19,7 @@ fn missing_file_generates_roundtrippable_defaults() {
     assert!(contents.contains("max_view_distance = 2"));
     assert!(contents.contains("game_mode = \"spectator\""));
     assert!(contents.contains("offline_mode = false"));
+    assert!(contents.contains("# ops = [\"YourName\"]"));
     assert!(contents.contains("# [resource_pack]"));
     assert!(contents.contains("# id = "));
     assert!(contents.contains("# url = "));
@@ -88,6 +89,7 @@ fn invalid_files_are_reported_and_never_overwritten() {
         "offline_mode = 'true'",
         "offline_mode = 1",
         "bind = 'not an address'",
+        "ops = ['bad name!']",
     ] {
         fs::write(&path, contents).unwrap();
         let error = Config::load_or_create(&path).unwrap_err();
