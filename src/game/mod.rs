@@ -1,15 +1,20 @@
 //! Data-driven Java 1.21.1 gameplay core. Protocol IDs live at the edge;
 //! generated definitions and shared behaviors replace per-item handler branches.
+mod behavior;
 mod data;
 mod inventory;
 mod items;
 mod loot;
 mod placement;
 mod player;
+mod recipes;
 
+pub use behavior::{
+    BlockBehavior, BlockUseOutcome, ItemBehavior, ItemUseOutcome, block_behavior, item_behavior,
+};
 pub use data::{
-    BlockDefinition, BlockStateDefinition, GameRegistry, ItemDefinition, ToolRule, block_by_name,
-    block_by_state, blocks, item_by_id, item_by_name, items, registry,
+    BlockDefinition, BlockStateDefinition, FoodProperties, GameRegistry, ItemDefinition, ToolRule,
+    block_by_name, block_by_state, blocks, item_by_id, item_by_name, items, registry,
 };
 pub use inventory::{ClickResult, Inventory, InventoryClick, SLOT_COUNT};
 pub use items::{Hand, ItemStack};
@@ -19,6 +24,12 @@ pub use placement::{
     resolve_placement, resolve_stairs_shape,
 };
 pub use player::{PLAYER_EYE_HEIGHT, Player};
+pub use recipes::{container_remainder, fuel_burn_ticks, match_crafting, match_smelting};
+
+/// Data-driven food properties from `assets/protocol/767/game_data.json`.
+pub fn food_properties(item_id: i32) -> Option<FoodProperties> {
+    item_by_id(item_id)?.food
+}
 
 pub const AIR_STATE: i32 = 0;
 pub const STONE_STATE: i32 = 1;

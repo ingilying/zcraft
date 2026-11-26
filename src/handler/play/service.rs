@@ -182,6 +182,20 @@ impl PlayService {
         Ok(count)
     }
 
+    /// Advance all loaded furnaces by 1 tick (20 TPS), broadcasting `lit` block/light
+    /// changes and refreshing any players currently viewing an active furnace.
+    pub fn tick_furnaces(&self, players: &crate::players::Players) {
+        let (changed_positions, mutations) = self.world.tick_furnaces();
+        for mutation in mutations {
+            let _ = publish_mutation(players, mutation);
+        }
+        for pos in changed_positions {
+            for viewer in self.other_chest_viewers(pos, uuid::Uuid::nil()) {
+                players.send_control(viewer, crate::players::PlayerControl::RefreshContainer(pos));
+            }
+        }
+    }
+
     /// Track a player opening a chest and return the updated total viewer count.
     pub fn open_chest_viewer(&self, pos: BlockPos, uuid: uuid::Uuid) -> usize {
         let mut viewers = self.chest_viewers.lock().expect("chest viewers poisoned");

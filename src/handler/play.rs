@@ -37,6 +37,7 @@ pub struct PlaySession {
     next_teleport: i32,
     pending_keep_alive: Option<(i64, Instant)>,
     next_keep_alive: Instant,
+    last_food_tick: Instant,
     chunks: ChunkStream,
     blocks: blocks::CreativeSession,
     open_container: Option<blocks::OpenContainer>,
@@ -121,6 +122,7 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         next_teleport: 1,
         pending_keep_alive: None,
         next_keep_alive: now + KEEP_ALIVE_INTERVAL,
+        last_food_tick: now,
         chunks,
         blocks,
         open_container: None,
@@ -178,28 +180,39 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
 }
 
 /// Best-effort persistence of a player's state and inventory when leaving Play,
-/// returning any carried cursor item and updating open chest lid counts.
+/// returning any carried cursor or crafting grid items and updating container viewers.
 pub(crate) fn save_session(
     session: &mut Session,
     play: &PlayService,
     players: &crate::players::Players,
 ) {
-    let Some(play_session) = &session.play else {
+    let Some(play_session) = &mut session.play else {
         return;
     };
     let uuid = play_session.player.uuid;
     let pos = play_session.player.position;
-    // Return cursor-carried item to inventory (or drop on ground if full).
-    if let Some(mut carried) = session.inventory.take_carried() {
-        let added = session.inventory.give_stack(carried);
-        if added < carried.count {
-            carried.count -= added;
-            let _ = play.spawn_item_drop_scatter(players, pos, carried, 40);
+    let mut returned = Vec::new();
+    if let Some(carried) = session.inventory.take_carried() {
+        returned.push(carried);
+    }
+    returned.extend(session.inventory.drain_crafting_grid());
+    if let Some(open) = play_session.open_container.take()
+        && let blocks::ContainerKind::CraftingTable { grid, .. } = open.kind
+    {
+        returned.extend(grid.into_iter().flatten());
+    }
+    for mut stack in returned {
+        let added = session.inventory.give_stack(stack);
+        if added < stack.count {
+            stack.count -= added;
+            let _ = play.spawn_item_drop_scatter(players, pos, stack, 40);
         }
     }
-    // Remove player from any open chest viewer sets and broadcast updated lid counts.
-    for (chest_pos, count) in play.remove_player_from_chests(uuid) {
-        let _ = blocks::broadcast_chest_lid_count(players, chest_pos, count);
+    // Remove player from any open chest/furnace viewer sets and broadcast updated lid counts.
+    for (container_pos, count) in play.remove_player_from_chests(uuid) {
+        if play.world().chest_items(container_pos).is_some() {
+            let _ = blocks::broadcast_chest_lid_count(players, container_pos, count);
+        }
     }
     tracing::info!(
         player = %play_session.player.name,
@@ -268,7 +281,10 @@ fn closed(reason: &str) -> Outcome {
 /// Called by the connection timer, not by a packet handler. An idle Play connection
 /// is kept alive without imposing the old 30-second login lifetime on the world.
 pub fn tick(session: &mut Session, now: Instant) -> io::Result<Outcome> {
-    let state = play(session)?;
+    let state = session
+        .play
+        .as_mut()
+        .ok_or_else(|| invalid("Play session not initialized"))?;
     if state
         .pending_teleport
         .is_some_and(|(_, sent)| now.duration_since(sent) >= TELEPORT_TIMEOUT)
@@ -284,16 +300,68 @@ pub fn tick(session: &mut Session, now: Instant) -> io::Result<Outcome> {
     if state.chunks.feedback_timed_out(now) {
         return Ok(closed("ZCraft: chunk batch feedback timed out."));
     }
+    let mut replies = Vec::new();
     if state.pending_keep_alive.is_none() && now >= state.next_keep_alive {
         let id = rand::random::<i64>();
         state.pending_keep_alive = Some((id, now));
-        return Ok(Outcome {
-            replies: vec![KeepAlive { id }.into()],
-            close: false,
-            encryption: None,
-        });
+        replies.push(KeepAlive { id }.into());
     }
-    Ok(Outcome::empty())
+
+    // Complete continuous item use via unified `ItemBehavior::on_finish_use`.
+    let mut inv_changed = false;
+    let mut health_changed = false;
+    if let Some((hand, item_id, started, eat_ticks)) = state.player.eating {
+        let required = Duration::from_millis(u64::from(eat_ticks) * 50);
+        if now.duration_since(started) >= required {
+            state.player.eating = None;
+            if let Some(stack) = session.inventory.hand(hand)
+                && stack.item == item_id
+                && crate::game::item_behavior(item_id).on_finish_use(&mut state.player, stack)
+            {
+                let _ = session.inventory.drop_hand(hand, false);
+                if let Some(remainder) = crate::game::container_remainder(item_id) {
+                    session.inventory.give_stack(remainder);
+                }
+                inv_changed = true;
+                health_changed = true;
+            }
+        }
+    }
+
+    // Advance vanilla FoodData (exhaustion, natural regeneration, starvation) at 20 TPS.
+    let elapsed_ms = now.duration_since(state.last_food_tick).as_millis() as u64;
+    let elapsed_ticks = (elapsed_ms / 50).min(100) as u16;
+    if elapsed_ticks > 0 {
+        state.last_food_tick += Duration::from_millis(u64::from(elapsed_ticks) * 50);
+        let (changed, starved) = state.player.tick_food(elapsed_ticks);
+        health_changed |= changed;
+        if starved {
+            let hurt = Clientbound::from(HurtAnimation::new(state.player.entity_id, 0.0));
+            if let Some(slot) = &session.reservation {
+                let _ = slot.broadcast_to_viewers(&hurt);
+            }
+            replies.push(hurt);
+        }
+    }
+
+    if health_changed {
+        replies.push(
+            UpdateHealth::new(
+                state.player.health,
+                state.player.food,
+                state.player.saturation,
+            )
+            .into(),
+        );
+    }
+    if inv_changed {
+        replies.push(InventoryContent::player(&session.inventory).into());
+    }
+    Ok(Outcome {
+        replies,
+        close: false,
+        encryption: None,
+    })
 }
 
 pub async fn handle_teleport(
@@ -385,7 +453,8 @@ fn movement(
     if state.pending_teleport.is_some() {
         return Ok(Outcome::empty());
     }
-    let old_y = state.player.position[1];
+    let [old_x, old_y, old_z] = state.player.position;
+    let was_on_ground = state.player.on_ground;
     if let Some([x, y, z]) = position {
         if !crate::game::Player::position_in_bounds([x, y, z]) {
             let spawn = ctx.server.play.world().spawn_position();
@@ -424,6 +493,16 @@ fn movement(
     let now = Instant::now();
     if state.player.is_survival() && !state.player.dead {
         let [px, py, pz] = state.player.position;
+        // Vanilla movement exhaustion: sprinting 0.1/m, jumping 0.05 (0.2 when sprinting).
+        let horiz = ((px - old_x).powi(2) + (pz - old_z).powi(2)).sqrt();
+        if state.player.sprinting && horiz > 0.0 && horiz < 10.0 {
+            state.player.add_exhaustion(0.1 * horiz as f32);
+        }
+        if was_on_ground && !on_ground && py > old_y {
+            state
+                .player
+                .add_exhaustion(if state.player.sprinting { 0.2 } else { 0.05 });
+        }
         if py < f64::from(world::MIN_Y) - 64.0 {
             // Vanilla `Entity.checkBelowWorld`: void damage below `minBuildHeight - 64` (-128)
             // with 10-tick hurt invulnerability.
@@ -759,6 +838,7 @@ mod tests {
                 next_teleport: 1,
                 pending_keep_alive: None,
                 next_keep_alive: now,
+                last_food_tick: now,
                 chunks: ChunkStream::new(2, now),
                 blocks: blocks::CreativeSession::new(Arc::default()),
                 open_container: None,

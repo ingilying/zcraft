@@ -104,6 +104,7 @@ async fn serve_validated(
                     let _ = server.players().broadcast(&packet);
                 }
                 server.play.tick_drops(server.players());
+                server.play.tick_furnaces(server.players());
                 ticks_since_save += 1;
                 if ticks_since_save >= AUTOSAVE_TICKS {
                     ticks_since_save = 0;
@@ -305,7 +306,7 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
     };
     let login_deadline = Instant::now() + Duration::from_secs(30);
     let mut frame_deadline = Instant::now() + deadline;
-    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+    let mut ticks = tokio::time::interval(Duration::from_millis(200));
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         let inbox = session

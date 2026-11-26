@@ -88,44 +88,89 @@ pub(crate) fn apply_control(
             }
         }
         PlayerControl::RefreshContainer(pos) => {
-            let Some(open) = state.open_container else {
+            let Some(open) = state.open_container.clone() else {
                 return Ok(Outcome::empty());
             };
-            if open.pos != pos {
-                return Ok(Outcome::empty());
-            }
-            let Some(chest_items) = service.world().chest_items(pos) else {
-                state.open_container = None;
-                return Ok(Outcome {
-                    replies: vec![
-                        crate::protocol::packets::play_blocks::CloseContainer(open.window_id)
+            match open.kind {
+                super::blocks::ContainerKind::Chest(cpos) if cpos == pos => {
+                    let Some(chest_items) = service.world().chest_items(pos) else {
+                        state.open_container = None;
+                        return Ok(Outcome {
+                            replies: vec![
+                                crate::protocol::packets::play_blocks::CloseContainer(
+                                    open.window_id,
+                                )
+                                .into(),
+                            ],
+                            close: false,
+                            encryption: None,
+                        });
+                    };
+                    let next_state_id = open.state_id.wrapping_add(1);
+                    state.open_container = Some(super::blocks::OpenContainer {
+                        state_id: next_state_id,
+                        ..open
+                    });
+                    let mut slots = Vec::with_capacity(crate::world::CHEST_SLOTS + 36);
+                    slots.extend_from_slice(&chest_items);
+                    slots.extend_from_slice(&session.inventory.slots()[9..45]);
+                    Ok(Outcome {
+                        replies: vec![
+                            InventoryContent::container(
+                                open.window_id,
+                                next_state_id,
+                                slots,
+                                session.inventory.carried(),
+                            )
                             .into(),
-                    ],
-                    close: false,
-                    encryption: None,
-                });
-            };
-            let next_state_id = open.state_id.wrapping_add(1);
-            state.open_container = Some(super::blocks::OpenContainer {
-                state_id: next_state_id,
-                ..open
-            });
-            let mut slots = Vec::with_capacity(crate::world::CHEST_SLOTS + 36);
-            slots.extend_from_slice(&chest_items);
-            slots.extend_from_slice(&session.inventory.slots()[9..45]);
-            Ok(Outcome {
-                replies: vec![
-                    InventoryContent::container(
+                        ],
+                        close: false,
+                        encryption: None,
+                    })
+                }
+                super::blocks::ContainerKind::Furnace(fpos) if fpos == pos => {
+                    let Some(furnace) = service.world().furnace_data(pos) else {
+                        state.open_container = None;
+                        return Ok(Outcome {
+                            replies: vec![
+                                crate::protocol::packets::play_blocks::CloseContainer(
+                                    open.window_id,
+                                )
+                                .into(),
+                            ],
+                            close: false,
+                            encryption: None,
+                        });
+                    };
+                    let next_state_id = open.state_id.wrapping_add(1);
+                    state.open_container = Some(super::blocks::OpenContainer {
+                        state_id: next_state_id,
+                        ..open
+                    });
+                    let mut slots = Vec::with_capacity(39);
+                    slots.extend_from_slice(&furnace.slots());
+                    slots.extend_from_slice(&session.inventory.slots()[9..45]);
+                    let mut replies = vec![
+                        InventoryContent::container(
+                            open.window_id,
+                            next_state_id,
+                            slots,
+                            session.inventory.carried(),
+                        )
+                        .into(),
+                    ];
+                    replies.extend(super::blocks::furnace_property_packets(
                         open.window_id,
-                        next_state_id,
-                        slots,
-                        session.inventory.carried(),
-                    )
-                    .into(),
-                ],
-                close: false,
-                encryption: None,
-            })
+                        &furnace,
+                    ));
+                    Ok(Outcome {
+                        replies,
+                        close: false,
+                        encryption: None,
+                    })
+                }
+                _ => Ok(Outcome::empty()),
+            }
         }
         PlayerControl::SetGameMode(mode) => {
             state.player.game_mode = mode;
