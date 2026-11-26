@@ -34,6 +34,11 @@ pub trait BlockBehavior: Send + Sync {
         let _ = (world, pos);
         Vec::new()
     }
+
+    /// Whether this block falls under gravity when unsupported below (sand, gravel, anvils, concrete powder).
+    fn falls_with_gravity(&self) -> bool {
+        false
+    }
 }
 
 struct DefaultBlock;
@@ -110,6 +115,13 @@ impl BlockBehavior for BedBlock {
     }
 }
 
+struct FallingBlock;
+impl BlockBehavior for FallingBlock {
+    fn falls_with_gravity(&self) -> bool {
+        true
+    }
+}
+
 fn toggle_open_property(state: i32) -> Option<i32> {
     let reg = registry();
     let (_, def, sdef) = reg.state_by_id(state)?;
@@ -130,6 +142,7 @@ static CHEST_BLOCK: ChestBlock = ChestBlock;
 static FURNACE_BLOCK: FurnaceBlock = FurnaceBlock;
 static TOGGLE_OPEN_BLOCK: ToggleOpenBlock = ToggleOpenBlock;
 static BED_BLOCK: BedBlock = BedBlock;
+static FALLING_BLOCK: FallingBlock = FallingBlock;
 
 /// Resolve the unified `BlockBehavior` for a block state ID.
 pub fn block_behavior(state: i32) -> &'static dyn BlockBehavior {
@@ -142,6 +155,9 @@ pub fn block_behavior(state: i32) -> &'static dyn BlockBehavior {
         "chest" | "trapped_chest" => &CHEST_BLOCK,
         "furnace" => &FURNACE_BLOCK,
         "iron_door" | "iron_trapdoor" => &DEFAULT_BLOCK,
+        "sand" | "red_sand" | "gravel" | "suspicious_sand" | "suspicious_gravel" | "anvil"
+        | "chipped_anvil" | "damaged_anvil" | "dragon_egg" => &FALLING_BLOCK,
+        _ if path.ends_with("_concrete_powder") => &FALLING_BLOCK,
         _ if path.ends_with("_door")
             || path.ends_with("_trapdoor")
             || path.ends_with("_fence_gate") =>
@@ -162,13 +178,26 @@ pub enum ItemUseOutcome {
         item_id: i32,
         eat_ticks: u16,
     },
+    /// Bucket picked up or placed a fluid (block update + survival item swap).
+    UseBucket {
+        hand: Hand,
+        pos: BlockPos,
+        new_state: i32,
+        result_item: i32,
+    },
 }
 
 /// Polymorphic behavior for a Minecraft item type.
 pub trait ItemBehavior: Send + Sync {
     /// Handle right-clicking with this item (`Item.use`).
-    fn on_use(&self, player: &Player, hand: Hand, stack: ItemStack) -> ItemUseOutcome {
-        let _ = (player, hand, stack);
+    fn on_use(
+        &self,
+        world: &World,
+        player: &Player,
+        hand: Hand,
+        stack: ItemStack,
+    ) -> ItemUseOutcome {
+        let _ = (world, player, hand, stack);
         ItemUseOutcome::Pass
     }
 
@@ -185,7 +214,13 @@ impl ItemBehavior for DefaultItem {}
 
 struct FoodItem;
 impl ItemBehavior for FoodItem {
-    fn on_use(&self, player: &Player, hand: Hand, stack: ItemStack) -> ItemUseOutcome {
+    fn on_use(
+        &self,
+        _world: &World,
+        player: &Player,
+        hand: Hand,
+        stack: ItemStack,
+    ) -> ItemUseOutcome {
         if !player.is_survival() || player.dead {
             return ItemUseOutcome::Pass;
         }
@@ -218,13 +253,293 @@ impl ItemBehavior for FoodItem {
     }
 }
 
+struct BucketItem;
+impl ItemBehavior for BucketItem {
+    fn on_use(
+        &self,
+        world: &World,
+        player: &Player,
+        hand: Hand,
+        stack: ItemStack,
+    ) -> ItemUseOutcome {
+        if !player.can_interact() || player.dead {
+            return ItemUseOutcome::Pass;
+        }
+        let Some(def) = item_by_id(stack.item) else {
+            return ItemUseOutcome::Pass;
+        };
+        let reach = if player.is_survival() { 5.0 } else { 5.5 };
+        match def.name.as_str() {
+            "minecraft:bucket" => {
+                let Some((pos, _)) = raycast_block(
+                    world,
+                    player.eye_position(),
+                    player.yaw,
+                    player.pitch,
+                    reach,
+                    true,
+                ) else {
+                    return ItemUseOutcome::Pass;
+                };
+                let state = world.block_at(pos);
+                let Some((_, bdef, sdef)) = registry().state_by_id(state) else {
+                    return ItemUseOutcome::Pass;
+                };
+                if bdef.name == "minecraft:water"
+                    && sdef.properties.get("level").map(String::as_str) == Some("0")
+                    && let Some(wb) = super::item_by_name("water_bucket")
+                {
+                    return ItemUseOutcome::UseBucket {
+                        hand,
+                        pos,
+                        new_state: super::AIR_STATE,
+                        result_item: wb.id,
+                    };
+                }
+                if bdef.name == "minecraft:lava"
+                    && sdef.properties.get("level").map(String::as_str) == Some("0")
+                    && let Some(lb) = super::item_by_name("lava_bucket")
+                {
+                    return ItemUseOutcome::UseBucket {
+                        hand,
+                        pos,
+                        new_state: super::AIR_STATE,
+                        result_item: lb.id,
+                    };
+                }
+                if sdef.properties.get("waterlogged").map(String::as_str) == Some("true")
+                    && let Some(unlogged) = set_waterlogged_property(state, false)
+                    && let Some(wb) = super::item_by_name("water_bucket")
+                {
+                    return ItemUseOutcome::UseBucket {
+                        hand,
+                        pos,
+                        new_state: unlogged,
+                        result_item: wb.id,
+                    };
+                }
+                ItemUseOutcome::Pass
+            }
+            "minecraft:water_bucket" => {
+                let Some((hit_pos, normal)) = raycast_block(
+                    world,
+                    player.eye_position(),
+                    player.yaw,
+                    player.pitch,
+                    reach,
+                    false,
+                ) else {
+                    return ItemUseOutcome::Pass;
+                };
+                let Some(empty) = super::item_by_name("bucket") else {
+                    return ItemUseOutcome::Pass;
+                };
+                let hit_state = world.block_at(hit_pos);
+                if let Some((_, _, sdef)) = registry().state_by_id(hit_state)
+                    && sdef.properties.get("waterlogged").map(String::as_str) == Some("false")
+                    && let Some(logged) = set_waterlogged_property(hit_state, true)
+                {
+                    return ItemUseOutcome::UseBucket {
+                        hand,
+                        pos: hit_pos,
+                        new_state: logged,
+                        result_item: empty.id,
+                    };
+                }
+                let target = BlockPos([
+                    hit_pos.0[0] + normal[0],
+                    hit_pos.0[1] + normal[1],
+                    hit_pos.0[2] + normal[2],
+                ]);
+                if target.valid()
+                    && block_by_state(world.block_at(target))
+                        .is_some_and(|d| d.air || d.replaceable)
+                    && let Some(water) = super::block_by_name("water")
+                {
+                    return ItemUseOutcome::UseBucket {
+                        hand,
+                        pos: target,
+                        new_state: water.default_state,
+                        result_item: empty.id,
+                    };
+                }
+                ItemUseOutcome::Pass
+            }
+            "minecraft:lava_bucket" => {
+                let Some((hit_pos, normal)) = raycast_block(
+                    world,
+                    player.eye_position(),
+                    player.yaw,
+                    player.pitch,
+                    reach,
+                    false,
+                ) else {
+                    return ItemUseOutcome::Pass;
+                };
+                let Some(empty) = super::item_by_name("bucket") else {
+                    return ItemUseOutcome::Pass;
+                };
+                let target = BlockPos([
+                    hit_pos.0[0] + normal[0],
+                    hit_pos.0[1] + normal[1],
+                    hit_pos.0[2] + normal[2],
+                ]);
+                if target.valid()
+                    && block_by_state(world.block_at(target))
+                        .is_some_and(|d| d.air || d.replaceable)
+                    && let Some(lava) = super::block_by_name("lava")
+                {
+                    return ItemUseOutcome::UseBucket {
+                        hand,
+                        pos: target,
+                        new_state: lava.default_state,
+                        result_item: empty.id,
+                    };
+                }
+                ItemUseOutcome::Pass
+            }
+            _ => ItemUseOutcome::Pass,
+        }
+    }
+}
+
+fn set_waterlogged_property(state: i32, waterlogged: bool) -> Option<i32> {
+    let reg = registry();
+    let (_, def, sdef) = reg.state_by_id(state)?;
+    if !sdef.properties.contains_key("waterlogged") {
+        return None;
+    }
+    let mut props: std::collections::BTreeMap<String, String> = sdef
+        .properties
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    props.insert(
+        "waterlogged".into(),
+        if waterlogged { "true" } else { "false" }.into(),
+    );
+    reg.resolve_state(&def.name, &props)
+}
+
+/// 3D voxel DDA raycast from `eye` along `(yaw, pitch)` up to `max_dist`.
+/// Returns `(hit_block_pos, hit_face_normal)`.
+fn raycast_block(
+    world: &World,
+    eye: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    max_dist: f64,
+    stop_on_fluid_source: bool,
+) -> Option<(BlockPos, [i32; 3])> {
+    let yaw_rad = f64::from(yaw).to_radians();
+    let pitch_rad = f64::from(pitch).to_radians();
+    let dx = -yaw_rad.sin() * pitch_rad.cos();
+    let dy = -pitch_rad.sin();
+    let dz = yaw_rad.cos() * pitch_rad.cos();
+
+    let mut x = eye[0].floor() as i32;
+    let mut y = eye[1].floor() as i32;
+    let mut z = eye[2].floor() as i32;
+
+    let step_x = if dx >= 0.0 { 1 } else { -1 };
+    let step_y = if dy >= 0.0 { 1 } else { -1 };
+    let step_z = if dz >= 0.0 { 1 } else { -1 };
+
+    let t_delta_x = if dx.abs() < 1e-9 {
+        f64::INFINITY
+    } else {
+        1.0 / dx.abs()
+    };
+    let t_delta_y = if dy.abs() < 1e-9 {
+        f64::INFINITY
+    } else {
+        1.0 / dy.abs()
+    };
+    let t_delta_z = if dz.abs() < 1e-9 {
+        f64::INFINITY
+    } else {
+        1.0 / dz.abs()
+    };
+
+    let mut t_max_x = if dx > 1e-9 {
+        (f64::from(x + 1) - eye[0]) * t_delta_x
+    } else if dx < -1e-9 {
+        (eye[0] - f64::from(x)) * t_delta_x
+    } else {
+        f64::INFINITY
+    };
+    let mut t_max_y = if dy > 1e-9 {
+        (f64::from(y + 1) - eye[1]) * t_delta_y
+    } else if dy < -1e-9 {
+        (eye[1] - f64::from(y)) * t_delta_y
+    } else {
+        f64::INFINITY
+    };
+    let mut t_max_z = if dz > 1e-9 {
+        (f64::from(z + 1) - eye[2]) * t_delta_z
+    } else if dz < -1e-9 {
+        (eye[2] - f64::from(z)) * t_delta_z
+    } else {
+        f64::INFINITY
+    };
+
+    let mut normal = [0, 1, 0];
+    let mut t = 0.0;
+    while t <= max_dist {
+        let pos = BlockPos([x, y, z]);
+        if pos.valid() {
+            let state = world.block_at(pos);
+            if let Some((_, bdef, sdef)) = registry().state_by_id(state) {
+                if stop_on_fluid_source {
+                    let is_source = (bdef.name == "minecraft:water"
+                        || bdef.name == "minecraft:lava")
+                        && sdef.properties.get("level").map(String::as_str) == Some("0");
+                    let is_waterlogged =
+                        sdef.properties.get("waterlogged").map(String::as_str) == Some("true");
+                    if is_source || is_waterlogged || sdef.collision {
+                        return Some((pos, normal));
+                    }
+                } else if !sdef.air && !sdef.liquid {
+                    return Some((pos, normal));
+                }
+            }
+        }
+        if t_max_x <= t_max_y && t_max_x <= t_max_z {
+            t = t_max_x;
+            t_max_x += t_delta_x;
+            x += step_x;
+            normal = [-step_x, 0, 0];
+        } else if t_max_y <= t_max_z {
+            t = t_max_y;
+            t_max_y += t_delta_y;
+            y += step_y;
+            normal = [0, -step_y, 0];
+        } else {
+            t = t_max_z;
+            t_max_z += t_delta_z;
+            z += step_z;
+            normal = [0, 0, -step_z];
+        }
+    }
+    None
+}
+
 static DEFAULT_ITEM: DefaultItem = DefaultItem;
 static FOOD_ITEM: FoodItem = FoodItem;
+static BUCKET_ITEM: BucketItem = BucketItem;
 
 /// Resolve the unified `ItemBehavior` for an item ID (data-driven via `ItemComponents`).
 pub fn item_behavior(item_id: i32) -> &'static dyn ItemBehavior {
-    if item_by_id(item_id).is_some_and(|d| d.components.food.is_some()) {
+    let Some(def) = item_by_id(item_id) else {
+        return &DEFAULT_ITEM;
+    };
+    if def.components.food.is_some() {
         &FOOD_ITEM
+    } else if matches!(
+        def.name.as_str(),
+        "minecraft:bucket" | "minecraft:water_bucket" | "minecraft:lava_bucket"
+    ) {
+        &BUCKET_ITEM
     } else {
         &DEFAULT_ITEM
     }
@@ -237,6 +552,7 @@ mod tests {
 
     #[test]
     fn food_item_behavior_and_hunger_regen_match_vanilla() {
+        let world = World::new();
         let mut player = Player::at_spawn(1, uuid::Uuid::nil(), "Steve".into(), GameMode::Survival);
         player.food = 10;
         player.saturation = 0.0;
@@ -245,7 +561,7 @@ mod tests {
         let steak = item_by_name("cooked_beef").unwrap().id;
         let stack = ItemStack::new(steak, 1).unwrap();
         assert_eq!(
-            item_behavior(steak).on_use(&player, Hand::Main, stack),
+            item_behavior(steak).on_use(&world, &player, Hand::Main, stack),
             ItemUseOutcome::StartEating {
                 hand: Hand::Main,
                 item_id: steak,
@@ -338,6 +654,59 @@ mod tests {
         assert_eq!(
             block_behavior(red_bed).on_use(&world, pos, red_bed),
             BlockUseOutcome::UseBed(pos)
+        );
+
+        // Gravity blocks report falls_with_gravity() == true.
+        let sand = crate::game::block_by_name("sand").unwrap().default_state;
+        assert!(block_behavior(sand).falls_with_gravity());
+        assert!(!block_behavior(table).falls_with_gravity());
+    }
+
+    #[test]
+    fn bucket_item_places_and_scoops_water_via_raycast() {
+        let world = World::new();
+        let mut player = Player::at_spawn(1, uuid::Uuid::nil(), "Steve".into(), GameMode::Survival);
+        // Stand at (8.5, 64.0, 8.5) looking straight down at grass block (8, 63, 8).
+        player.position = [8.5, 64.0, 8.5];
+        player.yaw = 0.0;
+        player.pitch = 90.0;
+
+        let water_bucket = item_by_name("water_bucket").unwrap().id;
+        let bucket = item_by_name("bucket").unwrap().id;
+        let water_source = crate::game::block_by_name("water").unwrap().default_state;
+
+        let place = item_behavior(water_bucket).on_use(
+            &world,
+            &player,
+            Hand::Main,
+            ItemStack::new(water_bucket, 1).unwrap(),
+        );
+        assert_eq!(
+            place,
+            ItemUseOutcome::UseBucket {
+                hand: Hand::Main,
+                pos: BlockPos([8, 64, 8]),
+                new_state: water_source,
+                result_item: bucket,
+            }
+        );
+        world.set_block(BlockPos([8, 64, 8]), water_source);
+
+        // Empty bucket scoops the water source back up.
+        let scoop = item_behavior(bucket).on_use(
+            &world,
+            &player,
+            Hand::Main,
+            ItemStack::new(bucket, 1).unwrap(),
+        );
+        assert_eq!(
+            scoop,
+            ItemUseOutcome::UseBucket {
+                hand: Hand::Main,
+                pos: BlockPos([8, 64, 8]),
+                new_state: crate::game::AIR_STATE,
+                result_item: water_bucket,
+            }
         );
     }
 }

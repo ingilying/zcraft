@@ -874,11 +874,13 @@ fn furnace_slots(
 }
 
 pub async fn handle_use_item(ctx: &mut Context<'_>, p: UseItem) -> io::Result<Outcome> {
+    let mut bucket_action: Option<(Hand, BlockPos, i32, i32, bool, [f64; 3])> = None;
     if let Some(hand) = Hand::from_wire(p.hand)
         && let Some(stack) = ctx.session.inventory.hand(hand)
         && let Ok(state) = play(ctx.session)
     {
-        match crate::game::item_behavior(stack.item).on_use(&state.player, hand, stack) {
+        let world = ctx.server.play.world();
+        match crate::game::item_behavior(stack.item).on_use(world, &state.player, hand, stack) {
             crate::game::ItemUseOutcome::StartEating {
                 hand,
                 item_id,
@@ -886,7 +888,45 @@ pub async fn handle_use_item(ctx: &mut Context<'_>, p: UseItem) -> io::Result<Ou
             } => {
                 state.player.eating = Some((hand, item_id, tokio::time::Instant::now(), eat_ticks));
             }
+            crate::game::ItemUseOutcome::UseBucket {
+                hand,
+                pos,
+                new_state,
+                result_item,
+            } => {
+                bucket_action = Some((
+                    hand,
+                    pos,
+                    new_state,
+                    result_item,
+                    state.player.is_survival(),
+                    state.player.position,
+                ));
+            }
             crate::game::ItemUseOutcome::Pass => {}
+        }
+    }
+    if let Some((hand, pos, new_state, result_item, is_survival, player_pos)) = bucket_action {
+        let changed = ctx
+            .server
+            .play
+            .set_block(ctx.server.players(), pos, new_state)?;
+        if changed
+            && is_survival
+            && let Some(replacement) = crate::game::ItemStack::new(result_item, 1)
+        {
+            if let Some(overflow) = ctx.session.inventory.replace_hand_one(hand, replacement) {
+                let _ = ctx.server.play.spawn_item_drop_scatter(
+                    ctx.server.players(),
+                    [player_pos[0], player_pos[1] + 0.5, player_pos[2]],
+                    overflow,
+                    10,
+                );
+            }
+            sync_equipment(ctx)?;
+            let mut out = inventory(ctx)?;
+            out.replies.push(BlockAck(p.sequence).into());
+            return Ok(out);
         }
     }
     if let Some(slot) = &ctx.session.reservation

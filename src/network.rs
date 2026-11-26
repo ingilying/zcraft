@@ -105,6 +105,7 @@ async fn serve_validated(
                 }
                 server.play.tick_drops(server.players());
                 server.play.tick_furnaces(server.players());
+                server.play.tick_physics(server.players());
                 ticks_since_save += 1;
                 if ticks_since_save >= AUTOSAVE_TICKS {
                     ticks_since_save = 0;

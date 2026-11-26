@@ -100,6 +100,35 @@ impl Inventory {
             ClickResult::Changed
         }
     }
+    /// Consume 1 item from `hand` and replace it with `replacement` (for buckets, bottles, etc.).
+    /// If the hand held a stack of >1, decrements the stack and inserts `replacement` into the
+    /// inventory, returning `Some(replacement)` only if the inventory was completely full.
+    pub fn replace_hand_one(&mut self, hand: Hand, replacement: ItemStack) -> Option<ItemStack> {
+        let slot = match hand {
+            Hand::Main => 36 + usize::from(self.selected),
+            Hand::Off => OFFHAND,
+        };
+        let mut stack = self.slots[slot]?;
+        if stack.count <= 1 {
+            self.slots[slot] = Some(replacement);
+            self.changed();
+            None
+        } else {
+            stack.count -= 1;
+            self.slots[slot] = Some(stack);
+            let added = self.give_stack(replacement);
+            self.changed();
+            if added < replacement.count {
+                Some(ItemStack::with_damage(
+                    replacement.item,
+                    replacement.count - added,
+                    replacement.damage,
+                )?)
+            } else {
+                None
+            }
+        }
+    }
     pub fn damage_hand(&mut self, hand: Hand, amount: u32) -> ClickResult {
         let slot = match hand {
             Hand::Main => 36 + usize::from(self.selected),

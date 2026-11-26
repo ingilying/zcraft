@@ -196,6 +196,13 @@ impl PlayService {
         }
     }
 
+    /// Advance scheduled block physics (gravity blocks & water/lava fluids) by 1 tick (20 TPS).
+    pub fn tick_physics(&self, players: &crate::players::Players) {
+        for mutation in self.world.tick_physics() {
+            let _ = publish_mutation(players, mutation);
+        }
+    }
+
     /// Track a player opening a chest and return the updated total viewer count.
     pub fn open_chest_viewer(&self, pos: BlockPos, uuid: uuid::Uuid) -> usize {
         let mut viewers = self.chest_viewers.lock().expect("chest viewers poisoned");

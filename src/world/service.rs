@@ -3,7 +3,7 @@
 use super::{
     AnvilStorage, BlockPos, Chunk, ChunkGenerator, ChunkStore, FlatGenerator, FlatGeneratorConfig,
     SavedPlayer, TickEvents, TimeSnapshot, WeatherEvent, WeatherSnapshot, WorldClock,
-    affected_light_chunks,
+    affected_light_chunks, physics,
 };
 use crate::game::{Inventory, Player};
 use std::{
@@ -44,6 +44,7 @@ pub struct World {
     storage: Option<AnvilStorage>,
     store: Mutex<ChunkStore>,
     clock: Mutex<WorldClock>,
+    physics: Mutex<physics::PhysicsScheduler>,
     save_lock: Mutex<()>,
     spawn: [f64; 3],
     placeholder_terrain: Arc<[u8]>,
@@ -72,6 +73,7 @@ impl World {
             storage: None,
             store,
             clock: Mutex::new(WorldClock::new()),
+            physics: Mutex::new(physics::PhysicsScheduler::new()),
             save_lock: Mutex::new(()),
             spawn,
             placeholder_terrain,
@@ -161,6 +163,7 @@ impl World {
             storage: Some(storage),
             store,
             clock: Mutex::new(clock),
+            physics: Mutex::new(physics::PhysicsScheduler::new()),
             save_lock: Mutex::new(()),
             spawn,
             placeholder_terrain,
@@ -413,28 +416,63 @@ impl World {
         on_reconciled(changes, light_update)
     }
 
+    /// Advance scheduled block physics (gravity blocks and water/lava fluids) by 1 tick.
+    pub fn tick_physics(&self) -> Vec<WorldMutation> {
+        let due = self
+            .physics
+            .lock()
+            .expect("physics scheduler poisoned")
+            .pop_due();
+        if due.is_empty() {
+            return Vec::new();
+        }
+        let mut mutations = Vec::new();
+        for (pos, kind) in due {
+            let edits = physics::evaluate_tick(pos, kind, |p| self.block_at(p));
+            for (epos, estate) in edits {
+                if let Some(mutation) = self.set_block(epos, estate) {
+                    mutations.push(mutation);
+                }
+            }
+        }
+        mutations
+    }
+
     /// Atomically set one block, refresh affected chunks' cached light once,
     /// and return all block + light diffs without holding the world lock.
     pub fn set_block(&self, pos: BlockPos, state: i32) -> Option<WorldMutation> {
         if !pos.valid() {
             return None;
         }
-        let mut store = self.store.lock().expect("chunk store poisoned");
-        let affected = affected_light_chunks(pos);
-        let old_lights: Vec<_> = affected
-            .iter()
-            .map(|&nc| (nc, store.cached_or_current_light(nc)))
-            .collect();
-        if !store.set_block(pos, state) {
-            return None;
-        }
-        let mut light_changes = Vec::new();
-        for (nc, old_light) in old_lights {
-            let new_light = store.recompute_light(nc);
-            if new_light != old_light {
-                light_changes.push((nc, new_light));
+        let (light_changes, samples) = {
+            let mut store = self.store.lock().expect("chunk store poisoned");
+            let affected = affected_light_chunks(pos);
+            let old_lights: Vec<_> = affected
+                .iter()
+                .map(|&nc| (nc, store.cached_or_current_light(nc)))
+                .collect();
+            if !store.set_block(pos, state) {
+                return None;
             }
-        }
+            let mut light_changes = Vec::new();
+            for (nc, old_light) in old_lights {
+                let new_light = store.recompute_light(nc);
+                if new_light != old_light {
+                    light_changes.push((nc, new_light));
+                }
+            }
+            let mut samples = Vec::with_capacity(7);
+            for npos in physics::neighborhood_positions(pos) {
+                if npos.valid() {
+                    samples.push((npos, store.get_block(npos)));
+                }
+            }
+            (light_changes, samples)
+        };
+        self.physics
+            .lock()
+            .expect("physics scheduler poisoned")
+            .schedule_samples(&samples);
         Some(WorldMutation {
             block_changes: vec![(pos, state)],
             light_changes,

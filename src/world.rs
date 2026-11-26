@@ -25,6 +25,7 @@ mod generator;
 mod light;
 mod nbt;
 mod overworld;
+mod physics;
 mod service;
 mod store;
 pub use anvil::{AnvilStorage, LoadedGenerator, SavedPlayer};
