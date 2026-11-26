@@ -273,6 +273,22 @@ impl Encode for CloseContainer {
     }
 }
 
+/// Clientbound 0x14: Set Container Property (e.g. Furnace burn/cook progress).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerSetData {
+    pub window_id: u8,
+    pub property: i16,
+    pub value: i16,
+}
+impl Encode for ContainerSetData {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        out.push(self.window_id);
+        out.extend_from_slice(&self.property.to_be_bytes());
+        out.extend_from_slice(&self.value.to_be_bytes());
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenScreen {
     pub window_id: i32,

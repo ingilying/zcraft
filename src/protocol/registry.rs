@@ -212,6 +212,7 @@ clientbound_packets! {
         0x11 => DeclareCommands(DeclareCommands),
         0x12 => CloseContainer(CloseContainer),
         0x13 => InventoryContent(InventoryContent),
+        0x14 => ContainerSetData(ContainerSetData),
         0x15 => SetInventorySlot(SetInventorySlot),
         0x1d => PlayDisconnect(PlayDisconnect),
         0x21 => ForgetChunk(ForgetChunk),

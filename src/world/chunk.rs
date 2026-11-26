@@ -12,12 +12,31 @@ use std::{collections::BTreeMap, sync::Arc};
 
 pub const CHEST_SLOTS: usize = 27;
 
+/// Persistent state of a vanilla Furnace (`minecraft:furnace`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FurnaceData {
+    pub input: Option<ItemStack>,
+    pub fuel: Option<ItemStack>,
+    pub output: Option<ItemStack>,
+    pub burn_time: u16,
+    pub burn_total: u16,
+    pub cook_time: u16,
+    pub cook_total: u16,
+}
+
+impl FurnaceData {
+    pub fn slots(&self) -> [Option<ItemStack>; 3] {
+        [self.input, self.fuel, self.output]
+    }
+}
+
 /// Per-block persistent entity data stored inside a `Chunk` (Anvil `block_entities`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockEntity {
     Chest {
         items: Box<[Option<ItemStack>; CHEST_SLOTS]>,
     },
+    Furnace(Box<FurnaceData>),
 }
 
 impl BlockEntity {
@@ -25,6 +44,10 @@ impl BlockEntity {
         Self::Chest {
             items: Box::new([None; CHEST_SLOTS]),
         }
+    }
+
+    pub fn empty_furnace() -> Self {
+        Self::Furnace(Box::default())
     }
 }
 

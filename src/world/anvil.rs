@@ -3,7 +3,7 @@
 //! - `region/r.<rx>.<rz>.mca`: 32x32 chunk region files (lazy single-chunk load & atomic batch save)
 //! - `playerdata/<uuid>.dat`: GZip-compressed NBT per-player state & inventory
 use super::{
-    BiomeStorage, BlockEntity, BlockStorage, CHEST_SLOTS, Chunk, ChunkSection, MIN_Y,
+    BiomeStorage, BlockEntity, BlockStorage, CHEST_SLOTS, Chunk, ChunkSection, FurnaceData, MIN_Y,
     PLAINS_BIOME_ID, SECTION_COUNT,
     clock::PersistedClock,
     generator::{FlatGeneratorConfig, FlatLayerConfig},
@@ -774,32 +774,32 @@ fn encode_chunk_anvil(cx: i32, cz: i32, chunk: &Chunk) -> io::Result<Vec<u8>> {
 
     let mut be_list = Vec::with_capacity(chunk.block_entities().len());
     for (&[x, y, z], entity) in chunk.block_entities() {
-        let BlockEntity::Chest { items } = entity;
-        let mut items_nbt = Vec::new();
-        for (slot, stack) in items.iter().enumerate() {
-            let Some(stack) = stack else {
-                continue;
-            };
-            let Some(def) = item_by_id(stack.item) else {
-                continue;
-            };
-            let mut item_map = Compound::new();
-            item_map.insert("Slot".into(), Tag::Byte(slot as i8));
-            item_map.insert("id".into(), Tag::String(def.name.clone()));
-            item_map.insert("count".into(), Tag::Int(i32::from(stack.count)));
-            if stack.damage > 0 {
-                let mut components = Compound::new();
-                components.insert("minecraft:damage".into(), Tag::Int(stack.damage as i32));
-                item_map.insert("components".into(), Tag::Compound(components));
-            }
-            items_nbt.push(Tag::Compound(item_map));
-        }
         let mut be_map = Compound::new();
-        be_map.insert("id".into(), Tag::String("minecraft:chest".into()));
         be_map.insert("x".into(), Tag::Int(x));
         be_map.insert("y".into(), Tag::Int(y));
         be_map.insert("z".into(), Tag::Int(z));
-        be_map.insert("Items".into(), Tag::List(items_nbt));
+        match entity {
+            BlockEntity::Chest { items } => {
+                be_map.insert("id".into(), Tag::String("minecraft:chest".into()));
+                be_map.insert(
+                    "Items".into(),
+                    Tag::List(encode_container_items(items.as_slice())),
+                );
+            }
+            BlockEntity::Furnace(furnace) => {
+                be_map.insert("id".into(), Tag::String("minecraft:furnace".into()));
+                be_map.insert("BurnTime".into(), Tag::Short(furnace.burn_time as i16));
+                be_map.insert("CookTime".into(), Tag::Short(furnace.cook_time as i16));
+                be_map.insert(
+                    "CookTimeTotal".into(),
+                    Tag::Short(furnace.cook_total as i16),
+                );
+                be_map.insert(
+                    "Items".into(),
+                    Tag::List(encode_container_items(&furnace.slots())),
+                );
+            }
+        }
         be_list.push(Tag::Compound(be_map));
     }
 
@@ -843,6 +843,65 @@ fn encode_chunk_anvil(cx: i32, cz: i32, chunk: &Chunk) -> io::Result<Vec<u8>> {
     out.push(2); // Compression type 2 = Zlib.
     out.extend_from_slice(&compressed);
     Ok(out)
+}
+
+fn encode_container_items(items: &[Option<ItemStack>]) -> Vec<Tag> {
+    let mut items_nbt = Vec::new();
+    for (slot, stack) in items.iter().enumerate() {
+        let Some(stack) = stack else {
+            continue;
+        };
+        let Some(def) = item_by_id(stack.item) else {
+            continue;
+        };
+        let mut item_map = Compound::new();
+        item_map.insert("Slot".into(), Tag::Byte(slot as i8));
+        item_map.insert("id".into(), Tag::String(def.name.clone()));
+        item_map.insert("count".into(), Tag::Int(i32::from(stack.count)));
+        if stack.damage > 0 {
+            let mut components = Compound::new();
+            components.insert("minecraft:damage".into(), Tag::Int(stack.damage as i32));
+            item_map.insert("components".into(), Tag::Compound(components));
+        }
+        items_nbt.push(Tag::Compound(item_map));
+    }
+    items_nbt
+}
+
+fn decode_container_items(raw_items: &[Tag], out: &mut [Option<ItemStack>]) {
+    for item_tag in raw_items {
+        let Some(item_map) = item_tag.as_compound() else {
+            continue;
+        };
+        let Some(slot) = item_map
+            .get("Slot")
+            .and_then(Tag::as_byte)
+            .and_then(|s| usize::try_from(s).ok())
+            .filter(|&s| s < out.len())
+        else {
+            continue;
+        };
+        let Some(id_str) = item_map.get("id").and_then(Tag::as_str) else {
+            continue;
+        };
+        let Some(def) = item_by_name(id_str) else {
+            continue;
+        };
+        let count = item_map
+            .get("count")
+            .and_then(Tag::as_int)
+            .or_else(|| item_map.get("Count").and_then(Tag::as_byte).map(i32::from))
+            .unwrap_or(1)
+            .clamp(1, i32::from(def.max_stack)) as u8;
+        let damage = item_map
+            .get("components")
+            .and_then(Tag::as_compound)
+            .and_then(|c| c.get("minecraft:damage"))
+            .and_then(Tag::as_int)
+            .unwrap_or(0)
+            .max(0) as u32;
+        out[slot] = ItemStack::with_damage(def.id, count, damage);
+    }
 }
 
 fn decode_chunk_anvil(payload: &[u8]) -> io::Result<Chunk> {
@@ -996,9 +1055,6 @@ fn decode_chunk_sections(root: &Compound) -> Chunk {
             let Some(be_map) = be_tag.as_compound() else {
                 continue;
             };
-            if be_map.get("id").and_then(Tag::as_str) != Some("minecraft:chest") {
-                continue;
-            }
             let (Some(x), Some(y), Some(z)) = (
                 be_map.get("x").and_then(Tag::as_int),
                 be_map.get("y").and_then(Tag::as_int),
@@ -1006,43 +1062,49 @@ fn decode_chunk_sections(root: &Compound) -> Chunk {
             ) else {
                 continue;
             };
-            let mut items = Box::new([None; CHEST_SLOTS]);
-            if let Some(raw_items) = be_map.get("Items").and_then(Tag::as_list) {
-                for item_tag in raw_items {
-                    let Some(item_map) = item_tag.as_compound() else {
-                        continue;
-                    };
-                    let Some(slot) = item_map
-                        .get("Slot")
-                        .and_then(Tag::as_byte)
-                        .and_then(|s| usize::try_from(s).ok())
-                        .filter(|&s| s < CHEST_SLOTS)
-                    else {
-                        continue;
-                    };
-                    let Some(id_str) = item_map.get("id").and_then(Tag::as_str) else {
-                        continue;
-                    };
-                    let Some(def) = item_by_name(id_str) else {
-                        continue;
-                    };
-                    let count = item_map
-                        .get("count")
-                        .and_then(Tag::as_int)
-                        .or_else(|| item_map.get("Count").and_then(Tag::as_byte).map(i32::from))
-                        .unwrap_or(1)
-                        .clamp(1, i32::from(def.max_stack)) as u8;
-                    let damage = item_map
-                        .get("components")
-                        .and_then(Tag::as_compound)
-                        .and_then(|c| c.get("minecraft:damage"))
-                        .and_then(Tag::as_int)
-                        .unwrap_or(0)
-                        .max(0) as u32;
-                    items[slot] = ItemStack::with_damage(def.id, count, damage);
+            match be_map.get("id").and_then(Tag::as_str) {
+                Some("minecraft:chest") => {
+                    let mut items = Box::new([None; CHEST_SLOTS]);
+                    if let Some(raw_items) = be_map.get("Items").and_then(Tag::as_list) {
+                        decode_container_items(raw_items, items.as_mut_slice());
+                    }
+                    chunk.set_block_entity([x, y, z], BlockEntity::Chest { items });
                 }
+                Some("minecraft:furnace") => {
+                    let mut slots = [None; 3];
+                    if let Some(raw_items) = be_map.get("Items").and_then(Tag::as_list) {
+                        decode_container_items(raw_items, &mut slots);
+                    }
+                    let burn_time = be_map
+                        .get("BurnTime")
+                        .and_then(Tag::as_short)
+                        .unwrap_or(0)
+                        .max(0) as u16;
+                    let cook_time = be_map
+                        .get("CookTime")
+                        .and_then(Tag::as_short)
+                        .unwrap_or(0)
+                        .max(0) as u16;
+                    let cook_total = be_map
+                        .get("CookTimeTotal")
+                        .and_then(Tag::as_short)
+                        .unwrap_or(200)
+                        .max(0) as u16;
+                    chunk.set_block_entity(
+                        [x, y, z],
+                        BlockEntity::Furnace(Box::new(FurnaceData {
+                            input: slots[0],
+                            fuel: slots[1],
+                            output: slots[2],
+                            burn_time,
+                            burn_total: burn_time,
+                            cook_time,
+                            cook_total,
+                        })),
+                    );
+                }
+                _ => {}
             }
-            chunk.set_block_entity([x, y, z], BlockEntity::Chest { items });
         }
     }
     chunk

@@ -53,6 +53,13 @@ impl Tag {
         }
     }
 
+    pub fn as_short(&self) -> Option<i16> {
+        match self {
+            Self::Short(v) => Some(*v),
+            _ => None,
+        }
+    }
+
     pub fn as_int(&self) -> Option<i32> {
         match self {
             Self::Int(v) => Some(*v),

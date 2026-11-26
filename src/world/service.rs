@@ -269,6 +269,51 @@ impl World {
             .update_chest(pos, mutate)
     }
 
+    pub fn furnace_data(&self, pos: BlockPos) -> Option<super::FurnaceData> {
+        if !pos.valid() {
+            return None;
+        }
+        self.store
+            .lock()
+            .expect("chunk store poisoned")
+            .furnace_data(pos)
+    }
+
+    pub fn update_furnace(
+        &self,
+        pos: BlockPos,
+        mutate: impl FnOnce(&mut super::FurnaceData) -> bool,
+    ) -> Option<super::FurnaceData> {
+        if !pos.valid() {
+            return None;
+        }
+        self.store
+            .lock()
+            .expect("chunk store poisoned")
+            .update_furnace(pos, mutate)
+    }
+
+    /// Advance all loaded furnaces by 1 tick (20 TPS), applying any `lit` block
+    /// state & lighting transitions. Returns `(updated_positions, mutations)`.
+    pub fn tick_furnaces(&self) -> (Vec<BlockPos>, Vec<WorldMutation>) {
+        let updates = self
+            .store
+            .lock()
+            .expect("chunk store poisoned")
+            .tick_furnaces();
+        let mut changed_positions = Vec::with_capacity(updates.len());
+        let mut mutations = Vec::new();
+        for (pos, new_state) in updates {
+            changed_positions.push(pos);
+            if let Some(state) = new_state
+                && let Some(mutation) = self.set_block(pos, state)
+            {
+                mutations.push(mutation);
+            }
+        }
+        (changed_positions, mutations)
+    }
+
     /// Persist `level.dat` and all dirty chunks to Anvil `region/*.mca`.
     /// Serialized across concurrent callers so an older snapshot can never
     /// overwrite a newer one, and restores dirty markers on any I/O failure.

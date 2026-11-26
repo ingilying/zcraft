@@ -30,6 +30,7 @@ mod store;
 pub use anvil::{AnvilStorage, LoadedGenerator, SavedPlayer};
 pub use chunk::{
     BiomeStorage, BlockEntity, BlockPos, BlockStorage, CHEST_SLOTS, Chunk, ChunkSection,
+    FurnaceData,
 };
 pub use clock::{
     DAY_LENGTH, INITIAL_DAY_TIME, PersistedClock, TICK_INTERVAL, TICKS_PER_SECOND,
