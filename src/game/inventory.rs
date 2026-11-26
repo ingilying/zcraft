@@ -1,6 +1,7 @@
-use super::{Hand, ItemStack, item_by_name};
+use super::{Hand, ItemStack};
 
 pub const SLOT_COUNT: usize = 46;
+const ARMOR: std::ops::Range<usize> = 5..9;
 const MAIN: std::ops::Range<usize> = 9..36;
 const HOTBAR: std::ops::Range<usize> = 36..45;
 const OFFHAND: usize = 45;
@@ -27,25 +28,8 @@ pub struct Inventory {
 }
 impl Default for Inventory {
     fn default() -> Self {
-        let mut slots = [None; SLOT_COUNT];
-        for (slot, name, count) in [
-            (36, "stone", 64),
-            (37, "dirt", 64),
-            (38, "glass", 64),
-            (39, "wooden_pickaxe", 1),
-            (40, "stone_pickaxe", 1),
-            (41, "iron_pickaxe", 1),
-            (42, "wooden_shovel", 1),
-            (43, "stone_shovel", 1),
-            (44, "iron_shovel", 1),
-        ] {
-            slots[slot] = ItemStack::new(
-                item_by_name(name).expect("generated starter item").id,
-                count,
-            );
-        }
         Self {
-            slots,
+            slots: [None; SLOT_COUNT],
             carried: None,
             selected: 0,
             state_id: 0,
@@ -114,7 +98,7 @@ impl Inventory {
             ClickResult::Changed
         }
     }
-    pub fn damage_hand(&mut self, hand: Hand) -> ClickResult {
+    pub fn damage_hand(&mut self, hand: Hand, amount: u32) -> ClickResult {
         let slot = match hand {
             Hand::Main => 36 + usize::from(self.selected),
             Hand::Off => OFFHAND,
@@ -122,16 +106,84 @@ impl Inventory {
         let Some(mut stack) = self.slots[slot] else {
             return ClickResult::Unchanged;
         };
-        if stack.definition().max_damage == 0 {
+        if stack.definition().max_damage == 0 || amount == 0 {
             return ClickResult::Unchanged;
         }
-        if stack.damage_one() {
+        let mut broke = false;
+        for _ in 0..amount {
+            if stack.damage_one() {
+                broke = true;
+                break;
+            }
+        }
+        if broke {
             self.slots[slot] = None;
         } else {
             self.slots[slot] = Some(stack);
         }
         self.changed();
         ClickResult::Changed
+    }
+    /// Take and clear the cursor-carried item stack, if any.
+    pub fn take_carried(&mut self) -> Option<ItemStack> {
+        let carried = self.carried.take()?;
+        self.changed();
+        Some(carried)
+    }
+    /// Drain all non-empty items (armor, main, hotbar, offhand, carried) for death drops.
+    pub fn drain_all(&mut self) -> Vec<ItemStack> {
+        let mut out = Vec::new();
+        for slot in self.slots.iter_mut() {
+            if let Some(stack) = slot.take() {
+                out.push(stack);
+            }
+        }
+        if let Some(carried) = self.carried.take() {
+            out.push(carried);
+        }
+        if !out.is_empty() {
+            self.changed();
+        }
+        out
+    }
+    /// Insert an `ItemStack` preserving its `damage` component into hotbar then main inventory.
+    /// Returns the number of items actually inserted (`0..=stack.count`).
+    pub fn give_stack(&mut self, stack: ItemStack) -> u8 {
+        let max_stack = stack.definition().max_stack;
+        if max_stack == 0 || stack.count == 0 {
+            return 0;
+        }
+        let mut remaining = stack.count;
+        for slot in HOTBAR.chain(MAIN) {
+            if remaining == 0 {
+                break;
+            }
+            if let Some(mut existing) = self.slots[slot]
+                && existing.item == stack.item
+                && existing.damage == stack.damage
+                && existing.count < max_stack
+            {
+                let add = (max_stack - existing.count).min(remaining);
+                existing.count += add;
+                remaining -= add;
+                self.slots[slot] = Some(existing);
+            }
+        }
+        for slot in HOTBAR.chain(MAIN) {
+            if remaining == 0 {
+                break;
+            }
+            if self.slots[slot].is_none() {
+                let add = max_stack.min(remaining);
+                self.slots[slot] = ItemStack::with_damage(stack.item, add, stack.damage);
+                remaining -= add;
+            }
+        }
+        let added = stack.count - remaining;
+        if added > 0 {
+            self.changed();
+        }
+        added
     }
     pub fn swap_hands(&mut self) -> ClickResult {
         let main = 36 + usize::from(self.selected);
@@ -222,7 +274,7 @@ impl Inventory {
         }
     }
     fn storage(slot: usize) -> bool {
-        MAIN.contains(&slot) || HOTBAR.contains(&slot) || slot == OFFHAND
+        ARMOR.contains(&slot) || MAIN.contains(&slot) || HOTBAR.contains(&slot) || slot == OFFHAND
     }
     fn index(slot: i16) -> Option<usize> {
         usize::try_from(slot)
@@ -406,10 +458,14 @@ impl Inventory {
 
 #[cfg(test)]
 mod tests {
+    use super::super::item_by_name;
     use super::*;
     #[test]
     fn authoritative_clicks_move_split_merge_and_reject() {
         let mut i = Inventory::default();
+        assert!(i.slots().iter().all(Option::is_none));
+        let stone = item_by_name("stone").unwrap().id;
+        i.set_slot(36, ItemStack::new(stone, 64));
         assert_eq!(
             i.click(InventoryClick {
                 slot: 36,

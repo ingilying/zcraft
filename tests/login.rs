@@ -158,7 +158,9 @@ async fn configuration_end(client: &mut Transport<TcpStream>) {
     assert_eq!(client.read_frame().await.unwrap().unwrap(), [3]); // Finish Configuration
     client.write_frame(&[3]).await.unwrap(); // Acknowledge Finish
 
-    let expected_ids = [0x2b, 0x3e, 0x38, 0x56, 0x64, 0x25, 0x54, 0x22, 0x11, 0x0d];
+    let expected_ids = [
+        0x2b, 0x0b, 0x3e, 0x38, 0x56, 0x64, 0x25, 0x54, 0x22, 0x11, 0x5d, 0x13, 0x53, 0x0d,
+    ];
     let mut entity = 0;
     for id in expected_ids {
         let frame = client.read_frame().await.unwrap().unwrap();
@@ -169,7 +171,7 @@ async fn configuration_end(client: &mut Transport<TcpStream>) {
         }
     }
     let mut chunks = std::collections::BTreeSet::new();
-    for index in 0..8 {
+    for index in 0..9 {
         let frame = client.read_frame().await.unwrap().unwrap();
         assert_eq!(frame[0], 0x27);
         let x = i32::from_be_bytes(frame[1..5].try_into().unwrap());
@@ -180,7 +182,7 @@ async fn configuration_end(client: &mut Transport<TcpStream>) {
         assert!(chunks.insert((x, z)));
         assert_eq!(&frame[1..], zcraft::world::chunk_data(x, z).unwrap());
     }
-    assert_eq!(client.read_frame().await.unwrap().unwrap(), [0x0c, 8]);
+    assert_eq!(client.read_frame().await.unwrap().unwrap(), [0x0c, 9]);
     let position = client.read_frame().await.unwrap().unwrap();
     assert_eq!(position[0], 0x40);
     let mut reader = Reader::new(&position[1..]);

@@ -9,7 +9,12 @@ use uuid::Uuid;
 pub const PLAYER_EYE_HEIGHT: f64 = 1.62;
 pub const PLAYER_HALF_WIDTH: f64 = 0.3;
 pub const PLAYER_HEIGHT: f64 = 1.8;
-pub const BLOCK_REACH: f64 = 5.0;
+/// Vanilla 1.21.1 `Attributes.BLOCK_INTERACTION_RANGE` (4.5 Survival, 5.0 Creative)
+/// plus `ServerPlayerGameMode`'s +1.0 server reach tolerance.
+pub const SURVIVAL_BLOCK_REACH: f64 = 5.5;
+pub const CREATIVE_BLOCK_REACH: f64 = 6.0;
+/// Vanilla `LivingEntity.invulnerableDuration / 2` = 10 ticks (500 ms at 20 TPS).
+pub const HURT_INVULNERABILITY: std::time::Duration = std::time::Duration::from_millis(500);
 
 #[derive(Debug, Clone)]
 pub struct Player {
@@ -28,6 +33,7 @@ pub struct Player {
     pub saturation: f32,
     pub fall_distance: f64,
     pub dead: bool,
+    pub last_hurt_at: Option<tokio::time::Instant>,
 }
 
 impl Player {
@@ -48,6 +54,7 @@ impl Player {
             saturation: 5.0,
             fall_distance: 0.0,
             dead: false,
+            last_hurt_at: None,
         }
     }
 
@@ -63,7 +70,31 @@ impl Player {
         matches!(self.game_mode, GameMode::Creative | GameMode::Survival)
     }
 
-    /// Apply damage in Survival mode. Returns `true` if health decreased.
+    pub fn block_reach(&self) -> f64 {
+        if self.is_creative() {
+            CREATIVE_BLOCK_REACH
+        } else {
+            SURVIVAL_BLOCK_REACH
+        }
+    }
+
+    /// Apply damage in Survival mode respecting the 10-tick (500ms) hurt invulnerability
+    /// window. Returns `true` if health decreased.
+    pub fn apply_damage_at(&mut self, amount: f32, now: tokio::time::Instant) -> bool {
+        if let Some(last) = self.last_hurt_at
+            && now.duration_since(last) < HURT_INVULNERABILITY
+        {
+            return false;
+        }
+        if self.apply_damage(amount) {
+            self.last_hurt_at = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply damage in Survival mode without checking invulnerability timer.
     pub fn apply_damage(&mut self, amount: f32) -> bool {
         if !self.is_survival() || self.dead || amount <= 0.0 || !amount.is_finite() {
             return false;
@@ -88,6 +119,7 @@ impl Player {
         self.saturation = 5.0;
         self.fall_distance = 0.0;
         self.dead = false;
+        self.last_hurt_at = None;
     }
 
     pub fn eye_position(&self) -> [f64; 3] {
@@ -99,6 +131,7 @@ impl Player {
     }
 
     pub fn in_reach(&self, pos: BlockPos) -> bool {
+        let reach = self.block_reach();
         self.eye_position()
             .into_iter()
             .zip(pos.0)
@@ -107,7 +140,7 @@ impl Player {
                 (p - p.clamp(b, b + 1.0)).powi(2)
             })
             .sum::<f64>()
-            <= BLOCK_REACH * BLOCK_REACH
+            <= reach * reach
     }
 
     pub fn intersects_block(&self, pos: BlockPos) -> bool {
@@ -124,7 +157,8 @@ impl Player {
     pub fn position_in_bounds([x, y, z]: [f64; 3]) -> bool {
         (-world::WORLD_LIMIT..=world::WORLD_LIMIT).contains(&x)
             && (-world::WORLD_LIMIT..=world::WORLD_LIMIT).contains(&z)
-            && (f64::from(world::MIN_Y)..=f64::from(world::MIN_Y + world::HEIGHT)).contains(&y)
+            && y.is_finite()
+            && y.abs() <= 20_000_000.0
     }
 
     pub fn reset_to_spawn(&mut self) {

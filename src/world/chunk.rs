@@ -28,7 +28,7 @@ impl BlockEntity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockPos(pub [i32; 3]);
 
 impl BlockPos {

@@ -10,15 +10,18 @@ use crate::{
     config::GameMode,
     identity::Profile,
     protocol::{Decode, Encode, Reader, invalid, put_string, put_varint},
-    world::{SPAWN_X, SPAWN_Y, SPAWN_Z, VIEW_DISTANCE, WORLD_LIMIT},
+    world::{BlockPos, SPAWN_X, SPAWN_Y, SPAWN_Z, WORLD_LIMIT},
 };
 
 /// Clientbound 0x2b. A single overworld with dynamic dimension type 0.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JoinGame {
     pub entity_id: i32,
+    pub max_players: i32,
     pub view_distance: i32,
+    pub simulation_distance: i32,
     pub game_mode: GameMode,
+    pub is_flat: bool,
 }
 
 impl Encode for JoinGame {
@@ -27,16 +30,66 @@ impl Encode for JoinGame {
         out.push(0); // Not hardcore.
         put_varint(1, out);
         put_string("minecraft:overworld", out)?;
-        put_varint(20, out); // Advertised maximum players.
+        put_varint(self.max_players.max(1), out);
         put_varint(self.view_distance, out);
-        put_varint(VIEW_DISTANCE, out); // No dynamic simulation yet.
+        put_varint(self.simulation_distance, out);
         out.extend_from_slice(&[0, 1, 0]); // Reduced debug, respawn screen, limited crafting.
         put_varint(0, out); // SpawnInfo: dynamic dimension type ID.
         put_string("minecraft:overworld", out)?;
         out.extend_from_slice(&0i64.to_be_bytes()); // Hashed seed.
-        out.extend_from_slice(&[self.game_mode.wire_id(), 0xff, 0, 1, 0]); // Mode, previous=-1, debug, flat, death absent.
+        out.extend_from_slice(&[
+            self.game_mode.wire_id(),
+            0xff, // previous game mode = -1
+            0,    // is_debug = false
+            u8::from(self.is_flat),
+            0, // has_death_location = false
+        ]);
         put_varint(0, out); // Portal cooldown.
         out.push(0); // Enforces secure chat.
+        Ok(())
+    }
+}
+
+/// Clientbound 0x0b: Change Difficulty (`0=Peaceful, 1=Easy, 2=Normal, 3=Hard`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeDifficulty {
+    pub difficulty: u8,
+    pub locked: bool,
+}
+
+impl ChangeDifficulty {
+    pub fn normal() -> Self {
+        Self {
+            difficulty: 2,
+            locked: false,
+        }
+    }
+}
+
+impl Encode for ChangeDifficulty {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        out.push(self.difficulty);
+        out.push(u8::from(self.locked));
+        Ok(())
+    }
+}
+
+/// Clientbound 0x06: Set Block Destroy Stage (`0..=9`, or `0xff` to clear).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockDestruction {
+    pub entity_id: i32,
+    pub pos: BlockPos,
+    pub stage: u8,
+}
+
+impl Encode for BlockDestruction {
+    fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        put_varint(self.entity_id, out);
+        let [x, y, z] = self.pos.0;
+        let packed =
+            ((x as u64 & 0x3ff_ffff) << 38) | ((z as u64 & 0x3ff_ffff) << 12) | (y as u64 & 0xfff);
+        out.extend_from_slice(&packed.to_be_bytes());
+        out.push(self.stage);
         Ok(())
     }
 }
@@ -148,13 +201,31 @@ impl Decode for ClientCommand {
     }
 }
 
-/// Clientbound 0x56. Packed block position x=8, y=64, z=8.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DefaultSpawnPosition;
+/// Clientbound 0x56. Packed world spawn block position and angle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultSpawnPosition(pub BlockPos);
+
+impl Default for DefaultSpawnPosition {
+    fn default() -> Self {
+        Self(BlockPos([8, 64, 8]))
+    }
+}
+
+impl DefaultSpawnPosition {
+    pub fn from_spawn(spawn: [f64; 3]) -> Self {
+        Self(BlockPos([
+            spawn[0].floor() as i32,
+            spawn[1].floor() as i32,
+            spawn[2].floor() as i32,
+        ]))
+    }
+}
 
 impl Encode for DefaultSpawnPosition {
     fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
-        let position = (8u64 << 38) | (8u64 << 12) | 64;
+        let [x, y, z] = self.0.0;
+        let position =
+            ((x as u64 & 0x3ff_ffff) << 38) | ((z as u64 & 0x3ff_ffff) << 12) | (y as u64 & 0xfff);
         out.extend_from_slice(&position.to_be_bytes());
         out.extend_from_slice(&0f32.to_be_bytes());
         Ok(())

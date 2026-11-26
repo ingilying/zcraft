@@ -198,6 +198,30 @@ struct SessionCommandHost<'a> {
 }
 
 impl super::Players {
+    /// Broadcast a plain system chat message (e.g. death announcement) to all ready Play players.
+    pub fn broadcast_system_chat(&self, message: &str) -> io::Result<()> {
+        let body: Arc<[u8]> = Clientbound::from(SystemChat(message.to_string()))
+            .encode()?
+            .into();
+        let mut registry = lock(&self.registry);
+        let mut lagged = Vec::new();
+        for (&uuid, slot) in &mut registry.players {
+            if slot.chat_ready()
+                && slot.chat_mode != 2
+                && !slot.enqueue(Delivery::Chat {
+                    body: body.clone(),
+                    private: false,
+                })
+            {
+                lagged.push(uuid);
+            }
+        }
+        for uuid in lagged {
+            registry.deactivate(uuid);
+        }
+        Ok(())
+    }
+
     pub fn command_host(&self, source: &crate::command::SourceStack) -> impl CommandHost + '_ {
         let binding = source.authenticated_player().map(|uuid| {
             let epoch = lock(&self.registry)

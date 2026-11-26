@@ -116,6 +116,11 @@ impl AnvilStorage {
                 .get("DayTime")
                 .and_then(Tag::as_long)
                 .unwrap_or(super::INITIAL_DAY_TIME),
+            clear_weather_time: data
+                .get("clearWeatherTime")
+                .and_then(Tag::as_int)
+                .unwrap_or(0)
+                .max(0) as u32,
             raining: data.get("raining").and_then(Tag::as_byte).unwrap_or(0) != 0,
             rain_time: data
                 .get("rainTime")
@@ -167,12 +172,42 @@ impl AnvilStorage {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64);
 
+        let mut version_tag = Compound::new();
+        version_tag.insert("Id".into(), Tag::Int(DATA_VERSION_1_21_1));
+        version_tag.insert("Name".into(), Tag::String("1.21.1".into()));
+        version_tag.insert("Series".into(), Tag::String("main".into()));
+        version_tag.insert("Snapshot".into(), Tag::Byte(0));
+
+        let mut game_rules = Compound::new();
+        game_rules.insert("spawnChunkRadius".into(), Tag::String("2".into()));
+        game_rules.insert(
+            "commandModificationBlockLimit".into(),
+            Tag::String("32768".into()),
+        );
+        game_rules.insert("keepInventory".into(), Tag::String("false".into()));
+
         let mut data = Compound::new();
         data.insert("DataVersion".into(), Tag::Int(DATA_VERSION_1_21_1));
+        data.insert("Version".into(), Tag::Compound(version_tag));
         data.insert("version".into(), Tag::Int(ANVIL_VERSION));
         data.insert("LevelName".into(), Tag::String(level_name));
+        data.insert("GameType".into(), Tag::Int(0));
+        data.insert("Difficulty".into(), Tag::Byte(2)); // Normal
+        data.insert("DifficultyLocked".into(), Tag::Byte(0));
+        data.insert("hardcore".into(), Tag::Byte(0));
+        data.insert("allowCommands".into(), Tag::Byte(1));
+        data.insert("WasModded".into(), Tag::Byte(0));
+        data.insert(
+            "ServerBrands".into(),
+            Tag::List(vec![Tag::String("vanilla".into())]),
+        );
+        data.insert("GameRules".into(), Tag::Compound(game_rules));
         data.insert("Time".into(), Tag::Long(clock.world_age));
         data.insert("DayTime".into(), Tag::Long(clock.day_time));
+        data.insert(
+            "clearWeatherTime".into(),
+            Tag::Int(clock.clear_weather_time as i32),
+        );
         data.insert("raining".into(), Tag::Byte(i8::from(clock.raining)));
         data.insert("rainTime".into(), Tag::Int(clock.rain_time as i32));
         data.insert("thundering".into(), Tag::Byte(i8::from(clock.thundering)));
@@ -180,6 +215,7 @@ impl AnvilStorage {
         data.insert("SpawnX".into(), Tag::Int(spawn[0].floor() as i32));
         data.insert("SpawnY".into(), Tag::Int(spawn[1].floor() as i32));
         data.insert("SpawnZ".into(), Tag::Int(spawn[2].floor() as i32));
+        data.insert("SpawnAngle".into(), Tag::Float(0.0));
         data.insert("LastPlayed".into(), Tag::Long(now_ms));
         data.insert("initialized".into(), Tag::Byte(1));
 
@@ -468,6 +504,10 @@ fn vanilla_to_internal_slot(slot: i8) -> Option<usize> {
     match slot {
         0..=8 => Some(36 + slot as usize),
         9..=35 => Some(slot as usize),
+        100 => Some(8), // Boots
+        101 => Some(7), // Leggings
+        102 => Some(6), // Chestplate
+        103 => Some(5), // Helmet
         -106 => Some(45),
         _ => None,
     }
@@ -477,6 +517,10 @@ fn internal_to_vanilla_slot(slot: usize) -> Option<i8> {
     match slot {
         36..=44 => Some((slot - 36) as i8),
         9..=35 => Some(slot as i8),
+        8 => Some(100), // Boots
+        7 => Some(101), // Leggings
+        6 => Some(102), // Chestplate
+        5 => Some(103), // Helmet
         45 => Some(-106),
         _ => None,
     }
@@ -759,12 +803,29 @@ fn encode_chunk_anvil(cx: i32, cz: i32, chunk: &Chunk) -> io::Result<Vec<u8>> {
         be_list.push(Tag::Compound(be_map));
     }
 
+    let top_heights: Vec<u64> = chunk
+        .heightmap(|s| s != crate::game::AIR_STATE)
+        .into_iter()
+        .map(u64::from)
+        .collect();
+    let packed_heights = pack_long_array(&top_heights, 9);
+    let mut heightmaps = Compound::new();
+    heightmaps.insert(
+        "MOTION_BLOCKING".into(),
+        Tag::LongArray(packed_heights.clone()),
+    );
+    heightmaps.insert("WORLD_SURFACE".into(), Tag::LongArray(packed_heights));
+
     let mut root = Compound::new();
     root.insert("DataVersion".into(), Tag::Int(DATA_VERSION_1_21_1));
     root.insert("xPos".into(), Tag::Int(cx));
     root.insert("zPos".into(), Tag::Int(cz));
     root.insert("yPos".into(), Tag::Int(LOWEST_SECTION_Y));
+    root.insert("LastUpdate".into(), Tag::Long(0));
+    root.insert("InhabitedTime".into(), Tag::Long(0));
     root.insert("Status".into(), Tag::String("minecraft:full".into()));
+    root.insert("isLightOn".into(), Tag::Byte(1));
+    root.insert("Heightmaps".into(), Tag::Compound(heightmaps));
     root.insert("sections".into(), Tag::List(sections));
     if !be_list.is_empty() {
         root.insert("block_entities".into(), Tag::List(be_list));
@@ -1002,6 +1063,7 @@ mod tests {
         let clock = PersistedClock {
             world_age: 12_345,
             day_time: 18_000,
+            clear_weather_time: 0,
             raining: true,
             rain_time: 5_000,
             thundering: false,

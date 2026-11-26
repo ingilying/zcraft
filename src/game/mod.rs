@@ -3,6 +3,7 @@
 mod data;
 mod inventory;
 mod items;
+mod loot;
 mod placement;
 mod player;
 
@@ -12,7 +13,11 @@ pub use data::{
 };
 pub use inventory::{ClickResult, Inventory, InventoryClick, SLOT_COUNT};
 pub use items::{Hand, ItemStack};
-pub use placement::{PlacementContext, PlacementResult, resolve_placement};
+pub use loot::{block_drops, block_drops_with_rng};
+pub use placement::{
+    PlacementContext, PlacementResult, is_solid_support, paired_block_pos, required_support_offset,
+    resolve_placement, resolve_stairs_shape,
+};
 pub use player::{PLAYER_EYE_HEIGHT, Player};
 
 pub const AIR_STATE: i32 = 0;

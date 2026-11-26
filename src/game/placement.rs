@@ -1,6 +1,10 @@
-//! Vanilla-aligned block placement state resolution (stairs, slabs, logs,
-//! torches, directional blocks, trapdoors, signs, etc.).
-use crate::game::{BlockDefinition, registry};
+//! Vanilla-aligned block placement state resolution (stairs + corner shapes,
+//! slabs, logs, torches, directional blocks, trapdoors, signs, beds, doors,
+//! double plants, waterlogging, and support attachment rules).
+use crate::{
+    game::{BlockDefinition, registry},
+    world::BlockPos,
+};
 use std::collections::BTreeMap;
 
 /// Context of a player's block placement click.
@@ -14,15 +18,22 @@ pub struct PlacementContext {
     pub hit: [f32; 3],
     /// Current block state at the support position (for slab merging).
     pub support_state: i32,
-    /// Current block state at the target placement position (for slab merging).
+    /// Current block state at the target placement position (for slab merging / waterlogging).
     pub target_state: i32,
 }
 
-/// Result of resolving a block placement: either place into `target` or merge into `support` (double slab).
+/// Result of resolving a block placement: place into `target`, merge into `support`
+/// (double slab), or place a two-block structure (`PlacePair`: primary at target,
+/// secondary at offset `[dx, dy, dz]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlacementResult {
     PlaceTarget(i32),
     MergeSupport(i32),
+    PlacePair {
+        primary: i32,
+        secondary_offset: [i32; 3],
+        secondary: i32,
+    },
 }
 
 /// Cardinal direction the player is looking horizontally (`north`/`south`/`east`/`west`).
@@ -123,8 +134,72 @@ pub fn resolve_placement(block_index: usize, ctx: PlacementContext) -> Option<Pl
         }
     }
 
+    // 3b. Two-block structures: beds, doors, and double plants.
+    let path = block.name.strip_prefix("minecraft:").unwrap_or(&block.name);
+    if path.ends_with("_bed") {
+        let facing = horizontal_facing(ctx.yaw);
+        let offset = direction_offset(facing);
+        let mut foot_props = BTreeMap::new();
+        foot_props.insert("facing".into(), facing.into());
+        foot_props.insert("part".into(), "foot".into());
+        let mut head_props = BTreeMap::new();
+        head_props.insert("facing".into(), facing.into());
+        head_props.insert("part".into(), "head".into());
+        if let (Some(primary), Some(secondary)) = (
+            reg.resolve_state(&block.name, &foot_props),
+            reg.resolve_state(&block.name, &head_props),
+        ) {
+            return Some(PlacementResult::PlacePair {
+                primary,
+                secondary_offset: offset,
+                secondary,
+            });
+        }
+    }
+    if path.ends_with("_door") {
+        let facing = horizontal_facing(ctx.yaw);
+        let mut lower_props = BTreeMap::new();
+        lower_props.insert("facing".into(), facing.into());
+        lower_props.insert("half".into(), "lower".into());
+        lower_props.insert("open".into(), "false".into());
+        let mut upper_props = BTreeMap::new();
+        upper_props.insert("facing".into(), facing.into());
+        upper_props.insert("half".into(), "upper".into());
+        upper_props.insert("open".into(), "false".into());
+        if let (Some(primary), Some(secondary)) = (
+            reg.resolve_state(&block.name, &lower_props),
+            reg.resolve_state(&block.name, &upper_props),
+        ) {
+            return Some(PlacementResult::PlacePair {
+                primary,
+                secondary_offset: [0, 1, 0],
+                secondary,
+            });
+        }
+    }
+    if is_double_plant(path) {
+        let mut lower_props = BTreeMap::new();
+        lower_props.insert("half".into(), "lower".into());
+        let mut upper_props = BTreeMap::new();
+        upper_props.insert("half".into(), "upper".into());
+        if let (Some(primary), Some(secondary)) = (
+            reg.resolve_state(&block.name, &lower_props),
+            reg.resolve_state(&block.name, &upper_props),
+        ) {
+            return Some(PlacementResult::PlacePair {
+                primary,
+                secondary_offset: [0, 1, 0],
+                secondary,
+            });
+        }
+    }
+
     // 4. General property resolution based on the block's declared properties.
     let mut props = BTreeMap::new();
+
+    if block.properties.contains_key("waterlogged") && is_water_source(ctx.target_state) {
+        props.insert("waterlogged".into(), "true".into());
+    }
 
     if block.properties.contains_key("axis") {
         let axis = face_to_axis(ctx.face);
@@ -243,6 +318,191 @@ fn resolve_facing(block: &BlockDefinition, ctx: PlacementContext) -> &'static st
 
     // Chests, furnaces, trapdoors, carved pumpkins, repeaters, etc. face toward the player.
     opposite_facing(look)
+}
+
+fn direction_offset(dir: &str) -> [i32; 3] {
+    match dir {
+        "north" => [0, 0, -1],
+        "south" => [0, 0, 1],
+        "west" => [-1, 0, 0],
+        "east" => [1, 0, 0],
+        "up" => [0, 1, 0],
+        "down" => [0, -1, 0],
+        _ => [0, 0, 0],
+    }
+}
+
+fn is_double_plant(path: &str) -> bool {
+    matches!(
+        path,
+        "tall_grass"
+            | "large_fern"
+            | "sunflower"
+            | "lilac"
+            | "rose_bush"
+            | "peony"
+            | "pitcher_plant"
+    )
+}
+
+fn is_water_source(state: i32) -> bool {
+    registry().state_by_id(state).is_some_and(|(_, def, sdef)| {
+        def.name == "minecraft:water"
+            && sdef.properties.get("level").map(String::as_str) == Some("0")
+    })
+}
+
+/// Returns `true` if `state` is a solid non-replaceable support block.
+pub fn is_solid_support(state: i32) -> bool {
+    crate::game::block_by_state(state).is_some_and(|d| d.collision && !d.replaceable)
+}
+
+/// If a block with `state` requires an adjacent solid support block, returns
+/// the offset `[dx, dy, dz]` to that support block.
+pub fn required_support_offset(state: i32) -> Option<[i32; 3]> {
+    let (_, def, sdef) = registry().state_by_id(state)?;
+    let path = def.name.strip_prefix("minecraft:").unwrap_or(&def.name);
+    if path.ends_with("_wall_torch")
+        || path.ends_with("_wall_sign")
+        || path.ends_with("_wall_banner")
+        || matches!(path, "ladder" | "tripwire_hook")
+    {
+        let facing = sdef.properties.get("facing").map(String::as_str)?;
+        return Some(direction_offset(opposite_facing(facing)));
+    }
+    if path.ends_with("_button") || path == "lever" {
+        return match sdef.properties.get("face").map(String::as_str) {
+            Some("floor") => Some([0, -1, 0]),
+            Some("ceiling") => Some([0, 1, 0]),
+            Some("wall") => {
+                let facing = sdef.properties.get("facing").map(String::as_str)?;
+                Some(direction_offset(opposite_facing(facing)))
+            }
+            _ => Some([0, -1, 0]),
+        };
+    }
+    if matches!(
+        path,
+        "torch"
+            | "soul_torch"
+            | "redstone_torch"
+            | "redstone_wire"
+            | "repeater"
+            | "comparator"
+            | "rail"
+            | "powered_rail"
+            | "detector_rail"
+            | "activator_rail"
+            | "flower_pot"
+            | "snow"
+            | "short_grass"
+            | "fern"
+    ) || path.ends_with("_carpet")
+        || path.ends_with("_pressure_plate")
+        || path.ends_with("_sapling")
+        || (path.ends_with("_sign") && !path.contains("hanging") && !path.contains("wall"))
+    {
+        return Some([0, -1, 0]);
+    }
+    None
+}
+
+/// If `state` is half of a two-block structure (bed, door, double plant),
+/// returns the world position of its paired half.
+pub fn paired_block_pos(pos: BlockPos, state: i32) -> Option<BlockPos> {
+    let (_, def, sdef) = registry().state_by_id(state)?;
+    let path = def.name.strip_prefix("minecraft:").unwrap_or(&def.name);
+    if path.ends_with("_bed") {
+        let facing = sdef.properties.get("facing").map(String::as_str)?;
+        let part = sdef.properties.get("part").map(String::as_str)?;
+        let dir = if part == "foot" {
+            facing
+        } else {
+            opposite_facing(facing)
+        };
+        let [dx, dy, dz] = direction_offset(dir);
+        return Some(BlockPos([pos.0[0] + dx, pos.0[1] + dy, pos.0[2] + dz]));
+    }
+    if path.ends_with("_door") || is_double_plant(path) {
+        let half = sdef.properties.get("half").map(String::as_str)?;
+        let dy = if half == "lower" { 1 } else { -1 };
+        return Some(BlockPos([pos.0[0], pos.0[1] + dy, pos.0[2]]));
+    }
+    None
+}
+
+fn rotate_ccw(dir: &str) -> &'static str {
+    match dir {
+        "north" => "west",
+        "west" => "south",
+        "south" => "east",
+        "east" => "north",
+        _ => "north",
+    }
+}
+
+/// Compute vanilla stair corner `shape` (`straight`, `inner_left`, `inner_right`,
+/// `outer_left`, `outer_right`) given neighboring block states.
+pub fn resolve_stairs_shape(pos: BlockPos, state: i32, block_at: impl Fn(BlockPos) -> i32) -> i32 {
+    let reg = registry();
+    let Some((_, def, sdef)) = reg.state_by_id(state) else {
+        return state;
+    };
+    if !def.name.ends_with("_stairs") {
+        return state;
+    }
+    let Some(facing) = sdef.properties.get("facing").map(String::as_str) else {
+        return state;
+    };
+    let Some(half) = sdef.properties.get("half").map(String::as_str) else {
+        return state;
+    };
+    let stair_at = |dir: &str| -> Option<(&str, &str)> {
+        let [dx, dy, dz] = direction_offset(dir);
+        let nstate = block_at(BlockPos([pos.0[0] + dx, pos.0[1] + dy, pos.0[2] + dz]));
+        let (_, ndef, nsdef) = reg.state_by_id(nstate)?;
+        if !ndef.name.ends_with("_stairs") {
+            return None;
+        }
+        Some((
+            nsdef.properties.get("facing").map(String::as_str)?,
+            nsdef.properties.get("half").map(String::as_str)?,
+        ))
+    };
+
+    let mut shape = "straight";
+    if let Some((nf, nh)) = stair_at(facing)
+        && nh == half
+        && nf != facing
+        && nf != opposite_facing(facing)
+    {
+        shape = if nf == rotate_ccw(facing) {
+            "outer_left"
+        } else {
+            "outer_right"
+        };
+    } else if let Some((nf, nh)) = stair_at(opposite_facing(facing))
+        && nh == half
+        && nf != facing
+        && nf != opposite_facing(facing)
+    {
+        shape = if nf == rotate_ccw(facing) {
+            "inner_left"
+        } else {
+            "inner_right"
+        };
+    }
+
+    if sdef.properties.get("shape").map(String::as_str) == Some(shape) {
+        return state;
+    }
+    let mut props: BTreeMap<String, String> = sdef
+        .properties
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    props.insert("shape".into(), shape.into());
+    reg.resolve_state(&def.name, &props).unwrap_or(state)
 }
 
 #[cfg(test)]

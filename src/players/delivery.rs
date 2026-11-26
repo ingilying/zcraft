@@ -25,6 +25,8 @@ pub(crate) enum PlayerControl {
         item: i32,
         count: u32,
     },
+    TryPickup(i32),
+    RefreshContainer(crate::world::BlockPos),
     SetGameMode(crate::config::GameMode),
     RefreshCommands,
     Kick(String),

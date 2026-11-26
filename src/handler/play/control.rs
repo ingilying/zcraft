@@ -19,6 +19,7 @@ use tokio::time::Instant;
 pub(crate) fn apply_control(
     session: &mut Session,
     service: &PlayService,
+    players: &crate::players::Players,
     control: PlayerControl,
 ) -> io::Result<Outcome> {
     let slot = session.reservation.as_ref();
@@ -67,6 +68,61 @@ pub(crate) fn apply_control(
             session.inventory.give(item, count);
             Ok(Outcome {
                 replies: vec![InventoryContent::player(&session.inventory).into()],
+                close: false,
+                encryption: None,
+            })
+        }
+        PlayerControl::TryPickup(drop_id) => {
+            if state.player.dead || !state.player.can_interact() {
+                return Ok(Outcome::empty());
+            }
+            let player_id = state.player.entity_id;
+            if service.try_pickup_drop(players, drop_id, player_id, &mut session.inventory) {
+                Ok(Outcome {
+                    replies: vec![InventoryContent::player(&session.inventory).into()],
+                    close: false,
+                    encryption: None,
+                })
+            } else {
+                Ok(Outcome::empty())
+            }
+        }
+        PlayerControl::RefreshContainer(pos) => {
+            let Some(open) = state.open_container else {
+                return Ok(Outcome::empty());
+            };
+            if open.pos != pos {
+                return Ok(Outcome::empty());
+            }
+            let Some(chest_items) = service.world().chest_items(pos) else {
+                state.open_container = None;
+                return Ok(Outcome {
+                    replies: vec![
+                        crate::protocol::packets::play_blocks::CloseContainer(open.window_id)
+                            .into(),
+                    ],
+                    close: false,
+                    encryption: None,
+                });
+            };
+            let next_state_id = open.state_id.wrapping_add(1);
+            state.open_container = Some(super::blocks::OpenContainer {
+                state_id: next_state_id,
+                ..open
+            });
+            let mut slots = Vec::with_capacity(crate::world::CHEST_SLOTS + 36);
+            slots.extend_from_slice(&chest_items);
+            slots.extend_from_slice(&session.inventory.slots()[9..45]);
+            Ok(Outcome {
+                replies: vec![
+                    InventoryContent::container(
+                        open.window_id,
+                        next_state_id,
+                        slots,
+                        session.inventory.carried(),
+                    )
+                    .into(),
+                ],
                 close: false,
                 encryption: None,
             })

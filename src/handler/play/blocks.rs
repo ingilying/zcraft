@@ -118,7 +118,16 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
     // Handle Survival mining start/cancel without triggering block correction.
     if is_survival && let Action::Dig { pos, face, kind } = action {
         if kind == 1 {
-            state.blocks.mining = None;
+            if let Some((mpos, _)) = state.blocks.mining.take() {
+                let _ = ctx.server.players().broadcast_entity_packet(
+                    &crate::protocol::packets::play::BlockDestruction {
+                        entity_id: state.player.entity_id,
+                        pos: mpos,
+                        stage: 0xff,
+                    }
+                    .into(),
+                );
+            }
             slot.correct_blocks(Vec::new(), ack);
             return Ok(Outcome::empty());
         }
@@ -133,6 +142,14 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
                 && def.hardness > 0.0
             {
                 state.blocks.mining = Some((pos, tokio::time::Instant::now()));
+                let _ = ctx.server.players().broadcast_entity_packet(
+                    &crate::protocol::packets::play::BlockDestruction {
+                        entity_id: state.player.entity_id,
+                        pos,
+                        stage: 0,
+                    }
+                    .into(),
+                );
                 slot.correct_blocks(Vec::new(), ack);
                 return Ok(Outcome::empty());
             }
@@ -141,9 +158,13 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
 
     let valid = |pos: BlockPos| pos.valid() && state.chunks.tracks(pos.chunk());
     let reachable = |pos: BlockPos| valid(pos) && state.player.in_reach(pos);
-    let mut survival_dig_drop: Option<(BlockPos, crate::game::ItemStack)> = None;
-    let mut survival_damage_tool = false;
+    let mut survival_dig_drops: Vec<(BlockPos, crate::game::ItemStack)> = Vec::new();
+    let mut survival_tool_damage: u32 = 0;
     let mut survival_consume_hand: Option<Hand> = None;
+    let mut extra_edits: Vec<(BlockPos, i32)> = Vec::new();
+    let mut broken_chest_pos: Option<BlockPos> = None;
+    let mut broken_chest_items: Vec<crate::game::ItemStack> = Vec::new();
+    let mut clear_break_anim: Option<(i32, BlockPos)> = None;
 
     let (positions, edit) = match action {
         Action::Dig { pos, face, kind } => {
@@ -156,27 +177,45 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
                 }
             } else if face < 6 && reachable(pos) && current != crate::game::AIR_STATE {
                 crate::game::registry().state_by_id(current).and_then(
-                    |(block_idx, block_def, state_def)| {
+                    |(block_idx, _block_def, state_def)| {
                         if state_def.hardness < 0.0 {
                             return None;
                         }
-                        let tool_item = session.inventory.hand(Hand::Main).map(|s| s.item);
+                        let tool_stack = session.inventory.hand(Hand::Main);
+                        let tool_item = tool_stack.map(|s| s.item);
                         let can_harvest = !state_def.correct_tool
                             || crate::game::registry().correct_for_drops(tool_item, block_idx);
                         let allowed = if state_def.hardness == 0.0 {
                             kind == 0 || kind == 2
                         } else if kind == 2 {
-                            let speed = if can_harvest {
+                            let mut speed = if can_harvest {
                                 crate::game::registry()
                                     .tool_speed(tool_item, block_idx)
                                     .max(1.0)
                             } else {
                                 1.0
                             };
+                            // Vanilla `Player.getDestroySpeed`: /5 when airborne or eyes underwater.
+                            if !state.player.on_ground {
+                                speed /= 5.0;
+                            }
+                            let eye = state.player.eye_position();
+                            let eye_pos = BlockPos([
+                                eye[0].floor() as i32,
+                                eye[1].floor() as i32,
+                                eye[2].floor() as i32,
+                            ]);
+                            if crate::game::registry()
+                                .state_by_id(world.block_at(eye_pos))
+                                .is_some_and(|(_, def, _)| def.name == "minecraft:water")
+                            {
+                                speed /= 5.0;
+                            }
                             let expected = f64::from(state_def.hardness)
                                 * if can_harvest { 1.5 } else { 5.0 }
                                 / f64::from(speed);
                             state.blocks.mining.take().is_some_and(|(mpos, started)| {
+                                clear_break_anim = Some((state.player.entity_id, mpos));
                                 mpos == pos && started.elapsed().as_secs_f64() >= expected * 0.7
                             })
                         } else {
@@ -186,14 +225,15 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
                             return None;
                         }
                         if state_def.hardness > 0.0 {
-                            survival_damage_tool = true;
+                            // Vanilla: swords take 2 durability damage when breaking blocks.
+                            let is_sword =
+                                tool_stack.is_some_and(|s| s.definition().name.ends_with("_sword"));
+                            survival_tool_damage = if is_sword { 2 } else { 1 };
                         }
-                        if can_harvest
-                            && let Some(item_name) = block_def.item.as_deref()
-                            && let Some(item_def) = crate::game::item_by_name(item_name)
-                            && let Some(stack) = crate::game::ItemStack::new(item_def.id, 1)
-                        {
-                            survival_dig_drop = Some((pos, stack));
+                        if can_harvest {
+                            for stack in crate::game::block_drops(current) {
+                                survival_dig_drops.push((pos, stack));
+                            }
                         }
                         Some((pos, crate::game::AIR_STATE))
                     },
@@ -201,6 +241,45 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
             } else {
                 None
             };
+            if edit.is_some() {
+                // Breaking a chest drops its stored contents.
+                if let Some(items) = world.chest_items(pos) {
+                    broken_chest_pos = Some(pos);
+                    broken_chest_items.extend(items.into_iter().flatten());
+                }
+                // Breaking either half of a bed, door, or double plant breaks its paired half.
+                if let Some(other) = crate::game::paired_block_pos(pos, current)
+                    && other.valid()
+                    && world.block_at(other) != crate::game::AIR_STATE
+                {
+                    extra_edits.push((other, crate::game::AIR_STATE));
+                }
+                // Pop off any adjacent blocks that depended on `pos` for solid support.
+                for [dx, dy, dz] in [
+                    [0, 1, 0],
+                    [0, -1, 0],
+                    [1, 0, 0],
+                    [-1, 0, 0],
+                    [0, 0, 1],
+                    [0, 0, -1],
+                ] {
+                    let npos = BlockPos([pos.0[0] + dx, pos.0[1] + dy, pos.0[2] + dz]);
+                    if !npos.valid() {
+                        continue;
+                    }
+                    let nstate = world.block_at(npos);
+                    if let Some([sx, sy, sz]) = crate::game::required_support_offset(nstate)
+                        && BlockPos([npos.0[0] + sx, npos.0[1] + sy, npos.0[2] + sz]) == pos
+                    {
+                        extra_edits.push((npos, crate::game::AIR_STATE));
+                        if is_survival {
+                            for stack in crate::game::block_drops(nstate) {
+                                survival_dig_drops.push((npos, stack));
+                            }
+                        }
+                    }
+                }
+            }
             ([Some(pos), None], edit)
         }
         Action::Place {
@@ -241,8 +320,20 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
                         (!placed.collision || !state.player.intersects_block(support))
                             .then_some((support, material))
                     }
-                    crate::game::PlacementResult::PlaceTarget(material) => {
+                    crate::game::PlacementResult::PlaceTarget(mut material) => {
                         let placed = crate::game::block_by_state(material)?;
+                        // Validate required solid support for attached blocks (torches, buttons, rails, etc.).
+                        if let Some([sx, sy, sz]) = crate::game::required_support_offset(material) {
+                            let sup_pos = BlockPos([pos.0[0] + sx, pos.0[1] + sy, pos.0[2] + sz]);
+                            if !sup_pos.valid()
+                                || !crate::game::is_solid_support(world.block_at(sup_pos))
+                            {
+                                return None;
+                            }
+                        }
+                        // Compute vanilla stair corner shape from neighbors.
+                        material =
+                            crate::game::resolve_stairs_shape(pos, material, |p| world.block_at(p));
                         let target_ok = target_block.replaceable
                             || crate::game::registry()
                                 .state_by_id(target_state)
@@ -251,6 +342,28 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
                             && target_ok
                             && (!placed.collision || !state.player.intersects_block(pos)))
                         .then_some((pos, material))
+                    }
+                    crate::game::PlacementResult::PlacePair {
+                        primary,
+                        secondary_offset: [dx, dy, dz],
+                        secondary,
+                    } => {
+                        let pos2 = BlockPos([pos.0[0] + dx, pos.0[1] + dy, pos.0[2] + dz]);
+                        let p1 = crate::game::block_by_state(primary)?;
+                        let p2 = crate::game::block_by_state(secondary)?;
+                        let t2 = crate::game::block_by_state(world.block_at(pos2))?;
+                        let ok = reachable(pos)
+                            && valid(pos2)
+                            && target_block.replaceable
+                            && t2.replaceable
+                            && (!p1.collision || !state.player.intersects_block(pos))
+                            && (!p2.collision || !state.player.intersects_block(pos2));
+                        if ok {
+                            extra_edits.push((pos2, secondary));
+                            Some((pos, primary))
+                        } else {
+                            None
+                        }
                     }
                 };
                 if resolved.is_some() && is_survival {
@@ -261,6 +374,16 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
             ([Some(support), place], edit)
         }
     };
+    if let Some((eid, mpos)) = clear_break_anim {
+        let _ = ctx.server.players().broadcast_entity_packet(
+            &crate::protocol::packets::play::BlockDestruction {
+                entity_id: eid,
+                pos: mpos,
+                stage: 0xff,
+            }
+            .into(),
+        );
+    }
     if state.pending_teleport.is_none()
         && let Some((pos, material)) = edit
         && let Some(mutation) = world.set_block(pos, material)
@@ -278,28 +401,72 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
         let data = encode_chunk_updates(chunk, mutation.block_changes, center_light)?;
         slot.publish_blocks(chunk, data, ack);
 
+        // Apply any secondary edits (paired bed/door/double-plant halves, popped attached blocks).
+        for (epos, estate) in extra_edits {
+            let _ = ctx
+                .server
+                .play
+                .set_block(ctx.server.players(), epos, estate);
+        }
+        // Recompute corner shapes of adjacent horizontal stairs if a stair was placed or broken.
+        for [dx, dz] in [[1, 0], [-1, 0], [0, 1], [0, -1]] {
+            let npos = BlockPos([pos.0[0] + dx, pos.0[1], pos.0[2] + dz]);
+            if npos.valid() {
+                let nstate = world.block_at(npos);
+                let updated =
+                    crate::game::resolve_stairs_shape(npos, nstate, |p| world.block_at(p));
+                if updated != nstate {
+                    let _ = ctx
+                        .server
+                        .play
+                        .set_block(ctx.server.players(), npos, updated);
+                }
+            }
+        }
+
+        // Drop chest contents and close any open viewers if a chest was broken.
+        if let Some(cpos) = broken_chest_pos {
+            let drop_xyz = [
+                f64::from(cpos.0[0]) + 0.5,
+                f64::from(cpos.0[1]) + 0.5,
+                f64::from(cpos.0[2]) + 0.5,
+            ];
+            for stack in broken_chest_items {
+                let _ = ctx.server.play.spawn_item_drop_scatter(
+                    ctx.server.players(),
+                    drop_xyz,
+                    stack,
+                    10,
+                );
+            }
+            for viewer in ctx.server.play.other_chest_viewers(cpos, uuid::Uuid::nil()) {
+                ctx.server.players().send_control(
+                    viewer,
+                    crate::players::PlayerControl::RefreshContainer(cpos),
+                );
+            }
+        }
+
         let mut inv_changed = false;
-        if survival_damage_tool {
-            inv_changed |=
-                session.inventory.damage_hand(Hand::Main) == crate::game::ClickResult::Changed;
+        if survival_tool_damage > 0 {
+            inv_changed |= session
+                .inventory
+                .damage_hand(Hand::Main, survival_tool_damage)
+                == crate::game::ClickResult::Changed;
         }
         if let Some(hand) = survival_consume_hand {
             inv_changed |=
                 session.inventory.drop_hand(hand, false) == crate::game::ClickResult::Changed;
         }
-        if let Some((drop_pos, stack)) = survival_dig_drop {
+        for (drop_pos, stack) in survival_dig_drops {
             let drop_xyz = [
                 f64::from(drop_pos.0[0]) + 0.5,
                 f64::from(drop_pos.0[1]) + 0.5,
                 f64::from(drop_pos.0[2]) + 0.5,
             ];
-            ctx.server.play.spawn_item_drop(
-                ctx.server.players(),
-                drop_xyz,
-                [0.0, 0.2, 0.0],
-                stack,
-                10,
-            )?;
+            ctx.server
+                .play
+                .spawn_item_drop_scatter(ctx.server.players(), drop_xyz, stack, 10)?;
         }
         if inv_changed {
             sync_equipment(ctx)?;
@@ -380,16 +547,25 @@ pub async fn handle_dig(ctx: &mut Context<'_>, p: PlayerDigging) -> io::Result<O
     }
 }
 
+fn is_chest_blocked(world: &World, pos: BlockPos) -> bool {
+    let above = BlockPos([pos.0[0], pos.0[1] + 1, pos.0[2]]);
+    above.valid()
+        && crate::game::block_by_state(world.block_at(above))
+            .is_some_and(|d| d.collision && d.light_block == 15)
+}
+
 pub async fn handle_place(ctx: &mut Context<'_>, p: BlockPlace) -> io::Result<Outcome> {
-    // Right-clicking a chest while not sneaking opens its 27-slot container.
+    // Right-clicking an unobstructed chest while not sneaking opens its 27-slot container.
     if let Ok(state) = play(ctx.session)
         && state.player.can_interact()
         && !state.player.dead
         && !state.player.sneaking
         && state.pending_teleport.is_none()
         && state.player.in_reach(p.pos)
+        && !is_chest_blocked(ctx.server.play.world(), p.pos)
         && let Some(chest_items) = ctx.server.play.world().chest_items(p.pos)
     {
+        let uuid = state.player.uuid;
         let window_id = state.next_window_id;
         state.next_window_id = if window_id >= 100 { 1 } else { window_id + 1 };
         let open = OpenContainer {
@@ -398,7 +574,8 @@ pub async fn handle_place(ctx: &mut Context<'_>, p: BlockPlace) -> io::Result<Ou
             state_id: 0,
         };
         state.open_container = Some(open);
-        broadcast_chest_lid(ctx, p.pos, true)?;
+        let viewer_count = ctx.server.play.open_chest_viewer(p.pos, uuid);
+        broadcast_chest_lid_count(ctx.server.players(), p.pos, viewer_count)?;
         let slots = container_slots(&chest_items, &ctx.session.inventory);
         return Ok(reply(vec![
             OpenScreen {
@@ -425,17 +602,45 @@ pub async fn handle_place(ctx: &mut Context<'_>, p: BlockPlace) -> io::Result<Ou
 }
 
 pub async fn handle_close_window(ctx: &mut Context<'_>, p: CloseWindow) -> io::Result<Outcome> {
-    let state = play(ctx.session)?;
-    if let Some(open) = state.open_container
-        && (p.window_id == 0 || open.window_id == p.window_id)
-    {
-        state.open_container = None;
-        broadcast_chest_lid(ctx, open.pos, false)?;
+    let (uuid, pos, closed_chest) = {
+        let state = play(ctx.session)?;
+        let closed_chest = if let Some(open) = state.open_container
+            && (p.window_id == 0 || open.window_id == p.window_id)
+        {
+            state.open_container = None;
+            Some(open.pos)
+        } else {
+            None
+        };
+        (state.player.uuid, state.player.position, closed_chest)
+    };
+    if let Some(chest_pos) = closed_chest {
+        let count = ctx.server.play.close_chest_viewer(chest_pos, uuid);
+        broadcast_chest_lid_count(ctx.server.players(), chest_pos, count)?;
+    }
+    // Vanilla `AbstractContainerMenu.removed`: return carried cursor item to inventory or drop it.
+    if let Some(mut carried) = ctx.session.inventory.take_carried() {
+        let added = ctx.session.inventory.give_stack(carried);
+        if added < carried.count {
+            carried.count -= added;
+            let _ = ctx.server.play.spawn_item_drop_scatter(
+                ctx.server.players(),
+                [pos[0], pos[1] + 0.5, pos[2]],
+                carried,
+                40,
+            );
+        }
+        sync_equipment(ctx)?;
+        return inventory(ctx);
     }
     Ok(Outcome::empty())
 }
 
-fn broadcast_chest_lid(ctx: &Context<'_>, pos: BlockPos, open: bool) -> io::Result<()> {
+pub(super) fn broadcast_chest_lid_count(
+    players: &crate::players::Players,
+    pos: BlockPos,
+    viewer_count: usize,
+) -> io::Result<()> {
     let Some(chest_block_id) = crate::game::registry()
         .block_by_name("chest")
         .map(|(id, _)| id as i32)
@@ -445,14 +650,12 @@ fn broadcast_chest_lid(ctx: &Context<'_>, pos: BlockPos, open: bool) -> io::Resu
     let body: Arc<[u8]> = Clientbound::from(BlockAction {
         pos,
         action_id: 1,
-        action_param: u8::from(open),
+        action_param: viewer_count.min(255) as u8,
         block_id: chest_block_id,
     })
     .encode()?
     .into();
-    ctx.server
-        .players()
-        .publish_world_updates(pos.chunk(), Arc::from([body]));
+    players.publish_world_updates(pos.chunk(), Arc::from([body]));
     Ok(())
 }
 
@@ -489,6 +692,10 @@ pub async fn handle_slot(ctx: &mut Context<'_>, p: HeldItemSlot) -> io::Result<O
     ctx.session.inventory.select(p.slot as u8);
     sync_equipment(ctx)?;
     Ok(Outcome::empty())
+}
+
+pub(super) fn sync_equipment_public(ctx: &mut Context<'_>) -> io::Result<()> {
+    sync_equipment(ctx)
 }
 
 fn sync_equipment(ctx: &mut Context<'_>) -> io::Result<()> {
@@ -540,6 +747,21 @@ pub async fn handle_creative_slot(ctx: &mut Context<'_>, p: CreativeSlot) -> io:
         .into(),
     ]))
 }
+fn throw_item_from_player(ctx: &mut Context<'_>, stack: crate::game::ItemStack) -> io::Result<()> {
+    let (eye, yaw, pitch) = {
+        let st = play(ctx.session)?;
+        (st.player.eye_position(), st.player.yaw, st.player.pitch)
+    };
+    let yaw_rad = f64::from(yaw).to_radians();
+    let pitch_rad = f64::from(pitch).to_radians();
+    let vx = -yaw_rad.sin() * pitch_rad.cos() * 0.3;
+    let vy = -pitch_rad.sin() * 0.3 + 0.1;
+    let vz = yaw_rad.cos() * pitch_rad.cos() * 0.3;
+    ctx.server
+        .play
+        .spawn_item_drop(ctx.server.players(), eye, [vx, vy, vz], stack, 40)
+}
+
 pub async fn handle_inventory_click(
     ctx: &mut Context<'_>,
     p: InventoryClickPacket,
@@ -548,19 +770,38 @@ pub async fn handle_inventory_click(
         return Ok(Outcome::empty());
     }
     if p.window != 0 {
-        let Some(open) = play(ctx.session)?.open_container else {
-            return Ok(Outcome::empty());
+        let (open, uuid) = {
+            let state = play(ctx.session)?;
+            let Some(open) = state.open_container else {
+                return Ok(Outcome::empty());
+            };
+            (open, state.player.uuid)
         };
         if open.window_id != p.window {
             return Ok(Outcome::empty());
         }
         let world = ctx.server.play.world().clone();
         let inv = &mut ctx.session.inventory;
-        let updated = world.update_chest(open.pos, |chest| apply_chest_click(chest, inv, p.click));
+        let mut dropped: Option<crate::game::ItemStack> = None;
+        let updated = world.update_chest(open.pos, |chest| {
+            let (changed, drop) = apply_chest_click(chest, inv, p.click);
+            dropped = drop;
+            changed
+        });
         let Some(chest_items) = updated else {
             play(ctx.session)?.open_container = None;
             return Ok(reply(vec![CloseContainer(open.window_id).into()]));
         };
+        if let Some(stack) = dropped {
+            throw_item_from_player(ctx, stack)?;
+        }
+        // Sync updated chest contents to all other players currently viewing this chest.
+        for other in ctx.server.play.other_chest_viewers(open.pos, uuid) {
+            ctx.server.players().send_control(
+                other,
+                crate::players::PlayerControl::RefreshContainer(open.pos),
+            );
+        }
         let state = play(ctx.session)?;
         let next_state_id = open.state_id.wrapping_add(1);
         state.open_container = Some(OpenContainer {
@@ -580,35 +821,173 @@ pub async fn handle_inventory_click(
         ]));
     }
     if p.window == 0 && p.state_id == ctx.session.inventory.state_id() {
-        let _ = ctx.session.inventory.click(p.click);
-        sync_equipment(ctx)?;
+        let dropped = preview_player_drop(&ctx.session.inventory, p.click);
+        if ctx.session.inventory.click(p.click) == crate::game::ClickResult::Changed {
+            if let Some(stack) = dropped {
+                throw_item_from_player(ctx, stack)?;
+            }
+            sync_equipment(ctx)?;
+        }
     }
     // Full authoritative state keeps unsupported modes and stale client state
     // simple and makes adding containers later independent of player storage.
     inventory(ctx)
 }
 
+fn preview_player_drop(
+    inv: &crate::game::Inventory,
+    click: crate::game::InventoryClick,
+) -> Option<crate::game::ItemStack> {
+    if click.mode == 0 && click.slot == -999 {
+        let mut carried = inv.carried()?;
+        match click.button {
+            0 => Some(carried),
+            1 => {
+                carried.count = 1;
+                Some(carried)
+            }
+            _ => None,
+        }
+    } else if click.mode == 4 {
+        let slot = usize::try_from(click.slot).ok()?;
+        let mut stack = (*inv.slots().get(slot)?)?;
+        match click.button {
+            0 => {
+                stack.count = 1;
+                Some(stack)
+            }
+            1 => Some(stack),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
 fn apply_chest_click(
     chest: &mut [Option<crate::game::ItemStack>; crate::world::CHEST_SLOTS],
     inv: &mut crate::game::Inventory,
     click: crate::game::InventoryClick,
-) -> bool {
+) -> (bool, Option<crate::game::ItemStack>) {
+    // Drop cursor item when clicking outside (-999) in mode 0.
+    if click.mode == 0 && click.slot == -999 {
+        let Some(mut car) = inv.carried() else {
+            return (false, None);
+        };
+        return match click.button {
+            0 => {
+                inv.set_carried(None);
+                (true, Some(car))
+            }
+            1 => {
+                let mut one = car;
+                one.count = 1;
+                car.count -= 1;
+                inv.set_carried((car.count > 0).then_some(car));
+                (true, Some(one))
+            }
+            _ => (false, None),
+        };
+    }
+
     let Ok(slot) = usize::try_from(click.slot) else {
-        return false;
+        return (false, None);
     };
     let total = crate::world::CHEST_SLOTS + 36;
     if slot >= total {
-        return false;
+        return (false, None);
     }
+
+    let get_slot = |chest: &[Option<crate::game::ItemStack>; crate::world::CHEST_SLOTS],
+                    inv: &crate::game::Inventory,
+                    idx: usize| {
+        if idx < crate::world::CHEST_SLOTS {
+            chest[idx]
+        } else {
+            inv.slots()[9 + (idx - crate::world::CHEST_SLOTS)]
+        }
+    };
+    let set_slot = |chest: &mut [Option<crate::game::ItemStack>; crate::world::CHEST_SLOTS],
+                    inv: &mut crate::game::Inventory,
+                    idx: usize,
+                    val: Option<crate::game::ItemStack>| {
+        if idx < crate::world::CHEST_SLOTS {
+            chest[idx] = val;
+        } else {
+            inv.set_slot(9 + (idx - crate::world::CHEST_SLOTS), val);
+        }
+    };
+
+    // Mode 2: Number-key hotbar swap (0..=8) or offhand swap (40).
+    if click.mode == 2 {
+        let target_inv = match click.button {
+            0..=8 => 36 + click.button as usize,
+            40 => 45,
+            _ => return (false, None),
+        };
+        let a = get_slot(chest, inv, slot);
+        let b = inv.slots()[target_inv];
+        set_slot(chest, inv, slot, b);
+        inv.set_slot(target_inv, a);
+        return (true, None);
+    }
+
+    // Mode 4: Drop key (Q = 0 drops 1, Ctrl+Q = 1 drops full stack).
+    if click.mode == 4 {
+        let Some(mut cur) = get_slot(chest, inv, slot) else {
+            return (false, None);
+        };
+        return match click.button {
+            0 => {
+                let mut one = cur;
+                one.count = 1;
+                cur.count -= 1;
+                set_slot(chest, inv, slot, (cur.count > 0).then_some(cur));
+                (true, Some(one))
+            }
+            1 => {
+                set_slot(chest, inv, slot, None);
+                (true, Some(cur))
+            }
+            _ => (false, None),
+        };
+    }
+
+    // Mode 6: Double-click collect matching items into carried stack.
+    if click.mode == 6 {
+        if click.button != 0 {
+            return (false, None);
+        }
+        let Some(mut carried) = inv.carried() else {
+            return (false, None);
+        };
+        let max_stack = carried.definition().max_stack;
+        let mut changed = false;
+        for idx in 0..total {
+            if carried.count >= max_stack {
+                break;
+            }
+            if let Some(mut cur) = get_slot(chest, inv, idx)
+                && cur.item == carried.item
+                && cur.damage == carried.damage
+            {
+                let moved = (max_stack - carried.count).min(cur.count);
+                carried.count += moved;
+                cur.count -= moved;
+                set_slot(chest, inv, idx, (cur.count > 0).then_some(cur));
+                changed = true;
+            }
+        }
+        if changed {
+            inv.set_carried(Some(carried));
+        }
+        return (changed, None);
+    }
+
     // Shift-click (mode 1): quick-move between chest (0..27) and player inventory (27..63).
     if click.mode == 1 {
-        let stack = if slot < crate::world::CHEST_SLOTS {
-            chest[slot]
-        } else {
-            inv.slots()[9 + (slot - crate::world::CHEST_SLOTS)]
-        };
-        let Some(mut moving) = stack else {
-            return false;
+        let Some(mut moving) = get_slot(chest, inv, slot) else {
+            return (false, None);
         };
         let max_stack = moving.definition().max_stack;
         if slot < crate::world::CHEST_SLOTS {
@@ -624,7 +1003,7 @@ fn apply_chest_click(
                     inv.set_slot(target, Some(existing));
                     if moving.count == 0 {
                         chest[slot] = None;
-                        return true;
+                        return (true, None);
                     }
                 }
             }
@@ -632,11 +1011,11 @@ fn apply_chest_click(
                 if inv.slots()[target].is_none() {
                     inv.set_slot(target, Some(moving));
                     chest[slot] = None;
-                    return true;
+                    return (true, None);
                 }
             }
             chest[slot] = Some(moving);
-            return true;
+            return (true, None);
         } else {
             let inv_idx = 9 + (slot - crate::world::CHEST_SLOTS);
             for slot_ref in chest.iter_mut() {
@@ -651,7 +1030,7 @@ fn apply_chest_click(
                     *slot_ref = Some(existing);
                     if moving.count == 0 {
                         inv.set_slot(inv_idx, None);
-                        return true;
+                        return (true, None);
                     }
                 }
             }
@@ -659,23 +1038,19 @@ fn apply_chest_click(
                 if slot_ref.is_none() {
                     *slot_ref = Some(moving);
                     inv.set_slot(inv_idx, None);
-                    return true;
+                    return (true, None);
                 }
             }
             inv.set_slot(inv_idx, Some(moving));
-            return true;
+            return (true, None);
         }
     }
 
     if click.mode != 0 || !matches!(click.button, 0 | 1) {
-        return false;
+        return (false, None);
     }
 
-    let current = if slot < crate::world::CHEST_SLOTS {
-        chest[slot]
-    } else {
-        inv.slots()[9 + (slot - crate::world::CHEST_SLOTS)]
-    };
+    let current = get_slot(chest, inv, slot);
     let carried = inv.carried();
 
     let (next_slot, next_carried) = match (click.button, current, carried) {
@@ -710,14 +1085,10 @@ fn apply_chest_click(
             (Some(cur), (car.count > 0).then_some(car))
         }
         (1, cur, car) => (car, cur),
-        _ => return false,
+        _ => return (false, None),
     };
 
-    if slot < crate::world::CHEST_SLOTS {
-        chest[slot] = next_slot;
-    } else {
-        inv.set_slot(9 + (slot - crate::world::CHEST_SLOTS), next_slot);
-    }
+    set_slot(chest, inv, slot, next_slot);
     inv.set_carried(next_carried);
-    true
+    (true, None)
 }

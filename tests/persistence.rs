@@ -33,6 +33,7 @@ async fn anvil_superflat_world_survives_restart_via_save_all() {
 
     let config = Config {
         world_dir: Some(world_dir.to_string_lossy().into_owned()),
+        world_type: zcraft::config::WorldType::Flat,
         flat: Some(custom_flat.clone()),
         game_mode: GameMode::Creative,
         ..Config::default()

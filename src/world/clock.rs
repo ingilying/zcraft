@@ -52,6 +52,7 @@ pub struct TickEvents {
 pub struct PersistedClock {
     pub world_age: i64,
     pub day_time: i64,
+    pub clear_weather_time: u32,
     pub raining: bool,
     pub rain_time: u32,
     pub thundering: bool,
@@ -62,6 +63,7 @@ pub struct PersistedClock {
 pub struct WorldClock {
     world_age: i64,
     day_time: i64,
+    clear_weather_time: u32,
     raining: bool,
     rain_time: u32,
     thundering: bool,
@@ -86,6 +88,7 @@ impl WorldClock {
         Self {
             world_age: 0,
             day_time: INITIAL_DAY_TIME,
+            clear_weather_time: 0,
             raining: false,
             rain_time: rng.gen_range(CLEAR_RAIN_MIN..=CLEAR_RAIN_MAX),
             thundering: false,
@@ -99,6 +102,7 @@ impl WorldClock {
         Self {
             world_age: state.world_age.max(0),
             day_time: state.day_time.max(0),
+            clear_weather_time: state.clear_weather_time,
             raining: state.raining,
             rain_time: state.rain_time.max(1),
             thundering: state.raining && state.thundering,
@@ -116,6 +120,7 @@ impl WorldClock {
         PersistedClock {
             world_age: self.world_age,
             day_time: self.day_time,
+            clear_weather_time: self.clear_weather_time,
             raining: self.raining,
             rain_time: self.rain_time,
             thundering: self.thundering,
@@ -183,10 +188,20 @@ impl WorldClock {
     ) -> Vec<WeatherEvent> {
         let duration = duration.max(1);
         let was_raining = self.raining;
-        self.raining = raining;
-        self.thundering = raining && thundering;
-        self.rain_time = duration;
-        self.thunder_time = duration;
+        if !raining && !thundering {
+            // Vanilla `/weather clear`: set independent clearWeatherTime countdown.
+            self.clear_weather_time = duration;
+            self.raining = false;
+            self.thundering = false;
+            self.rain_time = 0;
+            self.thunder_time = 0;
+        } else {
+            self.clear_weather_time = 0;
+            self.raining = raining;
+            self.thundering = raining && thundering;
+            self.rain_time = duration;
+            self.thunder_time = duration;
+        }
         let mut out = Vec::new();
         if was_raining != self.raining {
             out.push(if self.raining {
@@ -218,24 +233,39 @@ impl WorldClock {
         let prev_rain_steps = self.rain_steps;
         let prev_thunder_steps = self.thunder_steps;
 
-        self.thunder_time = self.thunder_time.saturating_sub(1);
-        if self.thunder_time == 0 {
-            self.thundering = !self.thundering;
-            self.thunder_time = if self.thundering {
-                rng.gen_range(THUNDER_MIN..=THUNDER_MAX)
+        // Matches vanilla `ServerLevel.advanceWeatherCycle()`.
+        if self.clear_weather_time > 0 {
+            self.clear_weather_time -= 1;
+            self.thunder_time = u32::from(!self.thundering);
+            self.rain_time = u32::from(!self.raining);
+            self.thundering = false;
+            self.raining = false;
+        } else {
+            if self.thunder_time > 0 {
+                self.thunder_time -= 1;
+                if self.thunder_time == 0 {
+                    self.thundering = !self.thundering;
+                }
             } else {
-                rng.gen_range(CLEAR_THUNDER_MIN..=CLEAR_THUNDER_MAX)
-            };
-        }
+                self.thunder_time = if self.thundering {
+                    rng.gen_range(THUNDER_MIN..=THUNDER_MAX)
+                } else {
+                    rng.gen_range(CLEAR_THUNDER_MIN..=CLEAR_THUNDER_MAX)
+                };
+            }
 
-        self.rain_time = self.rain_time.saturating_sub(1);
-        if self.rain_time == 0 {
-            self.raining = !self.raining;
-            self.rain_time = if self.raining {
-                rng.gen_range(RAIN_MIN..=RAIN_MAX)
+            if self.rain_time > 0 {
+                self.rain_time -= 1;
+                if self.rain_time == 0 {
+                    self.raining = !self.raining;
+                }
             } else {
-                rng.gen_range(CLEAR_RAIN_MIN..=CLEAR_RAIN_MAX)
-            };
+                self.rain_time = if self.raining {
+                    rng.gen_range(RAIN_MIN..=RAIN_MAX)
+                } else {
+                    rng.gen_range(CLEAR_RAIN_MIN..=CLEAR_RAIN_MAX)
+                };
+            }
         }
 
         self.rain_steps = if self.raining {

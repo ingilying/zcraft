@@ -5,21 +5,22 @@ use crate::protocol::{
         CenterChunk, ChunkBatchFinished, ChunkBatchStart, ChunkData, ChunkViewDistance, ForgetChunk,
     },
 };
-use std::{collections::BTreeSet, io, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    io,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::time::Instant;
 
 const STREAM_INTERVAL: Duration = Duration::from_millis(50);
 const FEEDBACK_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_BATCH: usize = 16;
+const INITIAL_BATCH: usize = 9;
+const MAX_BATCH: usize = 64;
+const MAX_UNACKED_AFTER_FEEDBACK: usize = 10;
 const MAX_UNLOAD: usize = 32;
 
 type Chunk = [i32; 2];
-
-#[derive(Debug)]
-enum Batch {
-    Writing,
-    AwaitFeedback(Instant),
-}
 
 #[derive(Debug)]
 pub(super) struct ChunkStream {
@@ -28,13 +29,15 @@ pub(super) struct ChunkStream {
     radius: i32,
     advertised_radius: i32,
     loaded: BTreeSet<Chunk>,
-    // A creative chunk whose subscription was removed must reload even if
+    // A chunk whose subscription was removed must reload even if
     // the client moves back into range before its unload is written.
     retiring: BTreeSet<Chunk>,
     // Old chunks are drained before adding any new ones, so the set never
     // exceeds the largest possible view square, even on huge jumps.
     unload_remaining: bool,
-    batch: Option<Batch>,
+    writing: bool,
+    unacked: VecDeque<Instant>,
+    max_unacked: usize,
     batch_size: usize,
     next_batch: Instant,
     next: Instant,
@@ -55,8 +58,10 @@ impl ChunkStream {
             loaded: BTreeSet::new(),
             retiring: BTreeSet::new(),
             unload_remaining: false,
-            batch: None,
-            batch_size: MAX_BATCH,
+            writing: false,
+            unacked: VecDeque::new(),
+            max_unacked: 1,
+            batch_size: INITIAL_BATCH,
             next_batch: now,
             next: now,
         }
@@ -102,6 +107,10 @@ impl ChunkStream {
         (2 * self.stream_radius() + 1).pow(2) as usize
     }
 
+    fn can_send_batch(&self) -> bool {
+        !self.writing && self.unacked.len() < self.max_unacked
+    }
+
     pub(super) fn next_update(&self) -> Option<Instant> {
         if self.center != self.advertised_center
             || self.radius != self.advertised_radius
@@ -109,7 +118,7 @@ impl ChunkStream {
             || !self.retiring.is_empty()
         {
             Some(self.next)
-        } else if self.batch.is_none() && self.loaded.len() < self.desired_count() {
+        } else if self.can_send_batch() && self.loaded.len() < self.desired_count() {
             Some(self.next.max(self.next_batch))
         } else {
             None
@@ -142,7 +151,7 @@ impl ChunkStream {
                 .map(|&c| ForgetChunk(c).into()),
         );
         self.unload_remaining = outside.next().is_some();
-        if self.unload_remaining || self.batch.is_some() || now < self.next_batch {
+        if self.unload_remaining || !self.can_send_batch() || now < self.next_batch {
             return replies;
         }
 
@@ -160,7 +169,7 @@ impl ChunkStream {
                 (dx.max(dz), dx * dx + dz * dz, x, z)
             });
             let count = missing.len().min(self.batch_size);
-            self.batch = Some(Batch::Writing);
+            self.writing = true;
             replies.push(ChunkBatchStart.into());
             replies.extend(
                 missing
@@ -188,7 +197,8 @@ impl ChunkStream {
                 self.retiring.remove(&packet.0);
             }
             Clientbound::ChunkBatchFinished(_) => {
-                self.batch = Some(Batch::AwaitFeedback(now));
+                self.writing = false;
+                self.unacked.push_back(now);
                 self.next = now + STREAM_INTERVAL;
             }
             _ => {}
@@ -196,7 +206,7 @@ impl ChunkStream {
     }
 
     pub(super) fn feedback(&mut self, rate: f32, now: Instant) -> io::Result<()> {
-        if !matches!(self.batch, Some(Batch::AwaitFeedback(_))) {
+        if self.unacked.is_empty() {
             return Err(invalid("unexpected chunk batch feedback"));
         }
         if self.feedback_timed_out(now) {
@@ -205,9 +215,10 @@ impl ChunkStream {
                 "chunk batch feedback timed out",
             ));
         }
-        self.batch = None;
-        // A fractional chunks/tick budget must slow down batches, not round
-        // up to one chunk every tick. Bound extreme requests to 0.01..8.
+        self.unacked.pop_front();
+        // Matches vanilla `PlayerChunkSender.onChunkBatchReceivedByClient`:
+        // clamp desired chunks/tick to 0.01..=64.0 and raise max unacked to 10.
+        self.max_unacked = MAX_UNACKED_AFTER_FEEDBACK;
         let rate = rate.clamp(0.01, MAX_BATCH as f32);
         self.batch_size = (rate as usize).max(1);
         self.next_batch = now
@@ -218,7 +229,9 @@ impl ChunkStream {
     }
 
     pub(super) fn feedback_timed_out(&self, now: Instant) -> bool {
-        matches!(self.batch, Some(Batch::AwaitFeedback(sent)) if now >= sent + FEEDBACK_TIMEOUT)
+        self.unacked
+            .front()
+            .is_some_and(|&sent| now >= sent + FEEDBACK_TIMEOUT)
     }
 }
 
@@ -252,7 +265,7 @@ mod tests {
                 }
             }
             apply(stream, &packets, now);
-            if matches!(stream.batch, Some(Batch::AwaitFeedback(_))) {
+            while !stream.unacked.is_empty() {
                 stream.feedback(f32::MAX, now).unwrap();
             }
         }
@@ -371,7 +384,7 @@ mod tests {
                     now = now.max(next);
                     let packets = a.pump(&terrain, now);
                     apply(&mut a, &packets, now);
-                    if matches!(a.batch, Some(Batch::AwaitFeedback(_))) {
+                    while !a.unacked.is_empty() {
                         a.feedback(8.0, now).unwrap();
                     }
                 }
@@ -391,7 +404,7 @@ mod tests {
             }
         }
         let reset = ChunkStream::new(a.radius, now);
-        assert!(reset.loaded.is_empty() && reset.batch.is_none());
+        assert!(reset.loaded.is_empty() && reset.unacked.is_empty() && !reset.writing);
         assert_eq!(reset.center, [0, 0]);
     }
 }

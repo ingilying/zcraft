@@ -15,8 +15,8 @@ pub const DEFAULT_COMPRESSION_THRESHOLD: i32 = 256;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GameMode {
-    Survival,
     #[default]
+    Survival,
     Spectator,
     Creative,
 }
@@ -34,8 +34,8 @@ impl GameMode {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorldType {
-    #[default]
     Flat,
+    #[default]
     Overworld,
 }
 

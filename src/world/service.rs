@@ -173,10 +173,10 @@ impl World {
         Ok(world)
     }
 
-    /// Pre-generate and persist the initial spawn chunk area (7x7 = 49 chunks)
-    /// when creating a brand new world, matching vanilla server initialization.
+    /// Pre-generate and persist the initial spawn chunk area (5x5 = 25 chunks)
+    /// when creating a brand new world, matching vanilla 1.21.1 `spawnChunkRadius = 2`.
     fn prepare_spawn_area(&self) -> io::Result<()> {
-        const SPAWN_CHUNK_RADIUS: i32 = 3;
+        const SPAWN_CHUNK_RADIUS: i32 = 2;
         let [scx, scz] = super::chunk_at(self.spawn[0], self.spawn[2]);
         let side = (SPAWN_CHUNK_RADIUS * 2 + 1) as usize;
         let total = side * side;
@@ -396,15 +396,15 @@ impl World {
         })
     }
 
-    /// Atomically fill a bounded axis-aligned box (up to 4,096 blocks) and
-    /// refresh cached light for all affected chunks once.
+    /// Atomically fill a bounded axis-aligned box (up to 32,768 blocks, matching
+    /// vanilla `commandModificationBlockLimit`) and refresh cached light once.
     pub fn fill_blocks(
         &self,
         from: BlockPos,
         to: BlockPos,
         state: i32,
     ) -> io::Result<WorldMutation> {
-        const MAX_FILL_BLOCKS: i64 = 4096;
+        const MAX_FILL_BLOCKS: i64 = 32_768;
         let min_x = from.0[0].min(to.0[0]);
         let max_x = from.0[0].max(to.0[0]);
         let min_y = from.0[1].min(to.0[1]);
@@ -422,7 +422,7 @@ impl World {
             * i64::from(max_y - min_y + 1)
             * i64::from(max_z - min_z + 1);
         if volume > MAX_FILL_BLOCKS {
-            return Err(crate::protocol::invalid("fill volume exceeds 4096 blocks"));
+            return Err(crate::protocol::invalid("fill volume exceeds 32768 blocks"));
         }
 
         let mut store = self.store.lock().expect("chunk store poisoned");

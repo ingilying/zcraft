@@ -8,14 +8,16 @@ use crate::{
             play::{GameEvent, TimeUpdate},
             play_blocks::{BlockUpdate, LightUpdate},
             play_entities::{
-                CollectItem, EntityMetadata, EntityVelocity, RemoveEntities, SpawnEntity,
+                CollectItem, EntityMetadata, EntityPose, EntityTeleport, EntityVelocity,
+                RemoveEntities, SpawnEntity,
             },
         },
     },
-    world::{self, TimeSnapshot, WeatherEvent, World, WorldMutation},
+    world::{self, BlockPos, TimeSnapshot, WeatherEvent, World, WorldMutation},
 };
+use rand::Rng;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io,
     sync::{
         Arc, Mutex,
@@ -28,16 +30,20 @@ const MAX_ITEM_DROPS: usize = 512;
 #[derive(Debug, Clone)]
 struct ItemDrop {
     id: i32,
+    uuid: uuid::Uuid,
     position: [f64; 3],
+    last_synced_pos: [f64; 3],
     velocity: [f64; 3],
     stack: crate::game::ItemStack,
     pickup_delay: u16,
     age: u16,
+    ticks_since_sync: u16,
 }
 
 pub struct PlayService {
     world: Arc<World>,
     drops: Mutex<Vec<ItemDrop>>,
+    chest_viewers: Mutex<HashMap<BlockPos, HashSet<uuid::Uuid>>>,
     ops: Mutex<HashSet<String>>,
     shutdown: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     pub(super) game_mode: GameMode,
@@ -52,7 +58,7 @@ impl PlayService {
     }
 
     pub fn with_max_view_distance(max_view_distance: i32) -> io::Result<Self> {
-        Self::with_options(max_view_distance, GameMode::Spectator)
+        Self::with_options(max_view_distance, GameMode::default())
     }
 
     pub fn with_options(max_view_distance: i32, game_mode: GameMode) -> io::Result<Self> {
@@ -68,6 +74,7 @@ impl PlayService {
         Ok(Self {
             world,
             drops: Mutex::new(Vec::new()),
+            chest_viewers: Mutex::new(HashMap::new()),
             ops: Mutex::new(HashSet::new()),
             shutdown: Mutex::new(None),
             game_mode,
@@ -175,6 +182,84 @@ impl PlayService {
         Ok(count)
     }
 
+    /// Track a player opening a chest and return the updated total viewer count.
+    pub fn open_chest_viewer(&self, pos: BlockPos, uuid: uuid::Uuid) -> usize {
+        let mut viewers = self.chest_viewers.lock().expect("chest viewers poisoned");
+        let entry = viewers.entry(pos).or_default();
+        entry.insert(uuid);
+        entry.len()
+    }
+
+    /// Track a player closing a chest and return the updated total viewer count.
+    pub fn close_chest_viewer(&self, pos: BlockPos, uuid: uuid::Uuid) -> usize {
+        let mut viewers = self.chest_viewers.lock().expect("chest viewers poisoned");
+        if let Some(entry) = viewers.get_mut(&pos) {
+            entry.remove(&uuid);
+            let count = entry.len();
+            if count == 0 {
+                viewers.remove(&pos);
+            }
+            count
+        } else {
+            0
+        }
+    }
+
+    /// Remove a disconnecting player from all open chests, returning `(pos, remaining_count)`.
+    pub fn remove_player_from_chests(&self, uuid: uuid::Uuid) -> Vec<(BlockPos, usize)> {
+        let mut viewers = self.chest_viewers.lock().expect("chest viewers poisoned");
+        let mut changed = Vec::new();
+        viewers.retain(|&pos, set| {
+            if set.remove(&uuid) {
+                changed.push((pos, set.len()));
+            }
+            !set.is_empty()
+        });
+        changed
+    }
+
+    /// Return UUIDs of other players currently viewing the chest at `pos`.
+    pub fn other_chest_viewers(&self, pos: BlockPos, exclude: uuid::Uuid) -> Vec<uuid::Uuid> {
+        let viewers = self.chest_viewers.lock().expect("chest viewers poisoned");
+        viewers
+            .get(&pos)
+            .map(|set| set.iter().copied().filter(|&id| id != exclude).collect())
+            .unwrap_or_default()
+    }
+
+    /// Spawn a dropped `ItemEntity` with vanilla `ItemEntity.<init>` random horizontal scatter.
+    pub fn spawn_item_drop_scatter(
+        &self,
+        players: &crate::players::Players,
+        position: [f64; 3],
+        stack: crate::game::ItemStack,
+        pickup_delay: u16,
+    ) -> io::Result<()> {
+        let mut rng = rand::thread_rng();
+        let vx = rng.r#gen::<f64>() * 0.2 - 0.1;
+        let vz = rng.r#gen::<f64>() * 0.2 - 0.1;
+        self.spawn_item_drop(players, position, [vx, 0.2, vz], stack, pickup_delay)
+    }
+
+    /// Build spawn/metadata/velocity packets for all active `ItemDrop`s (for joining/respawning players).
+    pub fn existing_drop_packets(&self) -> Vec<Clientbound> {
+        let drops = self.drops.lock().expect("item drops poisoned");
+        let mut packets = Vec::with_capacity(drops.len() * 3);
+        for drop in drops.iter() {
+            packets
+                .push(SpawnEntity::item(drop.id, drop.uuid, drop.position, drop.velocity).into());
+            packets.push(
+                EntityMetadata::Item {
+                    id: drop.id,
+                    stack: drop.stack,
+                }
+                .into(),
+            );
+            packets.push(EntityVelocity::new(drop.id, drop.velocity).into());
+        }
+        packets
+    }
+
     /// Spawn a dropped `ItemEntity` in the world and broadcast it to players.
     pub fn spawn_item_drop(
         &self,
@@ -194,11 +279,14 @@ impl PlayService {
             }
             drops.push(ItemDrop {
                 id,
+                uuid,
                 position,
+                last_synced_pos: position,
                 velocity,
                 stack,
                 pickup_delay,
                 age: 0,
+                ticks_since_sync: 0,
             });
         }
         if let Some(old_id) = evicted {
@@ -211,76 +299,215 @@ impl PlayService {
         Ok(())
     }
 
-    /// Advance dropped item physics, expiration, and proximity pickup (20 TPS).
+    /// Atomically attempt to pick up `drop_id` into `inventory`, preserving `damage`
+    /// and leaving uncollected items on the ground if the inventory is full.
+    pub fn try_pickup_drop(
+        &self,
+        players: &crate::players::Players,
+        drop_id: i32,
+        player_id: i32,
+        inventory: &mut crate::game::Inventory,
+    ) -> bool {
+        let collect_count;
+        let mut remaining_stack: Option<crate::game::ItemStack> = None;
+        let mut removed = false;
+        {
+            let mut drops = self.drops.lock().expect("item drops poisoned");
+            if let Some(idx) = drops
+                .iter()
+                .position(|d| d.id == drop_id && d.pickup_delay == 0)
+            {
+                let added = inventory.give_stack(drops[idx].stack);
+                if added == 0 {
+                    return false;
+                }
+                collect_count = added;
+                if added >= drops[idx].stack.count {
+                    drops.remove(idx);
+                    removed = true;
+                } else {
+                    drops[idx].stack.count -= added;
+                    remaining_stack = Some(drops[idx].stack);
+                }
+            } else {
+                return false;
+            }
+        }
+        let _ = players.broadcast_entity_packet(
+            &CollectItem {
+                collected_id: drop_id,
+                collector_id: player_id,
+                count: i32::from(collect_count),
+            }
+            .into(),
+        );
+        if removed {
+            let _ = players.broadcast_entity_packet(&RemoveEntities(vec![drop_id]).into());
+        } else if let Some(stack) = remaining_stack {
+            let _ = players
+                .broadcast_entity_packet(&EntityMetadata::Item { id: drop_id, stack }.into());
+        }
+        true
+    }
+
+    /// Advance dropped item physics, merging, periodic sync, expiration, and
+    /// proximity pickup requests (20 TPS), aligned with vanilla `ItemEntity.tick`.
     pub fn tick_drops(&self, players: &crate::players::Players) {
         let candidates = players.pickup_candidates();
-        let mut collected: Vec<(uuid::Uuid, i32, i32, crate::game::ItemStack)> = Vec::new();
+        let mut pickup_requests: Vec<(uuid::Uuid, i32)> = Vec::new();
         let mut expired: Vec<i32> = Vec::new();
+        let mut merged_removed: Vec<i32> = Vec::new();
+        let mut merged_updated: Vec<(i32, crate::game::ItemStack)> = Vec::new();
+        let mut pos_syncs: Vec<(i32, [f64; 3], [f64; 3])> = Vec::new();
         {
             let mut drops = self.drops.lock().expect("item drops poisoned");
             drops.retain_mut(|drop| {
                 drop.age = drop.age.saturating_add(1);
-                if drop.age >= 6000 || drop.position[1] < f64::from(world::MIN_Y) - 10.0 {
+                if drop.age >= 6000 || drop.position[1] < f64::from(world::MIN_Y) - 64.0 {
                     expired.push(drop.id);
                     return false;
                 }
                 drop.pickup_delay = drop.pickup_delay.saturating_sub(1);
 
-                // Simple gravity + ground stop.
+                // Vanilla ItemEntity gravity (0.04/tick) and drag (0.98 air, 0.6*0.98 ground).
                 drop.velocity[1] = (drop.velocity[1] - 0.04).max(-1.0);
-                for axis in 0..3 {
-                    drop.position[axis] += drop.velocity[axis];
-                    drop.velocity[axis] *= 0.98;
+
+                // Horizontal move with basic solid block collision.
+                for axis in [0usize, 2usize] {
+                    let next = drop.position[axis] + drop.velocity[axis];
+                    let mut test = drop.position;
+                    test[axis] = next;
+                    let bp = BlockPos([
+                        test[0].floor() as i32,
+                        test[1].floor() as i32,
+                        test[2].floor() as i32,
+                    ]);
+                    if bp.valid()
+                        && crate::game::block_by_state(self.world.block_at(bp))
+                            .is_some_and(|d| d.collision)
+                    {
+                        drop.velocity[axis] = 0.0;
+                    } else {
+                        drop.position[axis] = next;
+                    }
                 }
-                let below = world::BlockPos([
+                drop.position[1] += drop.velocity[1];
+
+                let below = BlockPos([
                     drop.position[0].floor() as i32,
-                    (drop.position[1] - 0.1).floor() as i32,
+                    (drop.position[1] - 0.125).floor() as i32,
                     drop.position[2].floor() as i32,
                 ]);
-                if below.valid()
+                let on_ground = below.valid()
                     && crate::game::block_by_state(self.world.block_at(below))
-                        .is_some_and(|d| d.collision)
-                {
+                        .is_some_and(|d| d.collision);
+                if on_ground {
                     drop.position[1] = f64::from(below.0[1] + 1) + 0.125;
-                    drop.velocity[1] = 0.0;
-                    drop.velocity[0] *= 0.6;
-                    drop.velocity[2] *= 0.6;
+                    let ground_drag = 0.6 * 0.98;
+                    drop.velocity[0] *= ground_drag;
+                    drop.velocity[2] *= ground_drag;
+                    if drop.velocity[1] < 0.0 {
+                        drop.velocity[1] *= -0.5;
+                        if drop.velocity[1].abs() < 0.05 {
+                            drop.velocity[1] = 0.0;
+                        }
+                    }
+                } else {
+                    drop.velocity[0] *= 0.98;
+                    drop.velocity[1] *= 0.98;
+                    drop.velocity[2] *= 0.98;
+                }
+
+                // Periodic position/velocity sync when moving or after significant drift.
+                drop.ticks_since_sync = drop.ticks_since_sync.saturating_add(1);
+                let dx = drop.position[0] - drop.last_synced_pos[0];
+                let dy = drop.position[1] - drop.last_synced_pos[1];
+                let dz = drop.position[2] - drop.last_synced_pos[2];
+                let moved_sq = dx * dx + dy * dy + dz * dz;
+                if moved_sq > 0.04 || (drop.ticks_since_sync >= 20 && moved_sq > 1e-4) {
+                    drop.last_synced_pos = drop.position;
+                    drop.ticks_since_sync = 0;
+                    pos_syncs.push((drop.id, drop.position, drop.velocity));
                 }
 
                 if drop.pickup_delay == 0 {
-                    for &(uuid, player_id, ppos) in &candidates {
+                    for &(uuid, _player_id, ppos) in &candidates {
                         let dx = ppos[0] - drop.position[0];
                         let dy = (ppos[1] + 0.9) - drop.position[1];
                         let dz = ppos[2] - drop.position[2];
                         if dx * dx + dy * dy + dz * dz <= 2.25 {
-                            collected.push((uuid, drop.id, player_id, drop.stack));
-                            return false;
+                            pickup_requests.push((uuid, drop.id));
+                            break;
                         }
                     }
                 }
                 true
             });
+
+            // Merge nearby identical stacks (matching vanilla `ItemEntity.mergeWithNeighbours`).
+            let mut i = 0;
+            while i < drops.len() {
+                let moving = drops[i].velocity[0].abs() + drops[i].velocity[2].abs() > 0.003;
+                let interval = if moving { 2 } else { 40 };
+                if !drops[i].age.is_multiple_of(interval) {
+                    i += 1;
+                    continue;
+                }
+                let max_stack = drops[i].stack.definition().max_stack;
+                if drops[i].stack.count >= max_stack {
+                    i += 1;
+                    continue;
+                }
+                let mut j = i + 1;
+                while j < drops.len() {
+                    let same = drops[i].stack.item == drops[j].stack.item
+                        && drops[i].stack.damage == drops[j].stack.damage;
+                    if same && drops[i].stack.count < max_stack {
+                        let dx = drops[i].position[0] - drops[j].position[0];
+                        let dy = drops[i].position[1] - drops[j].position[1];
+                        let dz = drops[i].position[2] - drops[j].position[2];
+                        if dx * dx + dy * dy + dz * dz <= 0.25 {
+                            let space = max_stack - drops[i].stack.count;
+                            let take = space.min(drops[j].stack.count);
+                            drops[i].stack.count += take;
+                            drops[i].age = drops[i].age.min(drops[j].age);
+                            drops[i].pickup_delay =
+                                drops[i].pickup_delay.max(drops[j].pickup_delay);
+                            merged_updated.push((drops[i].id, drops[i].stack));
+                            if take == drops[j].stack.count {
+                                merged_removed.push(drops[j].id);
+                                drops.remove(j);
+                                continue;
+                            } else {
+                                drops[j].stack.count -= take;
+                                merged_updated.push((drops[j].id, drops[j].stack));
+                            }
+                        }
+                    }
+                    j += 1;
+                }
+                i += 1;
+            }
         }
+        expired.extend(merged_removed);
         if !expired.is_empty() {
             let _ = players.broadcast_entity_packet(&RemoveEntities(expired).into());
         }
-        for (uuid, drop_id, player_id, stack) in collected {
-            players.send_control(
-                uuid,
-                crate::players::PlayerControl::Give {
-                    item: stack.item,
-                    count: u32::from(stack.count),
-                },
-            );
+        for (id, stack) in merged_updated {
+            let _ = players.broadcast_entity_packet(&EntityMetadata::Item { id, stack }.into());
+        }
+        for (id, pos, vel) in pos_syncs {
             let _ = players.broadcast_entity_packet(
-                &CollectItem {
-                    collected_id: drop_id,
-                    collector_id: player_id,
-                    count: i32::from(stack.count),
+                &EntityTeleport {
+                    id,
+                    pose: EntityPose::new(pos, 0.0, 0.0, false),
                 }
                 .into(),
             );
-            let _ = players.broadcast_entity_packet(&RemoveEntities(vec![drop_id]).into());
+            let _ = players.broadcast_entity_packet(&EntityVelocity::new(id, vel).into());
+        }
+        for (uuid, drop_id) in pickup_requests {
+            players.send_control(uuid, crate::players::PlayerControl::TryPickup(drop_id));
         }
     }
 

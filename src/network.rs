@@ -285,7 +285,11 @@ impl std::ops::DerefMut for ConnectionSession<'_> {
 
 impl Drop for ConnectionSession<'_> {
     fn drop(&mut self) {
-        crate::handler::play::save_session(&self.session, &self.server.play);
+        crate::handler::play::save_session(
+            &mut self.session,
+            &self.server.play,
+            self.server.players(),
+        );
     }
 }
 
@@ -395,7 +399,12 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 crate::handler::play::stream_chunks(&mut session, &server.play, Instant::now())
             }
             Ok(ConnectionEvent::Broadcast(crate::players::Delivery::Control(control))) => {
-                crate::handler::play::apply_control(&mut session, &server.play, control)
+                crate::handler::play::apply_control(
+                    &mut session,
+                    &server.play,
+                    server.players(),
+                    control,
+                )
             }
             Ok(ConnectionEvent::Broadcast(delivery)) => {
                 let writing_until = Instant::now() + deadline;

@@ -56,7 +56,7 @@ fn broadcast_allowlist_has_fixed_bounded_encodings() {
         (Clientbound::from(TimeUpdate::default()), 17),
         (Clientbound::from(GameEvent::start_raining()), 6),
         (Clientbound::from(WorldBorder), 40),
-        (Clientbound::from(DefaultSpawnPosition), 13),
+        (Clientbound::from(DefaultSpawnPosition::default()), 13),
     ] {
         assert_eq!(packet.encode().unwrap().len(), size);
         assert!(players.broadcast(&packet).is_ok());

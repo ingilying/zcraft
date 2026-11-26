@@ -18,7 +18,8 @@ fn missing_file_generates_roundtrippable_defaults() {
     assert!(contents.contains("compression_threshold = 256"));
     assert!(contents.contains("max_view_distance = 10"));
     assert!(contents.contains("world_dir = \"world\""));
-    assert!(contents.contains("game_mode = \"spectator\""));
+    assert!(contents.contains("world_type = \"overworld\""));
+    assert!(contents.contains("game_mode = \"survival\""));
     assert!(contents.contains("offline_mode = false"));
     assert!(contents.contains("# ops = [\"YourName\"]"));
     assert!(contents.contains("# [resource_pack]"));

@@ -19,8 +19,11 @@ fn f64_field(reader: &mut Reader<'_>) -> f64 {
 fn join_game_has_exact_767_field_order() {
     let bytes = encoded(&JoinGame {
         entity_id: 42,
+        max_players: 20,
         view_distance: 2,
+        simulation_distance: 2,
         game_mode: GameMode::Spectator,
+        is_flat: true,
     });
     let mut reader = Reader::new(&bytes);
     assert_eq!(reader.take(4).unwrap(), 42i32.to_be_bytes());
@@ -93,7 +96,7 @@ fn position_and_spawn_are_absolute_and_correctly_packed() {
     assert_eq!(reader.take(1).unwrap(), [0]);
     assert_eq!(reader.varint().unwrap(), 123);
     reader.finish().unwrap();
-    let bytes = encoded(&DefaultSpawnPosition);
+    let bytes = encoded(&DefaultSpawnPosition::default());
     let mut reader = Reader::new(&bytes);
     let packed = reader.i64().unwrap() as u64;
     assert_eq!(packed >> 38, 8);

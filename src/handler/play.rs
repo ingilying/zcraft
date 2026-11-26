@@ -26,7 +26,7 @@ use crate::{
 use std::{io, sync::Arc, time::Duration};
 use tokio::time::Instant;
 
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 const TELEPORT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -132,16 +132,22 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         game_mode = ?game_mode,
         "joined the game"
     );
+    let is_flat = world.flat_config().is_some();
+    let max_players = ctx.server.players().max_players() as i32;
     let mut replies = vec![
         JoinGame {
             entity_id,
+            max_players,
             view_distance,
+            simulation_distance: view_distance,
             game_mode,
+            is_flat,
         }
         .into(),
+        ChangeDifficulty::normal().into(),
         PlayerInfo { profile, game_mode }.into(),
         PlayerAbilities(game_mode).into(),
-        DefaultSpawnPosition.into(),
+        DefaultSpawnPosition::from_spawn(world.spawn_position()).into(),
     ];
     replies.extend(ctx.server.play.initial_environment_packets());
     replies.extend([
@@ -160,6 +166,7 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         ]);
     }
     replies.extend(first_batch);
+    replies.extend(ctx.server.play.existing_drop_packets());
     // The nearest chunks (including spawn) precede the initial teleport.
     // The rest of the view streams independently of teleport confirmation.
     replies.push(PlayerPosition::at(position, yaw, pitch, 0).into());
@@ -170,19 +177,38 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
     })
 }
 
-/// Best-effort persistence of a player's state and inventory when leaving Play.
-pub(crate) fn save_session(session: &Session, play: &PlayService) {
+/// Best-effort persistence of a player's state and inventory when leaving Play,
+/// returning any carried cursor item and updating open chest lid counts.
+pub(crate) fn save_session(
+    session: &mut Session,
+    play: &PlayService,
+    players: &crate::players::Players,
+) {
     let Some(play_session) = &session.play else {
         return;
     };
+    let uuid = play_session.player.uuid;
+    let pos = play_session.player.position;
+    // Return cursor-carried item to inventory (or drop on ground if full).
+    if let Some(mut carried) = session.inventory.take_carried() {
+        let added = session.inventory.give_stack(carried);
+        if added < carried.count {
+            carried.count -= added;
+            let _ = play.spawn_item_drop_scatter(players, pos, carried, 40);
+        }
+    }
+    // Remove player from any open chest viewer sets and broadcast updated lid counts.
+    for (chest_pos, count) in play.remove_player_from_chests(uuid) {
+        let _ = blocks::broadcast_chest_lid_count(players, chest_pos, count);
+    }
     tracing::info!(
         player = %play_session.player.name,
-        uuid = %play_session.player.uuid,
+        uuid = %uuid,
         "left the game"
     );
     if let Err(error) = play.save_player(&play_session.player, &session.inventory) {
         tracing::warn!(
-            uuid = %play_session.player.uuid,
+            uuid = %uuid,
             %error,
             "failed to save playerdata"
         );
@@ -362,30 +388,6 @@ fn movement(
     let old_y = state.player.position[1];
     if let Some([x, y, z]) = position {
         if !crate::game::Player::position_in_bounds([x, y, z]) {
-            if state.player.is_survival() && y < f64::from(world::MIN_Y) - 4.0 {
-                // Void damage below the world floor.
-                let mut replies = Vec::new();
-                if state.player.apply_damage(4.0) {
-                    let hurt = Clientbound::from(HurtAnimation::new(state.player.entity_id, 0.0));
-                    if let Some(slot) = slot {
-                        let _ = slot.broadcast_to_viewers(&hurt);
-                    }
-                    replies.push(hurt);
-                    replies.push(
-                        UpdateHealth::new(
-                            state.player.health,
-                            state.player.food,
-                            state.player.saturation,
-                        )
-                        .into(),
-                    );
-                }
-                return Ok(Outcome {
-                    replies,
-                    close: false,
-                    encryption: None,
-                });
-            }
             let spawn = ctx.server.play.world().spawn_position();
             let id = state.next_teleport;
             state.next_teleport = id
@@ -418,43 +420,94 @@ fn movement(
     }
     state.player.on_ground = on_ground;
     let mut replies = Vec::new();
+    let mut death_reason: Option<&'static str> = None;
+    let now = Instant::now();
     if state.player.is_survival() && !state.player.dead {
         let [px, py, pz] = state.player.position;
-        let feet_pos = world::BlockPos([px.floor() as i32, py.floor() as i32, pz.floor() as i32]);
-        let feet_state = ctx.server.play.world().block_at(feet_pos);
-        let in_liquid = crate::game::block_by_state(feet_state).is_some_and(|d| d.liquid);
-        if in_liquid {
-            state.player.fall_distance = 0.0;
-        } else if on_ground {
-            let fall = std::mem::take(&mut state.player.fall_distance);
-            if fall > 3.0 {
-                let damage = (fall - 3.0).floor() as f32;
-                if state.player.apply_damage(damage) {
-                    let hurt = Clientbound::from(HurtAnimation::new(state.player.entity_id, 0.0));
-                    if let Some(slot) = slot {
-                        let _ = slot.broadcast_to_viewers(&hurt);
-                    }
-                    replies.push(hurt);
-                    replies.push(
-                        UpdateHealth::new(
-                            state.player.health,
-                            state.player.food,
-                            state.player.saturation,
-                        )
-                        .into(),
-                    );
+        if py < f64::from(world::MIN_Y) - 64.0 {
+            // Vanilla `Entity.checkBelowWorld`: void damage below `minBuildHeight - 64` (-128)
+            // with 10-tick hurt invulnerability.
+            if state.player.apply_damage_at(4.0, now) {
+                let hurt = Clientbound::from(HurtAnimation::new(state.player.entity_id, 0.0));
+                if let Some(slot) = slot {
+                    let _ = slot.broadcast_to_viewers(&hurt);
+                }
+                replies.push(hurt);
+                replies.push(
+                    UpdateHealth::new(
+                        state.player.health,
+                        state.player.food,
+                        state.player.saturation,
+                    )
+                    .into(),
+                );
+                if state.player.dead {
+                    death_reason = Some("fell out of the world");
                 }
             }
-        } else if py < old_y {
-            state.player.fall_distance += old_y - py;
+        } else {
+            let feet_pos =
+                world::BlockPos([px.floor() as i32, py.floor() as i32, pz.floor() as i32]);
+            let feet_state = ctx.server.play.world().block_at(feet_pos);
+            let in_liquid = crate::game::block_by_state(feet_state).is_some_and(|d| d.liquid);
+            if in_liquid {
+                state.player.fall_distance = 0.0;
+            } else if on_ground {
+                let fall = std::mem::take(&mut state.player.fall_distance);
+                if fall > 3.0 {
+                    // Vanilla `LivingEntity.calculateFallDamage`: Mth.ceil(fall - 3.0).
+                    let damage = (fall - 3.0).ceil() as f32;
+                    if state.player.apply_damage_at(damage, now) {
+                        let hurt =
+                            Clientbound::from(HurtAnimation::new(state.player.entity_id, 0.0));
+                        if let Some(slot) = slot {
+                            let _ = slot.broadcast_to_viewers(&hurt);
+                        }
+                        replies.push(hurt);
+                        replies.push(
+                            UpdateHealth::new(
+                                state.player.health,
+                                state.player.food,
+                                state.player.saturation,
+                            )
+                            .into(),
+                        );
+                        if state.player.dead {
+                            death_reason = Some("fell from a high place");
+                        }
+                    }
+                }
+            } else if py < old_y {
+                state.player.fall_distance += old_y - py;
+            }
         }
     }
     let pose = state.player.pose();
+    let death_info =
+        death_reason.map(|reason| (state.player.name.clone(), state.player.position, reason));
     if let Some(slot) = slot {
         if old_view != state.chunks.view() {
             state.update_view(slot);
         }
         slot.update_pose(pose);
+    }
+    if let Some((player_name, death_pos, reason)) = death_info {
+        // Vanilla `Player.dropEquipment()` (`keepInventory = false`): drop all items on death.
+        let dropped = ctx.session.inventory.drain_all();
+        for stack in dropped {
+            let _ = ctx.server.play.spawn_item_drop_scatter(
+                ctx.server.players(),
+                [death_pos[0], death_pos[1] + 0.5, death_pos[2]],
+                stack,
+                40,
+            );
+        }
+        replies.push(InventoryContent::player(&ctx.session.inventory).into());
+        let _ = blocks::sync_equipment_public(ctx);
+        let _ = ctx
+            .server
+            .players()
+            .broadcast_system_chat(&format!("{player_name} {reason}"));
     }
     Ok(Outcome {
         replies,
@@ -632,6 +685,8 @@ pub async fn handle_client_command(
     }
     let mut replies = vec![
         Respawn { game_mode, is_flat }.into(),
+        DefaultSpawnPosition::from_spawn(spawn).into(),
+        ChangeDifficulty::normal().into(),
         PlayerAbilities(game_mode).into(),
         UpdateHealth::new(health, food, saturation).into(),
         CenterChunk(spawn_chunk).into(),
@@ -642,6 +697,7 @@ pub async fn handle_client_command(
         replies.push(SelectedSlot(ctx.session.inventory.selected()).into());
     }
     replies.extend(first_batch);
+    replies.extend(ctx.server.play.existing_drop_packets());
     replies.push(PlayerPosition::at(spawn, 0.0, 0.0, tp_id).into());
     Ok(Outcome {
         replies,

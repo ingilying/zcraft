@@ -357,17 +357,19 @@ impl Players {
     }
 
     /// Broadcast an entity lifecycle packet (`SpawnEntity`, `EntityMetadata`,
-    /// `EntityVelocity`, `CollectItem`, `RemoveEntities`, `HurtAnimation`) to
-    /// all ready players in Play.
+    /// `EntityVelocity`, `EntityTeleport`, `CollectItem`, `RemoveEntities`,
+    /// `HurtAnimation`, `BlockDestruction`) to all ready players in Play.
     pub(crate) fn broadcast_entity_packet(&self, packet: &Clientbound) -> io::Result<()> {
         if !matches!(
             packet,
             Clientbound::SpawnEntity(_)
                 | Clientbound::EntityMetadata(_)
                 | Clientbound::EntityVelocity(_)
+                | Clientbound::EntityTeleport(_)
                 | Clientbound::CollectItem(_)
                 | Clientbound::RemoveEntities(_)
                 | Clientbound::HurtAnimation(_)
+                | Clientbound::BlockDestruction(_)
         ) {
             return Err(invalid("packet is not a supported entity broadcast"));
         }
