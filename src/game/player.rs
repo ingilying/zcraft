@@ -31,6 +31,9 @@ pub struct Player {
     pub health: f32,
     pub food: i32,
     pub saturation: f32,
+    pub exhaustion: f32,
+    pub food_tick_timer: u16,
+    pub eating: Option<(super::Hand, i32, tokio::time::Instant, u16)>,
     pub fall_distance: f64,
     pub dead: bool,
     pub last_hurt_at: Option<tokio::time::Instant>,
@@ -52,6 +55,9 @@ impl Player {
             health: 20.0,
             food: 20,
             saturation: 5.0,
+            exhaustion: 0.0,
+            food_tick_timer: 0,
+            eating: None,
             fall_distance: 0.0,
             dead: false,
             last_hurt_at: None,
@@ -117,9 +123,78 @@ impl Player {
         self.health = 20.0;
         self.food = 20;
         self.saturation = 5.0;
+        self.exhaustion = 0.0;
+        self.food_tick_timer = 0;
+        self.eating = None;
         self.fall_distance = 0.0;
         self.dead = false;
         self.last_hurt_at = None;
+    }
+
+    /// Accumulate vanilla `FoodData` exhaustion (clamped at 40.0).
+    pub fn add_exhaustion(&mut self, amount: f32) {
+        if self.is_survival() && !self.dead && amount > 0.0 && amount.is_finite() {
+            self.exhaustion = (self.exhaustion + amount).min(40.0);
+        }
+    }
+
+    /// Apply consumed food nutrition and saturation (vanilla `FoodData.eat`).
+    pub fn eat(&mut self, props: super::FoodProperties) {
+        self.food = (self.food + props.nutrition).min(20);
+        self.saturation = (self.saturation + props.saturation).min(self.food as f32);
+    }
+
+    /// Advance vanilla `FoodData.tick()` by `ticks` game ticks (20 TPS).
+    /// Returns `(health_or_food_changed, starved_hurt)`.
+    pub fn tick_food(&mut self, ticks: u16) -> (bool, bool) {
+        if !self.is_survival() || self.dead || ticks == 0 {
+            return (false, false);
+        }
+        let prev = (self.health, self.food, self.saturation);
+        let mut starved_hurt = false;
+
+        for _ in 0..ticks {
+            if self.exhaustion > 4.0 {
+                self.exhaustion -= 4.0;
+                if self.saturation > 0.0 {
+                    self.saturation = (self.saturation - 1.0).max(0.0);
+                } else {
+                    self.food = (self.food - 1).max(0);
+                }
+            }
+
+            if self.saturation > 0.0 && self.health < 20.0 && self.food >= 20 {
+                self.food_tick_timer += 1;
+                if self.food_tick_timer >= 10 {
+                    let boost = self.saturation.min(6.0);
+                    self.health = (self.health + boost / 6.0).min(20.0);
+                    self.add_exhaustion(boost);
+                    self.food_tick_timer = 0;
+                }
+            } else if self.food >= 18 && self.health < 20.0 {
+                self.food_tick_timer += 1;
+                if self.food_tick_timer >= 80 {
+                    self.health = (self.health + 1.0).min(20.0);
+                    self.add_exhaustion(6.0);
+                    self.food_tick_timer = 0;
+                }
+            } else if self.food <= 0 {
+                self.food_tick_timer += 1;
+                if self.food_tick_timer >= 80 {
+                    // Normal difficulty starvation stops at 1.0 HP.
+                    if self.health > 1.0 {
+                        self.health = (self.health - 1.0).max(1.0);
+                        starved_hurt = true;
+                    }
+                    self.food_tick_timer = 0;
+                }
+            } else {
+                self.food_tick_timer = 0;
+            }
+        }
+
+        let changed = (self.health, self.food, self.saturation) != prev;
+        (changed, starved_hurt)
     }
 
     pub fn eye_position(&self) -> [f64; 3] {

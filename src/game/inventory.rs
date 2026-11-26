@@ -1,6 +1,8 @@
 use super::{Hand, ItemStack};
 
 pub const SLOT_COUNT: usize = 46;
+const CRAFT_OUT: usize = 0;
+const CRAFT_IN: std::ops::Range<usize> = 1..5;
 const ARMOR: std::ops::Range<usize> = 5..9;
 const MAIN: std::ops::Range<usize> = 9..36;
 const HOTBAR: std::ops::Range<usize> = 36..45;
@@ -130,10 +132,11 @@ impl Inventory {
         self.changed();
         Some(carried)
     }
-    /// Drain all non-empty items (armor, main, hotbar, offhand, carried) for death drops.
+    /// Drain all non-empty items (crafting grid, armor, main, hotbar, offhand, carried) for death drops.
     pub fn drain_all(&mut self) -> Vec<ItemStack> {
         let mut out = Vec::new();
-        for slot in self.slots.iter_mut() {
+        self.slots[CRAFT_OUT] = None;
+        for slot in self.slots[1..].iter_mut() {
             if let Some(stack) = slot.take() {
                 out.push(stack);
             }
@@ -145,6 +148,57 @@ impl Inventory {
             self.changed();
         }
         out
+    }
+    /// Drain the 2x2 inventory crafting grid (slots 1..=4) and clear output slot 0.
+    pub fn drain_crafting_grid(&mut self) -> Vec<ItemStack> {
+        let mut out = Vec::new();
+        for slot in &mut self.slots[CRAFT_IN] {
+            if let Some(stack) = slot.take() {
+                out.push(stack);
+            }
+        }
+        self.slots[CRAFT_OUT] = None;
+        if !out.is_empty() {
+            self.changed();
+        }
+        out
+    }
+    fn refresh_crafting_result(&mut self) {
+        self.slots[CRAFT_OUT] = crate::game::match_crafting(2, 2, &self.slots[CRAFT_IN]);
+    }
+    fn consume_crafting_inputs(&mut self) {
+        for slot in &mut self.slots[CRAFT_IN] {
+            if let Some(mut stack) = *slot {
+                if stack.count > 1 {
+                    stack.count -= 1;
+                    *slot = Some(stack);
+                } else {
+                    *slot = crate::game::container_remainder(stack.item);
+                }
+            }
+        }
+        self.refresh_crafting_result();
+    }
+    fn can_fit_full_stack(&self, stack: ItemStack) -> bool {
+        let max_stack = stack.definition().max_stack;
+        let mut remaining = stack.count;
+        for slot in HOTBAR.chain(MAIN) {
+            if remaining == 0 {
+                return true;
+            }
+            match self.slots[slot] {
+                None => return true,
+                Some(existing)
+                    if existing.item == stack.item
+                        && existing.damage == stack.damage
+                        && existing.count < max_stack =>
+                {
+                    remaining = remaining.saturating_sub(max_stack - existing.count);
+                }
+                _ => {}
+            }
+        }
+        remaining == 0
     }
     /// Insert an `ItemStack` preserving its `damage` component into hotbar then main inventory.
     /// Returns the number of items actually inserted (`0..=stack.count`).
@@ -266,6 +320,7 @@ impl Inventory {
             self.carried = before.1;
             return ClickResult::Rejected;
         }
+        self.refresh_crafting_result();
         if before == (self.slots, self.carried) {
             ClickResult::Unchanged
         } else {
@@ -274,7 +329,11 @@ impl Inventory {
         }
     }
     fn storage(slot: usize) -> bool {
-        ARMOR.contains(&slot) || MAIN.contains(&slot) || HOTBAR.contains(&slot) || slot == OFFHAND
+        CRAFT_IN.contains(&slot)
+            || ARMOR.contains(&slot)
+            || MAIN.contains(&slot)
+            || HOTBAR.contains(&slot)
+            || slot == OFFHAND
     }
     fn index(slot: i16) -> Option<usize> {
         usize::try_from(slot)
@@ -304,6 +363,34 @@ impl Inventory {
                 }
                 _ => false,
             };
+        }
+        // Clicking the 2x2 crafting output slot (0) crafts into the cursor.
+        if slot == CRAFT_OUT as i16 {
+            if !matches!(button, 0 | 1) {
+                return false;
+            }
+            let Some(result) = self.slots[CRAFT_OUT] else {
+                return false;
+            };
+            match self.carried {
+                None => {
+                    self.carried = Some(result);
+                    self.consume_crafting_inputs();
+                    return true;
+                }
+                Some(mut held)
+                    if held.item == result.item
+                        && held.damage == result.damage
+                        && u16::from(held.count) + u16::from(result.count)
+                            <= u16::from(result.definition().max_stack) =>
+                {
+                    held.count += result.count;
+                    self.carried = Some(held);
+                    self.consume_crafting_inputs();
+                    return true;
+                }
+                _ => return false,
+            }
         }
         let Some(slot) = Self::index(slot) else {
             return false;
@@ -362,6 +449,22 @@ impl Inventory {
     fn quick_move(&mut self, slot: i16, button: i8) -> bool {
         if !matches!(button, 0 | 1) {
             return false;
+        }
+        // Shift-click on crafting output (slot 0) crafts as many as fit.
+        if slot == CRAFT_OUT as i16 {
+            let mut crafted = false;
+            for _ in 0..64 {
+                let Some(result) = self.slots[CRAFT_OUT] else {
+                    break;
+                };
+                if !self.can_fit_full_stack(result) {
+                    break;
+                }
+                self.give_stack(result);
+                self.consume_crafting_inputs();
+                crafted = true;
+            }
+            return crafted;
         }
         let Some(source) = Self::index(slot) else {
             return false;

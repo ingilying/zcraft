@@ -114,6 +114,52 @@ fn build() -> io::Result<()> {
     }
     compress_game_data(&root, &out_dir)?;
     build_block_loot_tables(&version_cache, &generated, &out_dir, offline)?;
+    build_recipes(&version_cache, &generated, &out_dir, offline)?;
+    Ok(())
+}
+
+fn build_recipes(
+    version_cache: &Path,
+    generated: &Path,
+    out_dir: &Path,
+    offline: bool,
+) -> io::Result<()> {
+    let cached = generated.join("recipes.json.zlib");
+    println!("cargo:rerun-if-changed={}", cached.display());
+    let compressed = if cached.is_file() {
+        fs::read(&cached)?
+    } else {
+        fs::create_dir_all(version_cache)?;
+        let jar = acquire_jar(version_cache, offline)?;
+        let (recipes, item_tags) = archive::extract_recipes_and_item_tags(&jar)?;
+        let mut recipe_map = serde_json::Map::with_capacity(recipes.len());
+        for (name, raw) in recipes {
+            let value: serde_json::Value =
+                serde_json::from_slice(&raw).map_err(io::Error::other)?;
+            recipe_map.insert(name, value);
+        }
+        let mut tag_map = serde_json::Map::with_capacity(item_tags.len());
+        for (name, raw) in item_tags {
+            let value: serde_json::Value =
+                serde_json::from_slice(&raw).map_err(io::Error::other)?;
+            tag_map.insert(name, value);
+        }
+        let bundle = serde_json::json!({
+            "recipes": recipe_map,
+            "item_tags": tag_map,
+        });
+        let json = serde_json::to_vec(&bundle).map_err(io::Error::other)?;
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&json)?;
+        let compressed = encoder.finish()?;
+        fs::create_dir_all(generated)?;
+        cache::atomic_write(&cached, &compressed)?;
+        compressed
+    };
+    let target = out_dir.join("recipes.json.zlib");
+    if fs::read(&target).ok().as_deref() != Some(compressed.as_slice()) {
+        cache::atomic_write(&target, &compressed)?;
+    }
     Ok(())
 }
 

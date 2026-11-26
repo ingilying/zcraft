@@ -46,6 +46,14 @@ pub struct ToolRule {
     pub speed: Option<f32>,
     pub correct_for_drops: Option<bool>,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub struct FoodProperties {
+    pub nutrition: i32,
+    pub saturation: f32,
+    pub always_edible: bool,
+    pub eat_ticks: u16,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ItemDefinition {
     pub name: String,
@@ -54,6 +62,12 @@ pub struct ItemDefinition {
     pub max_damage: u32,
     pub tool_rules: Vec<ToolRule>,
     pub block: Option<usize>,
+    #[serde(default)]
+    pub food: Option<FoodProperties>,
+    #[serde(default)]
+    pub fuel_ticks: Option<u16>,
+    #[serde(default)]
+    pub craft_remainder: Option<String>,
 }
 
 pub struct GameRegistry {

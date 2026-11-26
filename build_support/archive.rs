@@ -70,6 +70,81 @@ pub fn extract_block_loot_tables(jar: &Path) -> io::Result<Vec<(String, Vec<u8>)
     Ok(out)
 }
 
+#[allow(dead_code)]
+pub type ExtractedEntries = Vec<(String, Vec<u8>)>;
+
+/// Extract all official `data/minecraft/recipe/*.json` and `data/minecraft/tags/item/*.json`
+/// files from the pinned bundler JAR as sorted `(name, raw_json_bytes)` pairs.
+#[allow(dead_code)]
+pub fn extract_recipes_and_item_tags(
+    jar: &Path,
+) -> io::Result<(ExtractedEntries, ExtractedEntries)> {
+    let bytes = read_inner_jar(jar)?;
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(invalid)?;
+    let mut recipes = Vec::new();
+    let mut item_tags = Vec::new();
+    let mut total = 0usize;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(invalid)?;
+        let name = entry.name();
+        let target = if let Some(stem) = name
+            .strip_prefix("data/minecraft/recipe/")
+            .and_then(|rest| rest.strip_suffix(".json"))
+        {
+            if !valid_nested_stem(stem) {
+                return Err(invalid("invalid recipe entry name"));
+            }
+            Some((true, format!("minecraft:{stem}")))
+        } else if let Some(stem) = name
+            .strip_prefix("data/minecraft/tags/item/")
+            .and_then(|rest| rest.strip_suffix(".json"))
+        {
+            if !valid_nested_stem(stem) {
+                return Err(invalid("invalid item tag entry name"));
+            }
+            Some((false, format!("minecraft:{stem}")))
+        } else {
+            None
+        };
+        let Some((is_recipe, key)) = target else {
+            continue;
+        };
+        if !entry.is_file() || entry.is_symlink() || entry.size() > MAX_JSON_BYTES {
+            return Err(invalid("invalid recipe/tag archive entry"));
+        }
+        let mut raw = Vec::new();
+        entry.take(MAX_JSON_BYTES + 1).read_to_end(&mut raw)?;
+        total += raw.len();
+        if raw.len() as u64 > MAX_JSON_BYTES
+            || total > MAX_TOTAL_BYTES
+            || recipes.len() + item_tags.len() >= 4096
+        {
+            return Err(invalid("recipe/tag archive data exceeds limit"));
+        }
+        if is_recipe {
+            recipes.push((key, raw));
+        } else {
+            item_tags.push((key, raw));
+        }
+    }
+    recipes.sort_by(|a, b| a.0.cmp(&b.0));
+    item_tags.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok((recipes, item_tags))
+}
+
+#[allow(dead_code)]
+fn valid_nested_stem(stem: &str) -> bool {
+    stem.len() <= 256
+        && stem.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-.".contains(&b))
+        })
+}
+
 fn read_inner_jar(jar: &Path) -> io::Result<Vec<u8>> {
     let mut outer = ZipArchive::new(fs::File::open(jar)?).map_err(invalid)?;
     let inner = outer
