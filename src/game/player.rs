@@ -33,7 +33,7 @@ pub struct Player {
     pub saturation: f32,
     pub exhaustion: f32,
     pub food_tick_timer: u16,
-    pub eating: Option<(super::Hand, i32, tokio::time::Instant, u16)>,
+    pub eating: Option<(super::Hand, super::Item, tokio::time::Instant, u16)>,
     pub fall_distance: f64,
     pub dead: bool,
     pub last_hurt_at: Option<tokio::time::Instant>,

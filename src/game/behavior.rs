@@ -4,7 +4,7 @@
 //! New interactive blocks (chests, crafting tables, furnaces, doors, beds, ...)
 //! and usable items (foods, buckets, bows, projectiles, ...) implement these
 //! traits instead of adding ad-hoc branches inside packet handlers.
-use super::{Hand, ItemStack, Player, block_by_state, item_by_id, registry};
+use super::{Hand, Item, ItemStack, Player, block_by_state, registry};
 use crate::world::{BlockPos, World};
 
 /// Result of right-clicking a block (`BlockBehavior::on_use`).
@@ -175,7 +175,7 @@ pub enum ItemUseOutcome {
     Pass,
     StartEating {
         hand: Hand,
-        item_id: i32,
+        item: Item,
         eat_ticks: u16,
     },
     /// Bucket picked up or placed a fluid (block update + survival item swap).
@@ -183,7 +183,7 @@ pub enum ItemUseOutcome {
         hand: Hand,
         pos: BlockPos,
         new_state: i32,
-        result_item: i32,
+        result_item: Item,
     },
 }
 
@@ -224,13 +224,13 @@ impl ItemBehavior for FoodItem {
         if !player.is_survival() || player.dead {
             return ItemUseOutcome::Pass;
         }
-        let Some(props) = item_by_id(stack.item).and_then(|d| d.components.food) else {
+        let Some(props) = stack.definition().components.food else {
             return ItemUseOutcome::Pass;
         };
         if props.always_edible || player.food < 20 {
             ItemUseOutcome::StartEating {
                 hand,
-                item_id: stack.item,
+                item: stack.item,
                 eat_ticks: props.eat_ticks,
             }
         } else {
@@ -242,7 +242,7 @@ impl ItemBehavior for FoodItem {
         if !player.is_survival() || player.dead {
             return false;
         }
-        let Some(props) = item_by_id(stack.item).and_then(|d| d.components.food) else {
+        let Some(props) = stack.definition().components.food else {
             return false;
         };
         if !props.always_edible && player.food >= 20 {
@@ -265,11 +265,8 @@ impl ItemBehavior for BucketItem {
         if !player.can_interact() || player.dead {
             return ItemUseOutcome::Pass;
         }
-        let Some(def) = item_by_id(stack.item) else {
-            return ItemUseOutcome::Pass;
-        };
         let reach = if player.is_survival() { 5.0 } else { 5.5 };
-        match def.name.as_str() {
+        match stack.item.name() {
             "minecraft:bucket" => {
                 let Some((pos, _)) = raycast_block(
                     world,
@@ -287,35 +284,35 @@ impl ItemBehavior for BucketItem {
                 };
                 if bdef.name == "minecraft:water"
                     && sdef.properties.get("level").map(String::as_str) == Some("0")
-                    && let Some(wb) = super::item_by_name("water_bucket")
+                    && let Some(wb) = Item::by_name("water_bucket")
                 {
                     return ItemUseOutcome::UseBucket {
                         hand,
                         pos,
                         new_state: super::AIR_STATE,
-                        result_item: wb.id,
+                        result_item: wb,
                     };
                 }
                 if bdef.name == "minecraft:lava"
                     && sdef.properties.get("level").map(String::as_str) == Some("0")
-                    && let Some(lb) = super::item_by_name("lava_bucket")
+                    && let Some(lb) = Item::by_name("lava_bucket")
                 {
                     return ItemUseOutcome::UseBucket {
                         hand,
                         pos,
                         new_state: super::AIR_STATE,
-                        result_item: lb.id,
+                        result_item: lb,
                     };
                 }
                 if sdef.properties.get("waterlogged").map(String::as_str) == Some("true")
                     && let Some(unlogged) = set_waterlogged_property(state, false)
-                    && let Some(wb) = super::item_by_name("water_bucket")
+                    && let Some(wb) = Item::by_name("water_bucket")
                 {
                     return ItemUseOutcome::UseBucket {
                         hand,
                         pos,
                         new_state: unlogged,
-                        result_item: wb.id,
+                        result_item: wb,
                     };
                 }
                 ItemUseOutcome::Pass
@@ -331,7 +328,7 @@ impl ItemBehavior for BucketItem {
                 ) else {
                     return ItemUseOutcome::Pass;
                 };
-                let Some(empty) = super::item_by_name("bucket") else {
+                let Some(empty) = Item::by_name("bucket") else {
                     return ItemUseOutcome::Pass;
                 };
                 let hit_state = world.block_at(hit_pos);
@@ -343,7 +340,7 @@ impl ItemBehavior for BucketItem {
                         hand,
                         pos: hit_pos,
                         new_state: logged,
-                        result_item: empty.id,
+                        result_item: empty,
                     };
                 }
                 let target = BlockPos([
@@ -360,7 +357,7 @@ impl ItemBehavior for BucketItem {
                         hand,
                         pos: target,
                         new_state: water.default_state,
-                        result_item: empty.id,
+                        result_item: empty,
                     };
                 }
                 ItemUseOutcome::Pass
@@ -376,7 +373,7 @@ impl ItemBehavior for BucketItem {
                 ) else {
                     return ItemUseOutcome::Pass;
                 };
-                let Some(empty) = super::item_by_name("bucket") else {
+                let Some(empty) = Item::by_name("bucket") else {
                     return ItemUseOutcome::Pass;
                 };
                 let target = BlockPos([
@@ -393,7 +390,7 @@ impl ItemBehavior for BucketItem {
                         hand,
                         pos: target,
                         new_state: lava.default_state,
-                        result_item: empty.id,
+                        result_item: empty,
                     };
                 }
                 ItemUseOutcome::Pass
@@ -528,15 +525,12 @@ static DEFAULT_ITEM: DefaultItem = DefaultItem;
 static FOOD_ITEM: FoodItem = FoodItem;
 static BUCKET_ITEM: BucketItem = BucketItem;
 
-/// Resolve the unified `ItemBehavior` for an item ID (data-driven via `ItemComponents`).
-pub fn item_behavior(item_id: i32) -> &'static dyn ItemBehavior {
-    let Some(def) = item_by_id(item_id) else {
-        return &DEFAULT_ITEM;
-    };
-    if def.components.food.is_some() {
+/// Resolve the unified `ItemBehavior` for an `Item` (data-driven via `ItemComponents`).
+pub fn item_behavior(item: Item) -> &'static dyn ItemBehavior {
+    if item.definition().components.food.is_some() {
         &FOOD_ITEM
     } else if matches!(
-        def.name.as_str(),
+        item.name(),
         "minecraft:bucket" | "minecraft:water_bucket" | "minecraft:lava_bucket"
     ) {
         &BUCKET_ITEM
@@ -548,7 +542,7 @@ pub fn item_behavior(item_id: i32) -> &'static dyn ItemBehavior {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::GameMode, game::item_by_name};
+    use crate::config::GameMode;
 
     #[test]
     fn food_item_behavior_and_hunger_regen_match_vanilla() {
@@ -558,13 +552,13 @@ mod tests {
         player.saturation = 0.0;
         player.health = 14.0;
 
-        let steak = item_by_name("cooked_beef").unwrap().id;
+        let steak = Item::by_name("cooked_beef").unwrap();
         let stack = ItemStack::new(steak, 1).unwrap();
         assert_eq!(
             item_behavior(steak).on_use(&world, &player, Hand::Main, stack),
             ItemUseOutcome::StartEating {
                 hand: Hand::Main,
-                item_id: steak,
+                item: steak,
                 eat_ticks: 32,
             }
         );
@@ -671,8 +665,8 @@ mod tests {
         player.yaw = 0.0;
         player.pitch = 90.0;
 
-        let water_bucket = item_by_name("water_bucket").unwrap().id;
-        let bucket = item_by_name("bucket").unwrap().id;
+        let water_bucket = Item::by_name("water_bucket").unwrap();
+        let bucket = Item::by_name("bucket").unwrap();
         let water_source = crate::game::block_by_name("water").unwrap().default_state;
 
         let place = item_behavior(water_bucket).on_use(

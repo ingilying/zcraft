@@ -22,7 +22,7 @@ pub(crate) enum PlayerControl {
         pitch: Option<f32>,
     },
     Give {
-        item: i32,
+        item: crate::game::Item,
         count: u32,
     },
     TryPickup(i32),

@@ -3,7 +3,7 @@
 //! All 982 official `data/minecraft/loot_table/blocks/*.json` definitions are
 //! extracted from the pinned official 1.21.1 `server.jar` at build time and
 //! zlib-compressed into `OUT_DIR/block_loot_tables.json.zlib`.
-use super::{BlockStateDefinition, ItemStack, item_by_id, item_by_name, registry};
+use super::{BlockStateDefinition, Item, ItemStack, registry};
 use rand::Rng;
 use serde::Deserialize;
 use std::{collections::HashMap, io::Read, sync::LazyLock};
@@ -159,14 +159,14 @@ struct EvalContext<'a> {
 
 /// Evaluate the official Minecraft 1.21.1 block loot table for breaking a block
 /// with `state` using optional held `tool_item`.
-pub fn block_drops(state: i32, tool_item: Option<i32>) -> Vec<ItemStack> {
+pub fn block_drops(state: i32, tool_item: Option<Item>) -> Vec<ItemStack> {
     let mut rng = rand::thread_rng();
     block_drops_with_rng(state, tool_item, &mut rng)
 }
 
 pub fn block_drops_with_rng(
     state: i32,
-    tool_item: Option<i32>,
+    tool_item: Option<Item>,
     rng: &mut impl Rng,
 ) -> Vec<ItemStack> {
     let Some((_, block_def, state_def)) = registry().state_by_id(state) else {
@@ -175,7 +175,7 @@ pub fn block_drops_with_rng(
     let Some(table) = BLOCK_LOOT_TABLES.get(&block_def.name) else {
         return Vec::new();
     };
-    let tool_name = tool_item.and_then(item_by_id).map(|def| def.name.as_str());
+    let tool_name = tool_item.map(Item::name);
     let ctx = EvalContext {
         block_name: &block_def.name,
         state: state_def,
@@ -402,13 +402,13 @@ fn push_item_drops(item_name: &str, mut count: i32, out: &mut Vec<ItemStack>) {
     if count <= 0 {
         return;
     }
-    let Some(def) = item_by_name(item_name) else {
+    let Some(item) = Item::by_name(item_name) else {
         return;
     };
-    let max_stack = i32::from(def.max_stack.max(1));
+    let max_stack = i32::from(item.definition().max_stack.max(1));
     while count > 0 {
         let take = count.min(max_stack) as u8;
-        if let Some(stack) = ItemStack::new(def.id, take) {
+        if let Some(stack) = ItemStack::new(item, take) {
             out.push(stack);
         }
         count -= i32::from(take);
@@ -463,7 +463,7 @@ mod tests {
         assert_eq!(drops[0].count, 2);
 
         // Oak leaves with shears -> oak_leaves
-        let shears = item_by_name("shears").unwrap().id;
+        let shears = Item::by_name("shears").unwrap();
         let oak_leaves = crate::game::block_by_name("oak_leaves")
             .unwrap()
             .default_state;

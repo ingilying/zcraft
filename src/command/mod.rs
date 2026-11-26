@@ -126,7 +126,7 @@ pub trait AdminCommandHost {
         yaw: Option<f32>,
         pitch: Option<f32>,
     ) -> io::Result<bool>;
-    fn give_item(&mut self, uuid: Uuid, item: i32, count: u32) -> io::Result<bool>;
+    fn give_item(&mut self, uuid: Uuid, item: crate::game::Item, count: u32) -> io::Result<bool>;
     fn set_game_mode(&mut self, uuid: Uuid, mode: crate::config::GameMode) -> io::Result<bool>;
     fn set_op(&mut self, target: &str, op: bool) -> io::Result<CommandResult>;
     fn kick_player(&mut self, uuid: Uuid, reason: &str) -> io::Result<bool>;

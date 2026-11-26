@@ -18,7 +18,7 @@ pub use data::{
     items, registry,
 };
 pub use inventory::{ClickResult, Inventory, InventoryClick, SLOT_COUNT};
-pub use items::{Hand, ItemStack};
+pub use items::{Hand, Item, ItemStack};
 pub use loot::{block_drops, block_drops_with_rng};
 pub use placement::{
     PlacementContext, PlacementResult, is_solid_support, paired_block_pos, required_support_offset,
@@ -28,8 +28,8 @@ pub use player::{PLAYER_EYE_HEIGHT, Player};
 pub use recipes::{container_remainder, fuel_burn_ticks, match_crafting, match_smelting};
 
 /// Data-driven food component from `assets/protocol/767/game_data.json`.
-pub fn food_properties(item_id: i32) -> Option<FoodProperties> {
-    item_by_id(item_id)?.components.food
+pub fn food_properties(item: Item) -> Option<FoodProperties> {
+    item.definition().components.food
 }
 
 pub const AIR_STATE: i32 = 0;

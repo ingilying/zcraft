@@ -472,8 +472,8 @@ mod tests {
         let furnace_state = crate::game::block_by_name("furnace").unwrap().default_state;
         store.set_block(pos, furnace_state);
 
-        let raw_iron = crate::game::item_by_name("raw_iron").unwrap().id;
-        let coal = crate::game::item_by_name("coal").unwrap().id;
+        let raw_iron = crate::game::Item::by_name("raw_iron").unwrap();
+        let coal = crate::game::Item::by_name("coal").unwrap();
         store.update_furnace(pos, |f| {
             f.input = crate::game::ItemStack::new(raw_iron, 1);
             f.fuel = crate::game::ItemStack::new(coal, 1);

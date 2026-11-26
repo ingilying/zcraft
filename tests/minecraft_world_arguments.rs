@@ -247,7 +247,8 @@ fn block_and_item_syntax_resolve_against_generated_registry() {
         assert_eq!(
             typed::<ItemSpec>(&ItemArgument, name)
                 .resolve_existing()
-                .unwrap(),
+                .unwrap()
+                .wire_id(),
             id
         );
     }

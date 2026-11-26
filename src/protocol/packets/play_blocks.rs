@@ -1,6 +1,6 @@
 //! Block interaction and inventory packets for Java 1.21.1 / protocol 767.
 use crate::{
-    game::{Inventory, InventoryClick, ItemStack, item_by_id},
+    game::{Inventory, InventoryClick, Item, ItemStack},
     protocol::{Decode, Encode, Reader, invalid, put_varint},
     world::BlockPos,
 };
@@ -121,16 +121,16 @@ fn item_stack(r: &mut Reader<'_>) -> io::Result<IncomingStack> {
     if removed != 0 {
         return Err(invalid("removed item components are not supported"));
     }
-    if item_by_id(id).is_none() {
+    let Some(item) = Item::from_wire_id(id) else {
         return Ok(IncomingStack::Unsupported);
-    }
-    Ok(ItemStack::with_damage(id, count as u8, damage)
+    };
+    Ok(ItemStack::with_damage(item, count as u8, damage)
         .map_or(IncomingStack::Unsupported, IncomingStack::Supported))
 }
 pub(crate) fn put_item_stack(stack: Option<ItemStack>, out: &mut Vec<u8>) {
     if let Some(stack) = stack {
         put_varint(i32::from(stack.count), out);
-        put_varint(stack.item, out);
+        put_varint(stack.item.wire_id(), out);
         put_varint(i32::from(stack.damage > 0), out); // addedComponentCount
         put_varint(0, out); // removedComponentCount
         if stack.damage > 0 {
@@ -412,7 +412,7 @@ mod tests {
 
         let mut known = Vec::new();
         known.extend(36i16.to_be_bytes());
-        let stone = crate::game::item_by_name("stone").unwrap().id;
+        let stone = Item::by_name("stone").unwrap();
         put_item_stack(ItemStack::new(stone, 12), &mut known);
         let mut r = Reader::new(&known);
         assert_eq!(
@@ -435,13 +435,13 @@ mod tests {
 
         let mut damaged = Vec::new();
         damaged.extend(39i16.to_be_bytes());
-        let pickaxe = crate::game::item_by_name("wooden_pickaxe").unwrap().id;
+        let pickaxe = Item::by_name("wooden_pickaxe").unwrap();
         let damaged_stack = ItemStack::with_damage(pickaxe, 1, 7).unwrap();
         put_item_stack(Some(damaged_stack), &mut damaged);
         // Verify exact protocol 767 Slot field order: count, id, added, removed, [type=3, value=7].
         let mut expected_wire = Vec::new();
         expected_wire.extend(39i16.to_be_bytes());
-        for v in [1, pickaxe, 1, 0, 3, 7] {
+        for v in [1, pickaxe.wire_id(), 1, 0, 3, 7] {
             put_varint(v, &mut expected_wire);
         }
         assert_eq!(damaged, expected_wire);
@@ -468,7 +468,7 @@ mod tests {
         click.extend(38i16.to_be_bytes());
         put_item_stack(None, &mut click);
         put_item_stack(
-            ItemStack::new(crate::game::item_by_name("glass").unwrap().id, 64),
+            ItemStack::new(Item::by_name("glass").unwrap(), 64),
             &mut click,
         );
         let packet = InventoryClickPacket::decode(&mut Reader::new(&click)).unwrap();

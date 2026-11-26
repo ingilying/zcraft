@@ -4,7 +4,7 @@ use zcraft::{
     command::{CommandSource, SourceKind},
     config::{Config, GameMode},
     context::ServerContext,
-    game::{Inventory, ItemStack, Player, item_by_name, registry},
+    game::{Inventory, Item, ItemStack, Player, registry},
     world::{BlockPos, FlatGeneratorConfig, FlatLayerConfig, World},
 };
 
@@ -104,7 +104,7 @@ async fn anvil_superflat_world_survives_restart_via_save_all() {
     player.on_ground = true;
     let mut inv = Inventory::default();
     inv.select(5);
-    let shovel = item_by_name("iron_shovel").unwrap().id;
+    let shovel = Item::by_name("iron_shovel").unwrap();
     inv.set_creative(36, ItemStack::with_damage(shovel, 1, 9));
     server.play.save_player(&player, &inv).unwrap();
     assert!(world_dir.join(format!("playerdata/{uuid}.dat")).exists());
@@ -328,8 +328,8 @@ fn chest_block_entity_persists_in_anvil_and_clears_when_broken() {
     let chest_state = zcraft::game::block_by_name("chest").unwrap().default_state;
     assert!(world.set_block(chest_pos, chest_state).is_some());
 
-    let diamond = item_by_name("diamond").unwrap().id;
-    let pickaxe = item_by_name("iron_pickaxe").unwrap().id;
+    let diamond = Item::by_name("diamond").unwrap();
+    let pickaxe = Item::by_name("iron_pickaxe").unwrap();
     let stack_a = ItemStack::new(diamond, 16).unwrap();
     let stack_b = ItemStack::with_damage(pickaxe, 1, 25).unwrap();
 

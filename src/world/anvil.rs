@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     config::GameMode,
-    game::{Inventory, ItemStack, Player, SLOT_COUNT, item_by_id, item_by_name, registry},
+    game::{Inventory, Item, ItemStack, Player, SLOT_COUNT, registry},
     registry_data::{biome_id, biome_name},
 };
 use flate2::{
@@ -413,7 +413,7 @@ impl AnvilStorage {
                 let Some(id_str) = item_map.get("id").and_then(Tag::as_str) else {
                     continue;
                 };
-                let Some(def) = item_by_name(id_str) else {
+                let Some(item) = Item::by_name(id_str) else {
                     continue;
                 };
                 let count = item_map
@@ -421,7 +421,8 @@ impl AnvilStorage {
                     .and_then(Tag::as_int)
                     .or_else(|| item_map.get("Count").and_then(Tag::as_byte).map(i32::from))
                     .unwrap_or(1)
-                    .clamp(1, i32::from(def.max_stack)) as u8;
+                    .clamp(1, i32::from(item.definition().max_stack))
+                    as u8;
                 let damage = item_map
                     .get("components")
                     .and_then(Tag::as_compound)
@@ -429,7 +430,7 @@ impl AnvilStorage {
                     .and_then(Tag::as_int)
                     .unwrap_or(0)
                     .max(0) as u32;
-                slots[internal_slot] = ItemStack::with_damage(def.id, count, damage);
+                slots[internal_slot] = ItemStack::with_damage(item, count, damage);
             }
         }
         let respawn_point = match (
@@ -496,12 +497,9 @@ impl AnvilStorage {
             let Some(vanilla_slot) = internal_to_vanilla_slot(idx) else {
                 continue;
             };
-            let Some(def) = item_by_id(stack.item) else {
-                continue;
-            };
             let mut item_map = Compound::new();
             item_map.insert("Slot".into(), Tag::Byte(vanilla_slot));
-            item_map.insert("id".into(), Tag::String(def.name.clone()));
+            item_map.insert("id".into(), Tag::String(stack.item.name().into()));
             item_map.insert("count".into(), Tag::Int(i32::from(stack.count)));
             if stack.damage > 0 {
                 let mut components = Compound::new();
@@ -866,12 +864,9 @@ fn encode_container_items(items: &[Option<ItemStack>]) -> Vec<Tag> {
         let Some(stack) = stack else {
             continue;
         };
-        let Some(def) = item_by_id(stack.item) else {
-            continue;
-        };
         let mut item_map = Compound::new();
         item_map.insert("Slot".into(), Tag::Byte(slot as i8));
-        item_map.insert("id".into(), Tag::String(def.name.clone()));
+        item_map.insert("id".into(), Tag::String(stack.item.name().into()));
         item_map.insert("count".into(), Tag::Int(i32::from(stack.count)));
         if stack.damage > 0 {
             let mut components = Compound::new();
@@ -899,7 +894,7 @@ fn decode_container_items(raw_items: &[Tag], out: &mut [Option<ItemStack>]) {
         let Some(id_str) = item_map.get("id").and_then(Tag::as_str) else {
             continue;
         };
-        let Some(def) = item_by_name(id_str) else {
+        let Some(item) = Item::by_name(id_str) else {
             continue;
         };
         let count = item_map
@@ -907,7 +902,7 @@ fn decode_container_items(raw_items: &[Tag], out: &mut [Option<ItemStack>]) {
             .and_then(Tag::as_int)
             .or_else(|| item_map.get("Count").and_then(Tag::as_byte).map(i32::from))
             .unwrap_or(1)
-            .clamp(1, i32::from(def.max_stack)) as u8;
+            .clamp(1, i32::from(item.definition().max_stack)) as u8;
         let damage = item_map
             .get("components")
             .and_then(Tag::as_compound)
@@ -915,7 +910,7 @@ fn decode_container_items(raw_items: &[Tag], out: &mut [Option<ItemStack>]) {
             .and_then(Tag::as_int)
             .unwrap_or(0)
             .max(0) as u32;
-        out[slot] = ItemStack::with_damage(def.id, count, damage);
+        out[slot] = ItemStack::with_damage(item, count, damage);
     }
 }
 
@@ -1200,8 +1195,8 @@ mod tests {
         player.on_ground = true;
         let mut inv = Inventory::default();
         inv.select(3);
-        let pickaxe_id = item_by_name("iron_pickaxe").unwrap().id;
-        inv.set_creative(45, ItemStack::with_damage(pickaxe_id, 1, 17));
+        let pickaxe = Item::by_name("iron_pickaxe").unwrap();
+        inv.set_creative(45, ItemStack::with_damage(pickaxe, 1, 17));
 
         storage.save_player(&player, &inv).unwrap();
         let loaded_player = storage.load_player(uuid).unwrap().unwrap();
@@ -1213,7 +1208,7 @@ mod tests {
         assert_eq!(loaded_player.inventory.selected(), 3);
         assert_eq!(
             loaded_player.inventory.slots()[45],
-            ItemStack::with_damage(pickaxe_id, 1, 17)
+            ItemStack::with_damage(pickaxe, 1, 17)
         );
     }
 }

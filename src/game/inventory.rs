@@ -1,4 +1,4 @@
-use super::{Hand, ItemStack};
+use super::{Hand, Item, ItemStack};
 
 pub const SLOT_COUNT: usize = 46;
 const CRAFT_OUT: usize = 0;
@@ -294,11 +294,8 @@ impl Inventory {
 
     /// Add up to `count` undamaged items into hotbar then main inventory.
     /// Returns the number of items actually inserted.
-    pub fn give(&mut self, item: i32, count: u32) -> u32 {
-        let Some(definition) = super::item_by_id(item) else {
-            return 0;
-        };
-        let max_stack = u32::from(definition.max_stack);
+    pub fn give(&mut self, item: Item, count: u32) -> u32 {
+        let max_stack = u32::from(item.definition().max_stack);
         if max_stack == 0 || count == 0 {
             return 0;
         }
@@ -590,13 +587,12 @@ impl Inventory {
 
 #[cfg(test)]
 mod tests {
-    use super::super::item_by_name;
     use super::*;
     #[test]
     fn authoritative_clicks_move_split_merge_and_reject() {
         let mut i = Inventory::default();
         assert!(i.slots().iter().all(Option::is_none));
-        let stone = item_by_name("stone").unwrap().id;
+        let stone = Item::by_name("stone").unwrap();
         i.set_slot(36, ItemStack::new(stone, 64));
         assert_eq!(
             i.click(InventoryClick {
@@ -635,7 +631,7 @@ mod tests {
             ClickResult::Rejected
         );
         assert_eq!(i, before);
-        let glass = item_by_name("glass").unwrap().id;
+        let glass = Item::by_name("glass").unwrap();
         assert_eq!(
             i.set_creative(45, ItemStack::new(glass, 2)),
             ClickResult::Changed
@@ -646,7 +642,7 @@ mod tests {
         assert_eq!(i.drop_hand(Hand::Main, false), ClickResult::Changed);
         assert_eq!(i.hand(Hand::Main).unwrap().count, 1);
 
-        let pickaxe = item_by_name("wooden_pickaxe").unwrap().id;
+        let pickaxe = Item::by_name("wooden_pickaxe").unwrap();
         assert_eq!(
             i.set_creative(9, ItemStack::with_damage(pickaxe, 1, 10)),
             ClickResult::Changed

@@ -3,7 +3,7 @@
 //! All official `data/minecraft/recipe/*.json` and `data/minecraft/tags/item/*.json`
 //! files are extracted from the pinned official 1.21.1 `server.jar` at build time
 //! and zlib-compressed into `OUT_DIR/recipes.json.zlib`.
-use super::{ItemStack, item_by_name};
+use super::{Item, ItemStack};
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -27,15 +27,15 @@ struct RawTag {
 
 #[derive(Debug, Clone)]
 enum Ingredient {
-    Item(i32),
-    AnyOf(Vec<i32>),
+    Item(Item),
+    AnyOf(Vec<Item>),
 }
 
 impl Ingredient {
-    fn matches(&self, item_id: i32) -> bool {
+    fn matches(&self, item: Item) -> bool {
         match self {
-            Self::Item(id) => *id == item_id,
-            Self::AnyOf(ids) => ids.contains(&item_id),
+            Self::Item(expected) => *expected == item,
+            Self::AnyOf(items) => items.contains(&item),
         }
     }
 }
@@ -79,7 +79,7 @@ impl RecipeRegistry {
             serde_json::from_slice(&json).expect("official recipes JSON must parse");
 
         // Resolve all item tags recursively.
-        let mut item_tags: HashMap<String, HashSet<i32>> = HashMap::new();
+        let mut item_tags: HashMap<String, HashSet<Item>> = HashMap::new();
         for name in bundle.item_tags.keys() {
             let mut visiting = HashSet::new();
             resolve_tag(name, &bundle.item_tags, &mut item_tags, &mut visiting);
@@ -124,9 +124,9 @@ impl RecipeRegistry {
 fn resolve_tag(
     name: &str,
     raw: &HashMap<String, RawTag>,
-    resolved: &mut HashMap<String, HashSet<i32>>,
+    resolved: &mut HashMap<String, HashSet<Item>>,
     visiting: &mut HashSet<String>,
-) -> HashSet<i32> {
+) -> HashSet<Item> {
     if let Some(existing) = resolved.get(name) {
         return existing.clone();
     }
@@ -146,8 +146,8 @@ fn resolve_tag(
             };
             if let Some(sub_tag) = s.strip_prefix('#') {
                 set.extend(resolve_tag(sub_tag, raw, resolved, visiting));
-            } else if let Some(def) = item_by_name(s) {
-                set.insert(def.id);
+            } else if let Some(item) = Item::by_name(s) {
+                set.insert(item);
             }
         }
     }
@@ -158,35 +158,35 @@ fn resolve_tag(
 
 fn parse_ingredient(
     val: &serde_json::Value,
-    tags: &HashMap<String, HashSet<i32>>,
+    tags: &HashMap<String, HashSet<Item>>,
 ) -> Option<Ingredient> {
-    let mut ids = Vec::new();
-    collect_ingredient_ids(val, tags, &mut ids);
-    ids.sort_unstable();
-    ids.dedup();
-    match ids.len() {
+    let mut items = Vec::new();
+    collect_ingredient_items(val, tags, &mut items);
+    items.sort_unstable_by_key(|item| item.name());
+    items.dedup();
+    match items.len() {
         0 => None,
-        1 => Some(Ingredient::Item(ids[0])),
-        _ => Some(Ingredient::AnyOf(ids)),
+        1 => Some(Ingredient::Item(items[0])),
+        _ => Some(Ingredient::AnyOf(items)),
     }
 }
 
-fn collect_ingredient_ids(
+fn collect_ingredient_items(
     val: &serde_json::Value,
-    tags: &HashMap<String, HashSet<i32>>,
-    out: &mut Vec<i32>,
+    tags: &HashMap<String, HashSet<Item>>,
+    out: &mut Vec<Item>,
 ) {
     match val {
         serde_json::Value::Array(arr) => {
             for elem in arr {
-                collect_ingredient_ids(elem, tags, out);
+                collect_ingredient_items(elem, tags, out);
             }
         }
         serde_json::Value::Object(obj) => {
-            if let Some(item) = obj.get("item").and_then(|v| v.as_str())
-                && let Some(def) = item_by_name(item)
+            if let Some(name) = obj.get("item").and_then(|v| v.as_str())
+                && let Some(item) = Item::by_name(name)
             {
-                out.push(def.id);
+                out.push(item);
             }
             if let Some(tag) = obj.get("tag").and_then(|v| v.as_str())
                 && let Some(set) = tags.get(tag)
@@ -202,13 +202,13 @@ fn parse_result(val: &serde_json::Value) -> Option<ItemStack> {
     let obj = val.as_object()?;
     let id_str = obj.get("id")?.as_str()?;
     let count = obj.get("count").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
-    let def = item_by_name(id_str)?;
-    ItemStack::new(def.id, count)
+    let item = Item::by_name(id_str)?;
+    ItemStack::new(item, count)
 }
 
 fn parse_shaped(
     val: &serde_json::Value,
-    tags: &HashMap<String, HashSet<i32>>,
+    tags: &HashMap<String, HashSet<Item>>,
 ) -> Option<ShapedRecipe> {
     let pattern_rows = val.get("pattern")?.as_array()?;
     if pattern_rows.is_empty() {
@@ -276,7 +276,7 @@ fn parse_shaped(
 
 fn parse_shapeless(
     val: &serde_json::Value,
-    tags: &HashMap<String, HashSet<i32>>,
+    tags: &HashMap<String, HashSet<Item>>,
 ) -> Option<ShapelessRecipe> {
     let raw_ings = val.get("ingredients")?.as_array()?;
     let mut ingredients = Vec::with_capacity(raw_ings.len());
@@ -295,7 +295,7 @@ fn parse_shapeless(
 
 fn parse_smelting(
     val: &serde_json::Value,
-    tags: &HashMap<String, HashSet<i32>>,
+    tags: &HashMap<String, HashSet<Item>>,
 ) -> Option<SmeltingRecipe> {
     let ingredient = parse_ingredient(val.get("ingredient")?, tags)?;
     let result = parse_result(val.get("result")?)?;
@@ -385,7 +385,7 @@ pub fn match_crafting(
 fn match_shapeless_backtrack(
     ingredients: &[Ingredient],
     idx: usize,
-    items: &[i32],
+    items: &[Item],
     used: &mut [bool],
 ) -> bool {
     if idx == ingredients.len() {
@@ -418,15 +418,15 @@ pub fn match_smelting(input: Option<ItemStack>) -> Option<(ItemStack, u16)> {
 
 /// Data-driven vanilla 1.21.1 furnace fuel burn duration in ticks (`20 ticks = 1s`),
 /// resolved from the furnace fuel table in `game_data.json`.
-pub fn fuel_burn_ticks(item_id: i32) -> Option<u16> {
-    super::registry().fuel_ticks(item_id)
+pub fn fuel_burn_ticks(item: Item) -> Option<u16> {
+    super::registry().fuel_ticks(item)
 }
 
 /// Data-driven vanilla 1.21.1 crafting/fuel container remainder
 /// (e.g., `lava_bucket` -> `bucket`, `mushroom_stew` -> `bowl`).
-pub fn container_remainder(item_id: i32) -> Option<ItemStack> {
-    let rem_id = super::registry().craft_remainder(item_id)?;
-    ItemStack::new(rem_id, 1)
+pub fn container_remainder(item: Item) -> Option<ItemStack> {
+    let rem = super::registry().craft_remainder(item)?;
+    ItemStack::new(rem, 1)
 }
 
 #[cfg(test)]
@@ -434,7 +434,7 @@ mod tests {
     use super::*;
 
     fn stack(name: &str) -> Option<ItemStack> {
-        ItemStack::new(item_by_name(name).unwrap().id, 1)
+        ItemStack::new(Item::by_name(name).unwrap(), 1)
     }
 
     #[test]
@@ -476,16 +476,13 @@ mod tests {
         assert_eq!(ticks, 200);
 
         // 7. Fuel burn times
+        assert_eq!(fuel_burn_ticks(Item::by_name("coal").unwrap()), Some(1600));
         assert_eq!(
-            fuel_burn_ticks(item_by_name("coal").unwrap().id),
-            Some(1600)
-        );
-        assert_eq!(
-            fuel_burn_ticks(item_by_name("oak_planks").unwrap().id),
+            fuel_burn_ticks(Item::by_name("oak_planks").unwrap()),
             Some(300)
         );
         assert_eq!(
-            fuel_burn_ticks(item_by_name("lava_bucket").unwrap().id),
+            fuel_burn_ticks(Item::by_name("lava_bucket").unwrap()),
             Some(20_000)
         );
     }

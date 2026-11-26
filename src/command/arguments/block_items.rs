@@ -49,14 +49,12 @@ impl BlockStateSpec {
     }
 }
 impl ItemSpec {
-    /// Actual registered item IDs; not arbitrary vanilla inventory support.
-    pub fn resolve_existing(&self) -> Result<i32, RegistryValueError> {
+    /// Resolve to a registered `Item` handle.
+    pub fn resolve_existing(&self) -> Result<crate::game::Item, RegistryValueError> {
         if self.name.namespace != "minecraft" {
             return Err(RegistryValueError::UnsupportedItem);
         }
-        crate::game::item_by_name(&self.name.path)
-            .map(|item| item.id)
-            .ok_or(RegistryValueError::UnsupportedItem)
+        crate::game::Item::by_name(&self.name.path).ok_or(RegistryValueError::UnsupportedItem)
     }
 }
 #[derive(Debug, Clone, Copy)]

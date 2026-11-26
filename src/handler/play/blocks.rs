@@ -874,7 +874,7 @@ fn furnace_slots(
 }
 
 pub async fn handle_use_item(ctx: &mut Context<'_>, p: UseItem) -> io::Result<Outcome> {
-    let mut bucket_action: Option<(Hand, BlockPos, i32, i32, bool, [f64; 3])> = None;
+    let mut bucket_action: Option<(Hand, BlockPos, i32, crate::game::Item, bool, [f64; 3])> = None;
     if let Some(hand) = Hand::from_wire(p.hand)
         && let Some(stack) = ctx.session.inventory.hand(hand)
         && let Ok(state) = play(ctx.session)
@@ -883,10 +883,10 @@ pub async fn handle_use_item(ctx: &mut Context<'_>, p: UseItem) -> io::Result<Ou
         match crate::game::item_behavior(stack.item).on_use(world, &state.player, hand, stack) {
             crate::game::ItemUseOutcome::StartEating {
                 hand,
-                item_id,
+                item,
                 eat_ticks,
             } => {
-                state.player.eating = Some((hand, item_id, tokio::time::Instant::now(), eat_ticks));
+                state.player.eating = Some((hand, item, tokio::time::Instant::now(), eat_ticks));
             }
             crate::game::ItemUseOutcome::UseBucket {
                 hand,

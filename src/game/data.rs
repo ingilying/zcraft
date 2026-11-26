@@ -153,11 +153,12 @@ impl GameRegistry {
             craft_remainders,
         }
     }
-    pub fn fuel_ticks(&self, item_id: i32) -> Option<u16> {
-        self.fuels.get(&item_id).copied()
+    pub fn fuel_ticks(&self, item: super::Item) -> Option<u16> {
+        self.fuels.get(&item.wire_id()).copied()
     }
-    pub fn craft_remainder(&self, item_id: i32) -> Option<i32> {
-        self.craft_remainders.get(&item_id).copied()
+    pub fn craft_remainder(&self, item: super::Item) -> Option<super::Item> {
+        let rem_id = *self.craft_remainders.get(&item.wire_id())?;
+        super::Item::from_wire_id(rem_id)
     }
     pub fn blocks(&self) -> &[BlockDefinition] {
         &self.raw.blocks
@@ -239,8 +240,8 @@ impl GameRegistry {
                 .is_some_and(|value| value.name == selector)
         }
     }
-    pub fn tool_speed(&self, item: Option<i32>, block: usize) -> f32 {
-        let Some(item) = item.and_then(|id| self.item_by_id(id)) else {
+    pub fn tool_speed(&self, item: Option<super::Item>, block: usize) -> f32 {
+        let Some(item) = item.map(super::Item::definition) else {
             return 1.0;
         };
         for rule in &item.tool_rules {
@@ -252,8 +253,8 @@ impl GameRegistry {
         }
         1.0
     }
-    pub fn correct_for_drops(&self, item: Option<i32>, block: usize) -> bool {
-        let Some(item) = item.and_then(|id| self.item_by_id(id)) else {
+    pub fn correct_for_drops(&self, item: Option<super::Item>, block: usize) -> bool {
+        let Some(item) = item.map(super::Item::definition) else {
             return false;
         };
         for rule in &item.tool_rules {
@@ -267,7 +268,12 @@ impl GameRegistry {
     }
     /// Project policy: blocks in a vanilla mineable tool tag require a matching
     /// tool; tier gates come from vanilla's incorrect-tool rules.
-    pub fn can_mine(&self, item: Option<i32>, block: usize, state: &BlockStateDefinition) -> bool {
+    pub fn can_mine(
+        &self,
+        item: Option<super::Item>,
+        block: usize,
+        state: &BlockStateDefinition,
+    ) -> bool {
         if state.hardness < 0.0 {
             return false;
         }
@@ -332,11 +338,11 @@ mod tests {
         assert_eq!(registry().items().len(), 1333);
         let (stone_i, stone) = registry().block_by_name("stone").unwrap();
         let state = registry().state_by_id(stone.default_state).unwrap().2;
-        let wood = registry().item_by_name("wooden_pickaxe").unwrap();
-        assert_eq!(registry().tool_speed(Some(wood.id), stone_i), 2.0);
-        assert!(registry().can_mine(Some(wood.id), stone_i, state));
+        let wood = crate::game::Item::by_name("wooden_pickaxe").unwrap();
+        assert_eq!(registry().tool_speed(Some(wood), stone_i), 2.0);
+        assert!(registry().can_mine(Some(wood), stone_i, state));
         let dirt_i = registry().block_by_name("dirt").unwrap().0;
-        assert!(!registry().can_mine(Some(wood.id), dirt_i, registry().state_by_id(10).unwrap().2));
+        assert!(!registry().can_mine(Some(wood), dirt_i, registry().state_by_id(10).unwrap().2));
         assert_eq!(
             registry()
                 .item_by_name("diamond_pickaxe")

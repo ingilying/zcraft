@@ -190,7 +190,12 @@ impl<H: crate::command::CommandHost> crate::command::AdminCommandHost for Server
             },
         ))
     }
-    fn give_item(&mut self, uuid: uuid::Uuid, item: i32, count: u32) -> std::io::Result<bool> {
+    fn give_item(
+        &mut self,
+        uuid: uuid::Uuid,
+        item: crate::game::Item,
+        count: u32,
+    ) -> std::io::Result<bool> {
         Ok(self
             .server
             .players()
