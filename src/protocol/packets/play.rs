@@ -357,6 +357,7 @@ pub struct GameEvent {
 }
 
 impl GameEvent {
+    pub const NO_RESPAWN_BLOCK_AVAILABLE: u8 = 0;
     pub const START_RAINING: u8 = 1;
     pub const STOP_RAINING: u8 = 2;
     pub const CHANGE_GAME_MODE: u8 = 3;
@@ -373,6 +374,10 @@ impl GameEvent {
 
     pub fn value(self) -> f32 {
         f32::from_bits(self.value_bits)
+    }
+
+    pub fn no_respawn_block_available() -> Self {
+        Self::new(Self::NO_RESPAWN_BLOCK_AVAILABLE, 0.0)
     }
 
     pub fn level_chunks_load_start() -> Self {

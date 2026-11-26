@@ -69,7 +69,7 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         tracing::error!(uuid = %profile.uuid, %error, "failed to load playerdata; rejecting login to prevent overwrite");
         error
     })?;
-    let (position, yaw, pitch, on_ground, game_mode, health, food, saturation) =
+    let (position, yaw, pitch, on_ground, game_mode, health, food, saturation, respawn_point) =
         if let Some(saved) = saved {
             ctx.session.inventory = saved.inventory;
             (
@@ -81,6 +81,7 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
                 saved.health,
                 saved.food,
                 saved.saturation,
+                saved.respawn_point,
             )
         } else {
             (
@@ -92,6 +93,7 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
                 20.0,
                 20,
                 5.0,
+                None,
             )
         };
     let spawn_chunk = world::chunk_at(position[0], position[2]);
@@ -115,6 +117,7 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
     player.health = health;
     player.food = food;
     player.saturation = saturation;
+    player.respawn_point = respawn_point;
     player.dead = health <= 0.0;
     ctx.session.play = Some(PlaySession {
         player,
@@ -727,7 +730,7 @@ pub async fn handle_client_command(
         return Ok(Outcome::empty());
     }
     let world = ctx.server.play.world().clone();
-    let spawn = world.spawn_position();
+    let world_spawn = world.spawn_position();
     let is_flat = world.flat_config().is_some();
     let view_distance = ctx
         .server
@@ -738,6 +741,26 @@ pub async fn handle_client_command(
     if !state.player.dead {
         return Ok(Outcome::empty());
     }
+    let mut missing_bed = false;
+    let spawn = if let Some(bed_pos) = state.player.respawn_point {
+        let is_bed = bed_pos.valid()
+            && crate::game::registry()
+                .state_by_id(world.block_at(bed_pos))
+                .is_some_and(|(_, def, _)| def.name.ends_with("_bed"));
+        if is_bed {
+            [
+                f64::from(bed_pos.0[0]) + 0.5,
+                f64::from(bed_pos.0[1]) + 0.6,
+                f64::from(bed_pos.0[2]) + 0.5,
+            ]
+        } else {
+            state.player.respawn_point = None;
+            missing_bed = true;
+            world_spawn
+        }
+    } else {
+        world_spawn
+    };
     let tp_id = state.next_teleport;
     state.next_teleport = tp_id
         .checked_add(1)
@@ -762,15 +785,19 @@ pub async fn handle_client_command(
         slot.set_view(spawn_chunk, view_distance);
         slot.update_pose(pose);
     }
-    let mut replies = vec![
+    let mut replies = Vec::new();
+    if missing_bed {
+        replies.push(GameEvent::no_respawn_block_available().into());
+    }
+    replies.extend([
         Respawn { game_mode, is_flat }.into(),
-        DefaultSpawnPosition::from_spawn(spawn).into(),
+        DefaultSpawnPosition::from_spawn(world_spawn).into(),
         ChangeDifficulty::normal().into(),
         PlayerAbilities(game_mode).into(),
         UpdateHealth::new(health, food, saturation).into(),
         CenterChunk(spawn_chunk).into(),
         GameEvent::level_chunks_load_start().into(),
-    ];
+    ]);
     if game_mode != GameMode::Spectator {
         replies.push(InventoryContent::player(&ctx.session.inventory).into());
         replies.push(SelectedSlot(ctx.session.inventory.selected()).into());

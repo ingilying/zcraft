@@ -37,6 +37,7 @@ pub struct Player {
     pub fall_distance: f64,
     pub dead: bool,
     pub last_hurt_at: Option<tokio::time::Instant>,
+    pub respawn_point: Option<BlockPos>,
 }
 
 impl Player {
@@ -61,6 +62,7 @@ impl Player {
             fall_distance: 0.0,
             dead: false,
             last_hurt_at: None,
+            respawn_point: None,
         }
     }
 

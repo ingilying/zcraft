@@ -705,6 +705,52 @@ pub async fn handle_place(ctx: &mut Context<'_>, p: BlockPlace) -> io::Result<Ou
                     ]));
                 }
             }
+            crate::game::BlockUseOutcome::SetBlocks(updates) => {
+                for (upos, ustate) in updates {
+                    let _ = ctx
+                        .server
+                        .play
+                        .set_block(ctx.server.players(), upos, ustate);
+                }
+                return Ok(reply(vec![BlockAck(p.sequence).into()]));
+            }
+            crate::game::BlockUseOutcome::UseBed(bed_pos) => {
+                let mut replies = Vec::new();
+                if state.player.respawn_point != Some(bed_pos) {
+                    state.player.respawn_point = Some(bed_pos);
+                    replies.push(
+                        crate::protocol::packets::play_chat::SystemChat("Respawn point set".into())
+                            .into(),
+                    );
+                }
+                let (_, day_time) = ctx.server.play.world_time();
+                let time_of_day = day_time.rem_euclid(crate::world::DAY_LENGTH);
+                let weather = ctx.server.play.weather();
+                let can_sleep = (12_541..=23_458).contains(&time_of_day) || weather.thundering;
+                if can_sleep {
+                    let next_morning = day_time - time_of_day + crate::world::DAY_LENGTH;
+                    let time_pkt = ctx.server.play.set_day_time(next_morning);
+                    let _ = ctx.server.players().broadcast(&time_pkt.into());
+                    if weather.raining || weather.thundering {
+                        for wpkt in ctx.server.play.set_weather(false, false, 12_000) {
+                            let _ = ctx.server.players().broadcast(&wpkt);
+                        }
+                    }
+                    let _ = ctx
+                        .server
+                        .players()
+                        .broadcast_system_chat("Sleeping through this night");
+                } else {
+                    replies.push(
+                        crate::protocol::packets::play_chat::SystemChat(
+                            "You can sleep only at night or during thunderstorms".into(),
+                        )
+                        .into(),
+                    );
+                }
+                replies.push(BlockAck(p.sequence).into());
+                return Ok(reply(replies));
+            }
             crate::game::BlockUseOutcome::Pass => {}
         }
     }

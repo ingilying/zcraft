@@ -65,6 +65,7 @@ pub struct SavedPlayer {
     pub health: f32,
     pub food: i32,
     pub saturation: f32,
+    pub respawn_point: Option<super::BlockPos>,
     pub inventory: Inventory,
 }
 
@@ -431,6 +432,14 @@ impl AnvilStorage {
                 slots[internal_slot] = ItemStack::with_damage(def.id, count, damage);
             }
         }
+        let respawn_point = match (
+            root.get("SpawnX").and_then(Tag::as_int),
+            root.get("SpawnY").and_then(Tag::as_int),
+            root.get("SpawnZ").and_then(Tag::as_int),
+        ) {
+            (Some(x), Some(y), Some(z)) => Some(super::BlockPos([x, y, z])),
+            _ => None,
+        };
         let inventory = Inventory::from_persisted(slots, selected);
         Ok(Some(SavedPlayer {
             position,
@@ -441,6 +450,7 @@ impl AnvilStorage {
             health,
             food,
             saturation,
+            respawn_point,
             inventory,
         }))
     }
@@ -468,6 +478,11 @@ impl AnvilStorage {
         root.insert("Health".into(), Tag::Float(player.health));
         root.insert("foodLevel".into(), Tag::Int(player.food));
         root.insert("foodSaturationLevel".into(), Tag::Float(player.saturation));
+        if let Some(spawn) = player.respawn_point {
+            root.insert("SpawnX".into(), Tag::Int(spawn.0[0]));
+            root.insert("SpawnY".into(), Tag::Int(spawn.0[1]));
+            root.insert("SpawnZ".into(), Tag::Int(spawn.0[2]));
+        }
         root.insert(
             "SelectedItemSlot".into(),
             Tag::Int(i32::from(inventory.selected())),
