@@ -3,7 +3,7 @@
 //! All official `data/minecraft/recipe/*.json` and `data/minecraft/tags/item/*.json`
 //! files are extracted from the pinned official 1.21.1 `server.jar` at build time
 //! and zlib-compressed into `OUT_DIR/recipes.json.zlib`.
-use super::{ItemStack, item_by_id, item_by_name};
+use super::{ItemStack, item_by_name};
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -417,16 +417,16 @@ pub fn match_smelting(input: Option<ItemStack>) -> Option<(ItemStack, u16)> {
 }
 
 /// Data-driven vanilla 1.21.1 furnace fuel burn duration in ticks (`20 ticks = 1s`),
-/// extracted from `AbstractFurnaceBlockEntity.getFuel()` into `game_data.json`.
+/// resolved from the furnace fuel table in `game_data.json`.
 pub fn fuel_burn_ticks(item_id: i32) -> Option<u16> {
-    item_by_id(item_id)?.fuel_ticks
+    super::registry().fuel_ticks(item_id)
 }
 
 /// Data-driven vanilla 1.21.1 crafting/fuel container remainder
 /// (e.g., `lava_bucket` -> `bucket`, `mushroom_stew` -> `bowl`).
 pub fn container_remainder(item_id: i32) -> Option<ItemStack> {
-    let name = item_by_id(item_id)?.craft_remainder.as_deref()?;
-    item_by_name(name).and_then(|d| ItemStack::new(d.id, 1))
+    let rem_id = super::registry().craft_remainder(item_id)?;
+    ItemStack::new(rem_id, 1)
 }
 
 #[cfg(test)]

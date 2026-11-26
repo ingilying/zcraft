@@ -136,7 +136,7 @@ impl ItemBehavior for FoodItem {
         if !player.is_survival() || player.dead {
             return ItemUseOutcome::Pass;
         }
-        let Some(props) = item_by_id(stack.item).and_then(|d| d.food) else {
+        let Some(props) = item_by_id(stack.item).and_then(|d| d.components.food) else {
             return ItemUseOutcome::Pass;
         };
         if props.always_edible || player.food < 20 {
@@ -154,7 +154,7 @@ impl ItemBehavior for FoodItem {
         if !player.is_survival() || player.dead {
             return false;
         }
-        let Some(props) = item_by_id(stack.item).and_then(|d| d.food) else {
+        let Some(props) = item_by_id(stack.item).and_then(|d| d.components.food) else {
             return false;
         };
         if !props.always_edible && player.food >= 20 {
@@ -168,9 +168,9 @@ impl ItemBehavior for FoodItem {
 static DEFAULT_ITEM: DefaultItem = DefaultItem;
 static FOOD_ITEM: FoodItem = FoodItem;
 
-/// Resolve the unified `ItemBehavior` for an item ID (data-driven via `game_data.json`).
+/// Resolve the unified `ItemBehavior` for an item ID (data-driven via `ItemComponents`).
 pub fn item_behavior(item_id: i32) -> &'static dyn ItemBehavior {
-    if item_by_id(item_id).is_some_and(|d| d.food.is_some()) {
+    if item_by_id(item_id).is_some_and(|d| d.components.food.is_some()) {
         &FOOD_ITEM
     } else {
         &DEFAULT_ITEM

@@ -12,6 +12,10 @@ struct RawGameData {
     states: Vec<BlockStateDefinition>,
     block_tags: HashMap<String, Vec<usize>>,
     items: Vec<ItemDefinition>,
+    #[serde(default)]
+    fuels: HashMap<String, u16>,
+    #[serde(default)]
+    craft_remainders: HashMap<String, String>,
 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlockDefinition {
@@ -54,6 +58,13 @@ pub struct FoodProperties {
     pub eat_ticks: u16,
 }
 
+/// Vanilla 1.21.1 default item data components (`DataComponentMap`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ItemComponents {
+    #[serde(default)]
+    pub food: Option<FoodProperties>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ItemDefinition {
     pub name: String,
@@ -63,11 +74,7 @@ pub struct ItemDefinition {
     pub tool_rules: Vec<ToolRule>,
     pub block: Option<usize>,
     #[serde(default)]
-    pub food: Option<FoodProperties>,
-    #[serde(default)]
-    pub fuel_ticks: Option<u16>,
-    #[serde(default)]
-    pub craft_remainder: Option<String>,
+    pub components: ItemComponents,
 }
 
 pub struct GameRegistry {
@@ -76,6 +83,8 @@ pub struct GameRegistry {
     item_names: HashMap<String, usize>,
     item_ids: Vec<Option<usize>>,
     state_ids: Vec<Option<(usize, usize)>>,
+    fuels: HashMap<i32, u16>,
+    craft_remainders: HashMap<i32, i32>,
 }
 impl GameRegistry {
     fn load() -> Self {
@@ -97,7 +106,7 @@ impl GameRegistry {
             .enumerate()
             .map(|(i, v)| (v.name.clone(), i))
             .collect();
-        let item_names = raw
+        let item_names: HashMap<String, usize> = raw
             .items
             .iter()
             .enumerate()
@@ -118,13 +127,37 @@ impl GameRegistry {
         }
         assert!(item_ids.iter().all(Option::is_some));
         assert!(state_ids.iter().all(Option::is_some));
+        let fuels = raw
+            .fuels
+            .iter()
+            .filter_map(|(name, &ticks)| {
+                item_names.get(name).map(|&idx| (raw.items[idx].id, ticks))
+            })
+            .collect();
+        let craft_remainders = raw
+            .craft_remainders
+            .iter()
+            .filter_map(|(name, rem_name)| {
+                let src = raw.items[*item_names.get(name)?].id;
+                let dst = raw.items[*item_names.get(rem_name)?].id;
+                Some((src, dst))
+            })
+            .collect();
         Self {
             raw,
             block_names,
             item_names,
             item_ids,
             state_ids,
+            fuels,
+            craft_remainders,
         }
+    }
+    pub fn fuel_ticks(&self, item_id: i32) -> Option<u16> {
+        self.fuels.get(&item_id).copied()
+    }
+    pub fn craft_remainder(&self, item_id: i32) -> Option<i32> {
+        self.craft_remainders.get(&item_id).copied()
     }
     pub fn blocks(&self) -> &[BlockDefinition] {
         &self.raw.blocks
