@@ -231,7 +231,7 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
                             survival_tool_damage = if is_sword { 2 } else { 1 };
                         }
                         if can_harvest {
-                            for stack in crate::game::block_drops(current) {
+                            for stack in crate::game::block_drops(current, tool_item) {
                                 survival_dig_drops.push((pos, stack));
                             }
                         }
@@ -273,7 +273,7 @@ fn interact(ctx: &mut Context<'_>, action: Action, sequence: i32) -> io::Result<
                     {
                         extra_edits.push((npos, crate::game::AIR_STATE));
                         if is_survival {
-                            for stack in crate::game::block_drops(nstate) {
+                            for stack in crate::game::block_drops(nstate, None) {
                                 survival_dig_drops.push((npos, stack));
                             }
                         }

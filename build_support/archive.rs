@@ -26,6 +26,51 @@ const REGISTRIES: [&str; 11] = [
 ];
 
 pub fn extract(jar: &Path, destination: &Path) -> io::Result<()> {
+    let bytes = read_inner_jar(jar)?;
+    extract_inner(Cursor::new(bytes), destination)
+}
+
+/// Extract all official `data/minecraft/loot_table/blocks/<name>.json` files
+/// from the pinned bundler JAR as sorted `(minecraft:<name>, raw_json_bytes)`.
+#[allow(dead_code)]
+pub fn extract_block_loot_tables(jar: &Path) -> io::Result<Vec<(String, Vec<u8>)>> {
+    let bytes = read_inner_jar(jar)?;
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(invalid)?;
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(invalid)?;
+        let Some(stem) = entry
+            .name()
+            .strip_prefix("data/minecraft/loot_table/blocks/")
+            .and_then(|rest| rest.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        if stem.is_empty()
+            || !stem
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-.".contains(&b))
+        {
+            return Err(invalid("invalid block loot table entry name"));
+        }
+        let block_name = format!("minecraft:{stem}");
+        if !entry.is_file() || entry.is_symlink() || entry.size() > MAX_JSON_BYTES {
+            return Err(invalid("invalid block loot table archive entry"));
+        }
+        let mut raw = Vec::new();
+        entry.take(MAX_JSON_BYTES + 1).read_to_end(&mut raw)?;
+        total += raw.len();
+        if raw.len() as u64 > MAX_JSON_BYTES || total > MAX_TOTAL_BYTES || out.len() >= 2048 {
+            return Err(invalid("block loot table archive data exceeds limit"));
+        }
+        out.push((block_name, raw));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+fn read_inner_jar(jar: &Path) -> io::Result<Vec<u8>> {
     let mut outer = ZipArchive::new(fs::File::open(jar)?).map_err(invalid)?;
     let inner = outer
         .by_name("META-INF/versions/1.21.1/server-1.21.1.jar")
@@ -38,7 +83,7 @@ pub fn extract(jar: &Path, destination: &Path) -> io::Result<()> {
     if bytes.len() as u64 > MAX_INNER_BYTES {
         return Err(invalid("inner server JAR exceeds limit"));
     }
-    extract_inner(Cursor::new(bytes), destination)
+    Ok(bytes)
 }
 
 fn extract_inner(reader: impl Read + Seek, destination: &Path) -> io::Result<()> {

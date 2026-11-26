@@ -113,6 +113,42 @@ fn build() -> io::Result<()> {
         cache::atomic_write(&out, source.as_bytes())?;
     }
     compress_game_data(&root, &out_dir)?;
+    build_block_loot_tables(&version_cache, &generated, &out_dir, offline)?;
+    Ok(())
+}
+
+fn build_block_loot_tables(
+    version_cache: &Path,
+    generated: &Path,
+    out_dir: &Path,
+    offline: bool,
+) -> io::Result<()> {
+    let cached = generated.join("block_loot_tables.json.zlib");
+    println!("cargo:rerun-if-changed={}", cached.display());
+    let compressed = if cached.is_file() {
+        fs::read(&cached)?
+    } else {
+        fs::create_dir_all(version_cache)?;
+        let jar = acquire_jar(version_cache, offline)?;
+        let entries = archive::extract_block_loot_tables(&jar)?;
+        let mut map = serde_json::Map::with_capacity(entries.len());
+        for (name, raw) in entries {
+            let value: serde_json::Value =
+                serde_json::from_slice(&raw).map_err(io::Error::other)?;
+            map.insert(name, value);
+        }
+        let json = serde_json::to_vec(&serde_json::Value::Object(map)).map_err(io::Error::other)?;
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&json)?;
+        let compressed = encoder.finish()?;
+        fs::create_dir_all(generated)?;
+        cache::atomic_write(&cached, &compressed)?;
+        compressed
+    };
+    let target = out_dir.join("block_loot_tables.json.zlib");
+    if fs::read(&target).ok().as_deref() != Some(compressed.as_slice()) {
+        cache::atomic_write(&target, &compressed)?;
+    }
     Ok(())
 }
 
