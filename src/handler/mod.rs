@@ -95,7 +95,69 @@ impl Dispatcher {
         ctx: &mut Context<'_>,
         packet: Serverbound,
     ) -> io::Result<Outcome> {
-        let outcome = packet.dispatch(ctx).await?;
+        // Also guards packets constructed directly rather than decoded from TCP.
+        if ctx.session.state != packet.state() {
+            return Err(invalid("packet not allowed in current session"));
+        }
+        let outcome = match packet {
+            Serverbound::Handshake(p) => handshake::handle_handshake(ctx, p).await?,
+            Serverbound::StatusRequest(p) => status::handle_status_request(ctx, p).await?,
+            Serverbound::Ping(p) => status::handle_ping(ctx, p).await?,
+            Serverbound::LoginStart(p) => login::handle_start(ctx, p).await?,
+            Serverbound::EncryptionResponse(p) => login::handle_encryption_response(ctx, p).await?,
+            Serverbound::LoginAcknowledged(p) => login::handle_acknowledged(ctx, p).await?,
+            Serverbound::ConfigurationClientInformation(p) => {
+                configuration::handle_information(ctx, p).await?
+            }
+            Serverbound::ConfigurationPluginMessage(p) => {
+                configuration::handle_plugin(ctx, p).await?
+            }
+            Serverbound::FinishConfigurationAcknowledged(p) => {
+                configuration::handle_finish(ctx, p).await?
+            }
+            Serverbound::ConfigurationKeepAliveResponse(p) => {
+                configuration::handle_keep_alive(ctx, p).await?
+            }
+            Serverbound::ResourcePackResponse(p) => {
+                configuration::handle_resource_pack(ctx, p).await?
+            }
+            Serverbound::KnownPacksResponse(p) => configuration::handle_known_packs(ctx, p).await?,
+            Serverbound::TeleportConfirm(p) => play::handle_teleport(ctx, p).await?,
+            Serverbound::ChatAcknowledgement(p) => play::ignore(ctx, p).await?,
+            Serverbound::ChatCommand(p) => play::chat::handle_command(ctx, p).await?,
+            Serverbound::SignedChatCommand(p) => play::chat::handle_signed_command(ctx, p).await?,
+            Serverbound::ChatMessage(p) => play::chat::handle_message(ctx, p).await?,
+            Serverbound::ChatSessionUpdate(p) => play::ignore(ctx, p).await?,
+            Serverbound::ChunkBatchReceived(p) => play::handle_batch(ctx, p).await?,
+            Serverbound::ClientCommand(p) => play::handle_client_command(ctx, p).await?,
+            Serverbound::PlayClientInformation(p) => play::handle_information(ctx, p).await?,
+            Serverbound::CommandCompletionRequest(p) => {
+                play::chat::handle_completion(ctx, p).await?
+            }
+            Serverbound::ConfigurationAcknowledged(p) => {
+                configuration::handle_reconfiguration_acknowledged(ctx, p).await?
+            }
+            Serverbound::InventoryClickPacket(p) => {
+                play::blocks::handle_inventory_click(ctx, p).await?
+            }
+            Serverbound::CloseWindow(p) => play::blocks::handle_close_window(ctx, p).await?,
+            Serverbound::PlayPluginMessage(p) => play::ignore(ctx, p).await?,
+            Serverbound::KeepAliveResponse(p) => play::handle_keep_alive(ctx, p).await?,
+            Serverbound::Position(p) => play::handle_position(ctx, p).await?,
+            Serverbound::PositionLook(p) => play::handle_position_look(ctx, p).await?,
+            Serverbound::Look(p) => play::handle_look(ctx, p).await?,
+            Serverbound::Flying(p) => play::handle_flying(ctx, p).await?,
+            Serverbound::Abilities(p) => play::ignore(ctx, p).await?,
+            Serverbound::PlayerDigging(p) => play::blocks::handle_dig(ctx, p).await?,
+            Serverbound::EntityAction(p) => play::handle_action(ctx, p).await?,
+            Serverbound::IgnoredAdvancementTab(p) => play::ignore(ctx, p).await?,
+            Serverbound::HeldItemSlot(p) => play::blocks::handle_slot(ctx, p).await?,
+            Serverbound::CreativeSlot(p) => play::blocks::handle_creative_slot(ctx, p).await?,
+            Serverbound::ArmAnimation(p) => play::handle_arm_animation(ctx, p).await?,
+            Serverbound::IgnoredSpectate(p) => play::ignore(ctx, p).await?,
+            Serverbound::BlockPlace(p) => play::blocks::handle_place(ctx, p).await?,
+            Serverbound::UseItem(p) => play::blocks::handle_use_item(ctx, p).await?,
+        };
         // Handlers may transition state before replying (e.g. handshake -> login).
         for reply in &outcome.replies {
             if reply.state() != ctx.session.state {

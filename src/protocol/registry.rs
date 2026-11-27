@@ -18,7 +18,6 @@ use super::{
     },
     put_varint,
 };
-use crate::handler::{Context, Outcome};
 use std::io;
 
 const fn assert_unique(entries: &[(State, i32)]) {
@@ -38,7 +37,7 @@ const fn assert_unique(entries: &[(State, i32)]) {
 }
 
 macro_rules! serverbound_packets {
-    ($( $state:ident { $( $id:literal => $variant:ident($packet:ty) => $handler:path ),* $(,)? } )*) => {
+    ($( $state:ident { $( $id:literal => $variant:ident($packet:ty) ),* $(,)? } )*) => {
         const _: () = assert_unique(&[$($( (State::$state, $id), )*)*]);
 
         #[derive(Debug, PartialEq)]
@@ -70,16 +69,6 @@ macro_rules! serverbound_packets {
             pub fn state(&self) -> State {
                 match self {
                     $($( Self::$variant(_) => State::$state, )*)*
-                }
-            }
-
-            pub(crate) async fn dispatch(self, ctx: &mut Context<'_>) -> io::Result<Outcome> {
-                // Also guards packets constructed directly rather than decoded from TCP.
-                if ctx.session.state != self.state() {
-                    return Err(invalid("packet not allowed in current session"));
-                }
-                match self {
-                    $($( Self::$variant(packet) => $handler(ctx, packet).await, )*)*
                 }
             }
         }
@@ -122,58 +111,58 @@ macro_rules! clientbound_packets {
     };
 }
 
-// Add a packet here after defining its fields/codec and typed handler.
+// Pure protocol-767 serverbound packet definitions; handler routing lives in `crate::handler`.
 serverbound_packets! {
     Handshake {
-        0x00 => Handshake(Handshake) => crate::handler::handshake::handle_handshake,
+        0x00 => Handshake(Handshake),
     }
     Status {
-        0x00 => StatusRequest(StatusRequest) => crate::handler::status::handle_status_request,
-        0x01 => Ping(Ping) => crate::handler::status::handle_ping,
+        0x00 => StatusRequest(StatusRequest),
+        0x01 => Ping(Ping),
     }
     Login {
-        0x00 => LoginStart(LoginStart) => crate::handler::login::handle_start,
-        0x01 => EncryptionResponse(EncryptionResponse) => crate::handler::login::handle_encryption_response,
-        0x03 => LoginAcknowledged(LoginAcknowledged) => crate::handler::login::handle_acknowledged,
+        0x00 => LoginStart(LoginStart),
+        0x01 => EncryptionResponse(EncryptionResponse),
+        0x03 => LoginAcknowledged(LoginAcknowledged),
     }
     Configuration {
-        0x00 => ConfigurationClientInformation(ConfigurationClientInformation) => crate::handler::configuration::handle_information,
-        0x02 => ConfigurationPluginMessage(ConfigurationPluginMessage) => crate::handler::configuration::handle_plugin,
-        0x03 => FinishConfigurationAcknowledged(FinishConfigurationAcknowledged) => crate::handler::configuration::handle_finish,
-        0x04 => ConfigurationKeepAliveResponse(ConfigurationKeepAliveResponse) => crate::handler::configuration::handle_keep_alive,
-        0x06 => ResourcePackResponse(ResourcePackResponse) => crate::handler::configuration::handle_resource_pack,
-        0x07 => KnownPacksResponse(KnownPacksResponse) => crate::handler::configuration::handle_known_packs,
+        0x00 => ConfigurationClientInformation(ConfigurationClientInformation),
+        0x02 => ConfigurationPluginMessage(ConfigurationPluginMessage),
+        0x03 => FinishConfigurationAcknowledged(FinishConfigurationAcknowledged),
+        0x04 => ConfigurationKeepAliveResponse(ConfigurationKeepAliveResponse),
+        0x06 => ResourcePackResponse(ResourcePackResponse),
+        0x07 => KnownPacksResponse(KnownPacksResponse),
     }
     Play {
-        0x00 => TeleportConfirm(TeleportConfirm) => crate::handler::play::handle_teleport,
-        0x03 => ChatAcknowledgement(ChatAcknowledgement) => crate::handler::play::ignore,
-        0x04 => ChatCommand(ChatCommand) => crate::handler::play::chat::handle_command,
-        0x05 => SignedChatCommand(SignedChatCommand) => crate::handler::play::chat::handle_signed_command,
-        0x06 => ChatMessage(ChatMessage) => crate::handler::play::chat::handle_message,
-        0x07 => ChatSessionUpdate(ChatSessionUpdate) => crate::handler::play::ignore,
-        0x08 => ChunkBatchReceived(ChunkBatchReceived) => crate::handler::play::handle_batch,
-        0x09 => ClientCommand(ClientCommand) => crate::handler::play::handle_client_command,
-        0x0a => PlayClientInformation(PlayClientInformation) => crate::handler::play::handle_information,
-        0x0b => CommandCompletionRequest(CommandCompletionRequest) => crate::handler::play::chat::handle_completion,
-        0x0c => ConfigurationAcknowledged(ConfigurationAcknowledged) => crate::handler::configuration::handle_reconfiguration_acknowledged,
-        0x0e => InventoryClickPacket(InventoryClickPacket) => crate::handler::play::blocks::handle_inventory_click,
-        0x0f => CloseWindow(CloseWindow) => crate::handler::play::blocks::handle_close_window,
-        0x12 => PlayPluginMessage(PlayPluginMessage) => crate::handler::play::ignore,
-        0x18 => KeepAliveResponse(KeepAliveResponse) => crate::handler::play::handle_keep_alive,
-        0x1a => Position(Position) => crate::handler::play::handle_position,
-        0x1b => PositionLook(PositionLook) => crate::handler::play::handle_position_look,
-        0x1c => Look(Look) => crate::handler::play::handle_look,
-        0x1d => Flying(Flying) => crate::handler::play::handle_flying,
-        0x23 => Abilities(Abilities) => crate::handler::play::ignore,
-        0x24 => PlayerDigging(PlayerDigging) => crate::handler::play::blocks::handle_dig,
-        0x25 => EntityAction(EntityAction) => crate::handler::play::handle_action,
-        0x2c => IgnoredAdvancementTab(IgnoredAdvancementTab) => crate::handler::play::ignore,
-        0x2f => HeldItemSlot(HeldItemSlot) => crate::handler::play::blocks::handle_slot,
-        0x32 => CreativeSlot(CreativeSlot) => crate::handler::play::blocks::handle_creative_slot,
-        0x36 => ArmAnimation(ArmAnimation) => crate::handler::play::handle_arm_animation,
-        0x37 => IgnoredSpectate(IgnoredSpectate) => crate::handler::play::ignore,
-        0x38 => BlockPlace(BlockPlace) => crate::handler::play::blocks::handle_place,
-        0x39 => UseItem(UseItem) => crate::handler::play::blocks::handle_use_item,
+        0x00 => TeleportConfirm(TeleportConfirm),
+        0x03 => ChatAcknowledgement(ChatAcknowledgement),
+        0x04 => ChatCommand(ChatCommand),
+        0x05 => SignedChatCommand(SignedChatCommand),
+        0x06 => ChatMessage(ChatMessage),
+        0x07 => ChatSessionUpdate(ChatSessionUpdate),
+        0x08 => ChunkBatchReceived(ChunkBatchReceived),
+        0x09 => ClientCommand(ClientCommand),
+        0x0a => PlayClientInformation(PlayClientInformation),
+        0x0b => CommandCompletionRequest(CommandCompletionRequest),
+        0x0c => ConfigurationAcknowledged(ConfigurationAcknowledged),
+        0x0e => InventoryClickPacket(InventoryClickPacket),
+        0x0f => CloseWindow(CloseWindow),
+        0x12 => PlayPluginMessage(PlayPluginMessage),
+        0x18 => KeepAliveResponse(KeepAliveResponse),
+        0x1a => Position(Position),
+        0x1b => PositionLook(PositionLook),
+        0x1c => Look(Look),
+        0x1d => Flying(Flying),
+        0x23 => Abilities(Abilities),
+        0x24 => PlayerDigging(PlayerDigging),
+        0x25 => EntityAction(EntityAction),
+        0x2c => IgnoredAdvancementTab(IgnoredAdvancementTab),
+        0x2f => HeldItemSlot(HeldItemSlot),
+        0x32 => CreativeSlot(CreativeSlot),
+        0x36 => ArmAnimation(ArmAnimation),
+        0x37 => IgnoredSpectate(IgnoredSpectate),
+        0x38 => BlockPlace(BlockPlace),
+        0x39 => UseItem(UseItem),
     }
 }
 

@@ -100,12 +100,7 @@ async fn serve_validated(
                 }
             }
             _ = world_tick.tick() => {
-                for packet in server.play.tick_world() {
-                    let _ = server.players().broadcast(&packet);
-                }
-                server.play.tick_drops(server.players());
-                server.play.tick_furnaces(server.players());
-                server.play.tick_physics(server.players());
+                server.tick();
                 ticks_since_save += 1;
                 if server.play.world().has_storage() && autosave.is_none() {
                     if ticks_since_save >= AUTOSAVE_TICKS {

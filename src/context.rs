@@ -57,6 +57,18 @@ impl ServerContext {
         })
     }
 
+    /// Advance all server-side gameplay systems by one 20 TPS tick (world clock,
+    /// weather, item drops, furnaces, block/fluid physics).
+    pub fn tick(&self) {
+        let players = self.players();
+        for packet in self.play.tick_world() {
+            let _ = players.broadcast(&packet);
+        }
+        self.play.tick_drops(players);
+        self.play.tick_furnaces(players);
+        self.play.tick_physics(players);
+    }
+
     /// Execute a trusted server command without a player connection. Permission
     /// and source are assigned by the caller, never taken from a client packet.
     pub fn execute_command(
