@@ -10,6 +10,71 @@ use std::{
 
 pub const DEFAULT_MAX_CACHED_CHUNKS: usize = 4096;
 
+/// Outcome of loading or generating a chunk outside the `ChunkStore` lock.
+#[derive(Debug)]
+pub(crate) enum LoadedChunk {
+    /// Loaded from Anvil `.mca` on disk.
+    Loaded(Arc<Chunk>),
+    /// Absent on disk (or no storage configured); freshly generated.
+    Absent(Arc<Chunk>),
+    /// Failed to load from Anvil due to corruption or I/O error; read-only fallback.
+    Failed(Arc<Chunk>),
+}
+
+/// Load a chunk from Anvil or generate it via `ChunkGenerator` **without holding any lock**.
+pub(crate) fn load_or_generate_uncached(
+    generator: &dyn ChunkGenerator,
+    storage: Option<&AnvilStorage>,
+    coords: [i32; 2],
+) -> LoadedChunk {
+    match storage {
+        Some(storage) => match storage.load_chunk(coords[0], coords[1]) {
+            Ok(Some(chunk)) => LoadedChunk::Loaded(Arc::new(chunk)),
+            Ok(None) => LoadedChunk::Absent(generator.generate_chunk(coords[0], coords[1])),
+            Err(error) => {
+                tracing::error!(
+                    cx = coords[0],
+                    cz = coords[1],
+                    %error,
+                    "failed to load Anvil chunk; using read-only fallback without overwriting disk"
+                );
+                LoadedChunk::Failed(generator.generate_chunk(coords[0], coords[1]))
+            }
+        },
+        None => LoadedChunk::Absent(generator.generate_chunk(coords[0], coords[1])),
+    }
+}
+
+/// Compute chunk lighting from a 3x3 neighborhood **without holding any lock**.
+/// Returns `(light_payload, is_default_template)`.
+pub(crate) fn compute_light_uncached(
+    generator: &dyn ChunkGenerator,
+    neighborhood: &Neighborhood,
+) -> (Arc<[u8]>, bool) {
+    let fast = generator
+        .default_chunk()
+        .zip(generator.default_light_payload());
+    let is_default = fast.is_some_and(|(tpl, _)| is_uniform_template(neighborhood, tpl));
+    let computed = chunk_light(neighborhood, fast);
+    (computed, is_default)
+}
+
+/// Encode full Chunk Data + Update Light payload **without holding any lock**.
+pub(crate) fn encode_payload_uncached(
+    generator: &dyn ChunkGenerator,
+    neighborhood: &Neighborhood,
+    light: &Arc<[u8]>,
+) -> Arc<[u8]> {
+    if let (Some(tpl), Some(default_payload)) = (
+        generator.default_chunk(),
+        generator.default_terrain_payload(),
+    ) && is_uniform_template(neighborhood, tpl)
+    {
+        return default_payload.clone();
+    }
+    neighborhood[1][1].encode_payload(light)
+}
+
 #[derive(Debug)]
 pub(crate) struct ChunkStore {
     generator: Arc<dyn ChunkGenerator>,
@@ -89,6 +154,45 @@ impl ChunkStore {
         }
     }
 
+    /// Fast-path cache lookup under a short lock (no disk I/O or generation).
+    pub(crate) fn peek_cached(&mut self, coords: [i32; 2]) -> Option<Arc<Chunk>> {
+        let chunk = self.chunks.get(&coords)?.clone();
+        self.touch(coords);
+        Some(chunk)
+    }
+
+    /// Commit a chunk loaded/generated outside the lock. If another thread
+    /// already populated `coords` in the meantime, keeps the existing
+    /// authoritative entry so concurrent edits are never clobbered.
+    pub(crate) fn commit_loaded(&mut self, coords: [i32; 2], loaded: LoadedChunk) -> Arc<Chunk> {
+        if let Some(existing) = self.chunks.get(&coords).cloned() {
+            self.touch(coords);
+            return existing;
+        }
+        let chunk = match loaded {
+            LoadedChunk::Loaded(chunk) => {
+                self.load_failed.remove(&coords);
+                chunk
+            }
+            LoadedChunk::Absent(chunk) => {
+                self.load_failed.remove(&coords);
+                if self.storage.is_some() {
+                    self.mark_chunk_dirty(coords);
+                }
+                chunk
+            }
+            LoadedChunk::Failed(chunk) => {
+                self.load_failed.insert(coords);
+                self.dirty.remove(&coords);
+                chunk
+            }
+        };
+        self.chunks.insert(coords, chunk.clone());
+        self.touch(coords);
+        self.evict_if_needed();
+        chunk
+    }
+
     /// Return the chunk at `coords`, lazily loading from Anvil `.mca` on first
     /// access or generating via `ChunkGenerator` if absent on disk.
     ///
@@ -96,54 +200,42 @@ impl ChunkStore {
     /// from an in-memory fallback and quarantined in `load_failed` so it will
     /// never be marked dirty or overwrite the existing on-disk region data.
     pub(crate) fn get_or_load(&mut self, coords: [i32; 2]) -> Arc<Chunk> {
-        if let Some(chunk) = self.chunks.get(&coords).cloned() {
-            self.touch(coords);
+        if let Some(chunk) = self.peek_cached(coords) {
             return chunk;
         }
-        enum LoadOutcome {
-            Loaded(Arc<Chunk>),
-            Absent,
-            Failed,
+        let loaded = load_or_generate_uncached(&*self.generator, self.storage.as_ref(), coords);
+        self.commit_loaded(coords, loaded)
+    }
+
+    /// Return cached light for `coords` without computing it.
+    pub(crate) fn peek_light(&self, coords: [i32; 2]) -> Option<Arc<[u8]>> {
+        self.light_cache.get(&coords).cloned()
+    }
+
+    /// Commit light computed outside the lock if the 3x3 neighborhood around
+    /// `coords` has not been mutated since the snapshot was taken.
+    pub(crate) fn commit_light_if_unchanged(
+        &mut self,
+        coords: [i32; 2],
+        neighborhood: &Neighborhood,
+        light: Arc<[u8]>,
+        is_default: bool,
+    ) -> Arc<[u8]> {
+        if let Some(cached) = self.light_cache.get(&coords) {
+            return cached.clone();
         }
-        let outcome = match self.storage.as_ref() {
-            Some(storage) => match storage.load_chunk(coords[0], coords[1]) {
-                Ok(Some(chunk)) => LoadOutcome::Loaded(Arc::new(chunk)),
-                Ok(None) => LoadOutcome::Absent,
-                Err(error) => {
-                    tracing::error!(
-                        cx = coords[0],
-                        cz = coords[1],
-                        %error,
-                        "failed to load Anvil chunk; using read-only fallback without overwriting disk"
-                    );
-                    LoadOutcome::Failed
-                }
-            },
-            None => LoadOutcome::Absent,
-        };
-        let chunk = match outcome {
-            LoadOutcome::Loaded(chunk) => {
-                self.load_failed.remove(&coords);
-                chunk
-            }
-            LoadOutcome::Absent => {
-                self.load_failed.remove(&coords);
-                let chunk = self.generator.generate_chunk(coords[0], coords[1]);
-                if self.storage.is_some() {
-                    self.mark_chunk_dirty(coords);
-                }
-                chunk
-            }
-            LoadOutcome::Failed => {
-                self.load_failed.insert(coords);
-                self.dirty.remove(&coords);
-                self.generator.generate_chunk(coords[0], coords[1])
-            }
-        };
-        self.chunks.insert(coords, chunk.clone());
-        self.touch(coords);
-        self.evict_if_needed();
-        chunk
+        let unchanged = (0..3).all(|dz| {
+            (0..3).all(|dx| {
+                let nc = [coords[0] + dx as i32 - 1, coords[1] + dz as i32 - 1];
+                self.chunks
+                    .get(&nc)
+                    .is_some_and(|cur| Arc::ptr_eq(cur, &neighborhood[dz][dx]))
+            })
+        });
+        if unchanged && !is_default {
+            self.light_cache.insert(coords, light.clone());
+        }
+        light
     }
 
     pub(crate) fn neighborhood(&mut self, [cx, cz]: [i32; 2]) -> Neighborhood {
@@ -171,19 +263,6 @@ impl ChunkStore {
             self.light_cache.insert(coords, computed.clone());
         }
         computed
-    }
-
-    /// Encode full Chunk Data + Update Light payload, using the zero-copy
-    /// generator template when the 3x3 neighborhood is untouched.
-    pub(crate) fn payload_for(&self, neighborhood: &Neighborhood, light: &Arc<[u8]>) -> Arc<[u8]> {
-        if let (Some(tpl), Some(default_payload)) = (
-            self.generator.default_chunk(),
-            self.generator.default_terrain_payload(),
-        ) && is_uniform_template(neighborhood, tpl)
-        {
-            return default_payload.clone();
-        }
-        neighborhood[1][1].encode_payload(light)
     }
 
     /// Return currently cached light if present, otherwise compute without mutating cache.

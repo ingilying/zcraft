@@ -239,10 +239,82 @@ impl World {
     }
 
     pub fn block_at(&self, pos: BlockPos) -> i32 {
+        let chunk = self.ensure_chunk(pos.chunk());
+        let (lx, y, lz) = pos.local();
+        chunk.get_block(lx, y, lz)
+    }
+
+    /// Return `coords` from cache under a short lock, or load/generate it
+    /// **outside** the store lock and commit with compare-and-insert.
+    fn ensure_chunk(&self, coords: [i32; 2]) -> Arc<Chunk> {
+        {
+            let mut store = self.store.lock().expect("chunk store poisoned");
+            if let Some(chunk) = store.peek_cached(coords) {
+                return chunk;
+            }
+        }
+        let loaded = super::store::load_or_generate_uncached(
+            &*self.generator,
+            self.storage.as_ref(),
+            coords,
+        );
         self.store
             .lock()
             .expect("chunk store poisoned")
-            .get_block(pos)
+            .commit_loaded(coords, loaded)
+    }
+
+    /// Ensure all 9 chunks in the 3x3 neighborhood of `center` are loaded,
+    /// performing all disk I/O and terrain generation outside the store lock.
+    fn ensure_neighborhood(&self, [cx, cz]: [i32; 2]) -> (super::Neighborhood, Option<Arc<[u8]>>) {
+        let mut slots: [[Option<Arc<Chunk>>; 3]; 3] = Default::default();
+        let mut missing = Vec::new();
+        let cached_light;
+        {
+            let mut store = self.store.lock().expect("chunk store poisoned");
+            for (dz, row) in slots.iter_mut().enumerate() {
+                for (dx, slot) in row.iter_mut().enumerate() {
+                    let coords = [cx + dx as i32 - 1, cz + dz as i32 - 1];
+                    if let Some(chunk) = store.peek_cached(coords) {
+                        *slot = Some(chunk);
+                    } else {
+                        missing.push((dx, dz, coords));
+                    }
+                }
+            }
+            cached_light = store.peek_light([cx, cz]);
+        }
+
+        if missing.is_empty() {
+            let neighborhood =
+                std::array::from_fn(|dz| std::array::from_fn(|dx| slots[dz][dx].take().unwrap()));
+            return (neighborhood, cached_light);
+        }
+
+        // Load / generate missing chunks outside the world lock.
+        let loaded: Vec<_> = missing
+            .into_iter()
+            .map(|(dx, dz, coords)| {
+                let chunk = super::store::load_or_generate_uncached(
+                    &*self.generator,
+                    self.storage.as_ref(),
+                    coords,
+                );
+                (dx, dz, coords, chunk)
+            })
+            .collect();
+
+        let cached_light = {
+            let mut store = self.store.lock().expect("chunk store poisoned");
+            for (dx, dz, coords, chunk) in loaded {
+                slots[dz][dx] = Some(store.commit_loaded(coords, chunk));
+            }
+            store.peek_light([cx, cz])
+        };
+
+        let neighborhood =
+            std::array::from_fn(|dz| std::array::from_fn(|dx| slots[dz][dx].take().unwrap()));
+        (neighborhood, cached_light)
     }
 
     pub fn chest_items(
@@ -379,13 +451,24 @@ impl World {
         }
     }
 
-    /// Prepare a chunk payload and light snapshot using the lazy chunk store
-    /// and per-chunk light cache.
+    /// Prepare a chunk payload and light snapshot using a short-lock query ->
+    /// off-lock load/generate/light/encode -> short-lock commit pipeline so
+    /// slow chunk I/O or lighting never serializes other players' world access.
     pub(crate) fn prepare_chunk(&self, chunk: [i32; 2]) -> PreparedChunk {
-        let mut store = self.store.lock().expect("chunk store poisoned");
-        let neighborhood = store.neighborhood(chunk);
-        let light = store.light_for(chunk, &neighborhood);
-        let payload = store.payload_for(&neighborhood, &light);
+        let (neighborhood, cached_light) = self.ensure_neighborhood(chunk);
+        let light = match cached_light {
+            Some(light) => light,
+            None => {
+                let (computed, is_default) =
+                    super::store::compute_light_uncached(&*self.generator, &neighborhood);
+                self.store
+                    .lock()
+                    .expect("chunk store poisoned")
+                    .commit_light_if_unchanged(chunk, &neighborhood, computed, is_default)
+            }
+        };
+        let payload =
+            super::store::encode_payload_uncached(&*self.generator, &neighborhood, &light);
         PreparedChunk {
             snapshot: neighborhood[1][1].clone(),
             light,
@@ -394,8 +477,9 @@ impl World {
     }
 
     /// Reconcile block and light changes that occurred between `prepare_chunk`
-    /// and finishing the socket write. Runs `on_reconciled` under the world lock
-    /// so no concurrent write can slip between reconciliation and subscription.
+    /// and finishing the socket write. Pre-warms the neighborhood and light
+    /// outside the lock, then runs `on_reconciled` under a short world lock so
+    /// no concurrent write can slip between reconciliation and subscription.
     pub(crate) fn reconcile_and_subscribe<R>(
         &self,
         chunk: [i32; 2],
@@ -403,6 +487,16 @@ impl World {
         old_light: &Arc<[u8]>,
         on_reconciled: impl FnOnce(Vec<(BlockPos, i32)>, Option<Arc<[u8]>>) -> io::Result<R>,
     ) -> io::Result<R> {
+        let (neighborhood, cached_light) = self.ensure_neighborhood(chunk);
+        if cached_light.is_none() {
+            let (computed, is_default) =
+                super::store::compute_light_uncached(&*self.generator, &neighborhood);
+            let _ = self
+                .store
+                .lock()
+                .expect("chunk store poisoned")
+                .commit_light_if_unchanged(chunk, &neighborhood, computed, is_default);
+        }
         let mut store = self.store.lock().expect("chunk store poisoned");
         let neighborhood = store.neighborhood(chunk);
         let current = &neighborhood[1][1];
@@ -579,5 +673,76 @@ impl World {
             .lock()
             .expect("world clock poisoned")
             .initial_state()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[derive(Debug)]
+    struct BlockingGenerator {
+        inner: FlatGenerator,
+        slow_chunk: [i32; 2],
+        entered: Mutex<Option<mpsc::Sender<()>>>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl ChunkGenerator for BlockingGenerator {
+        fn generate_chunk(&self, cx: i32, cz: i32) -> Arc<Chunk> {
+            if [cx, cz] == self.slow_chunk {
+                if let Some(tx) = self.entered.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                let _ = self.release.lock().unwrap().recv();
+            }
+            self.inner.generate_chunk(cx, cz)
+        }
+
+        fn spawn_position(&self) -> [f64; 3] {
+            self.inner.spawn_position()
+        }
+    }
+
+    #[test]
+    fn prepare_chunk_does_not_hold_world_lock_during_chunk_generation() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let generator = Arc::new(BlockingGenerator {
+            inner: FlatGenerator::default(),
+            slow_chunk: [10, 10],
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(release_rx),
+        });
+        let world = Arc::new(World::with_generator(generator));
+
+        // Pre-warm [0, 0] and its neighborhood before starting the slow request.
+        let _ = world.prepare_chunk([0, 0]);
+
+        let slow_world = world.clone();
+        let slow_thread = std::thread::spawn(move || slow_world.prepare_chunk([10, 10]));
+
+        // Wait until the slow thread is blocked inside `generate_chunk([10, 10])`.
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("slow generator should start");
+
+        // While [10, 10] is generating off-lock, other world reads & writes on [0, 0]
+        // must proceed immediately without deadlocking or blocking.
+        assert!(
+            world
+                .set_block(BlockPos([1, 64, 1]), crate::game::GLASS_STATE)
+                .is_some()
+        );
+        assert_eq!(
+            world.block_at(BlockPos([1, 64, 1])),
+            crate::game::GLASS_STATE
+        );
+
+        // Release the slow generator and confirm `prepare_chunk([10, 10])` finishes.
+        release_tx.send(()).unwrap();
+        let prepared = slow_thread.join().unwrap();
+        assert!(!prepared.payload.is_empty());
     }
 }
