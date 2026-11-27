@@ -113,7 +113,10 @@ async fn anvil_superflat_world_survives_restart_via_save_all() {
 
     // Reopen world WITHOUT passing `flat` in config; level.dat must restore everything!
     let reopened = World::open(&world_dir, None).unwrap();
-    assert_eq!(reopened.flat_config(), Some(&custom_flat));
+    assert_eq!(
+        reopened.generator_spec(),
+        Some(zcraft::world::GeneratorSpec::flat(&custom_flat))
+    );
     assert_eq!(reopened.block_at(pos_a), stairs);
     assert_eq!(reopened.block_at(pos_b), zcraft::game::GLASS_STATE);
     assert_eq!(reopened.block_at(pos_break), zcraft::game::AIR_STATE);
@@ -376,7 +379,10 @@ async fn overworld_seed_and_edits_persist_via_anvil_level_dat() {
     assert!(world_dir.join("level.dat").exists());
     assert!(world_dir.join("region/r.0.0.mca").exists());
     let world = server.play.world();
-    assert_eq!(world.overworld_seed(), Some(2026));
+    assert_eq!(
+        world.generator_spec(),
+        Some(zcraft::world::GeneratorSpec::overworld(2026))
+    );
     assert_eq!(
         world.block_at(BlockPos([0, -64, 0])),
         zcraft::game::BEDROCK_STATE
@@ -396,7 +402,10 @@ async fn overworld_seed_and_edits_persist_via_anvil_level_dat() {
 
     // Reopen WITHOUT passing world_type or seed: level.dat must restore Overworld(2026).
     let reopened = World::open(&world_dir, None).unwrap();
-    assert_eq!(reopened.overworld_seed(), Some(2026));
+    assert_eq!(
+        reopened.generator_spec(),
+        Some(zcraft::world::GeneratorSpec::overworld(2026))
+    );
     assert_eq!(reopened.block_at(sample_pos), natural_state);
     assert_eq!(reopened.block_at(edit_pos), zcraft::game::GLASS_STATE);
 }

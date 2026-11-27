@@ -39,18 +39,11 @@ const REGION_CHUNKS: usize = 1024;
 const HEADER_BYTES: usize = SECTOR_BYTES * 2;
 const LOWEST_SECTION_Y: i32 = MIN_Y / 16; // -4
 
-/// Generator descriptor parsed from `level.dat`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LoadedGenerator {
-    Flat(FlatGeneratorConfig),
-    Overworld { seed: i64 },
-}
-
 /// Loaded `level.dat` snapshot.
 #[derive(Debug, Clone)]
 pub struct LoadedLevel {
     pub clock: PersistedClock,
-    pub generator: Option<LoadedGenerator>,
+    pub generator: Option<super::GeneratorSpec>,
     pub spawn: Option<[f64; 3]>,
 }
 
@@ -158,8 +151,7 @@ impl AnvilStorage {
     pub fn save_level(
         &self,
         clock: PersistedClock,
-        flat: Option<&FlatGeneratorConfig>,
-        overworld_seed: Option<i64>,
+        generator: Option<&super::GeneratorSpec>,
         spawn: [f64; 3],
     ) -> io::Result<()> {
         let level_name = self
@@ -220,31 +212,49 @@ impl AnvilStorage {
         data.insert("LastPlayed".into(), Tag::Long(now_ms));
         data.insert("initialized".into(), Tag::Byte(1));
 
-        let gen_compound = if let Some(flat_cfg) = flat {
-            let mut layers = Vec::with_capacity(flat_cfg.layers.len());
-            for layer in &flat_cfg.layers {
-                let mut lc = Compound::new();
-                lc.insert("block".into(), Tag::String(layer.block.clone()));
-                lc.insert("height".into(), Tag::Int(i32::from(layer.height)));
-                layers.push(Tag::Compound(lc));
-            }
-            let mut settings = Compound::new();
-            settings.insert("biome".into(), Tag::String(flat_cfg.biome.clone()));
-            settings.insert("layers".into(), Tag::List(layers));
-            settings.insert("zcraft_base_y".into(), Tag::Int(flat_cfg.base_y));
+        let gen_compound = generator.map(|spec| {
+            if spec.id == "minecraft:flat"
+                && let Ok(flat_cfg) =
+                    serde_json::from_value::<FlatGeneratorConfig>(spec.settings.clone())
+            {
+                let mut layers = Vec::with_capacity(flat_cfg.layers.len());
+                for layer in &flat_cfg.layers {
+                    let mut lc = Compound::new();
+                    lc.insert("block".into(), Tag::String(layer.block.clone()));
+                    lc.insert("height".into(), Tag::Int(i32::from(layer.height)));
+                    layers.push(Tag::Compound(lc));
+                }
+                let mut settings = Compound::new();
+                settings.insert("biome".into(), Tag::String(flat_cfg.biome.clone()));
+                settings.insert("layers".into(), Tag::List(layers));
+                settings.insert("zcraft_base_y".into(), Tag::Int(flat_cfg.base_y));
 
-            let mut gc = Compound::new();
-            gc.insert("type".into(), Tag::String("minecraft:flat".into()));
-            gc.insert("settings".into(), Tag::Compound(settings));
-            Some((0i64, gc))
-        } else if let Some(seed) = overworld_seed {
-            let mut gc = Compound::new();
-            gc.insert("type".into(), Tag::String("minecraft:noise".into()));
-            gc.insert("settings".into(), Tag::String("minecraft:overworld".into()));
-            Some((seed, gc))
-        } else {
-            None
-        };
+                let mut gc = Compound::new();
+                gc.insert("type".into(), Tag::String("minecraft:flat".into()));
+                gc.insert("settings".into(), Tag::Compound(settings));
+                (spec.seed, gc)
+            } else if spec.id == "minecraft:noise" {
+                let mut gc = Compound::new();
+                gc.insert("type".into(), Tag::String("minecraft:noise".into()));
+                let preset = spec
+                    .settings
+                    .as_str()
+                    .unwrap_or("minecraft:overworld")
+                    .to_string();
+                gc.insert("settings".into(), Tag::String(preset));
+                (spec.seed, gc)
+            } else {
+                let mut gc = Compound::new();
+                gc.insert("type".into(), Tag::String(spec.id.clone()));
+                if !spec.settings.is_null() {
+                    gc.insert(
+                        "zcraft_settings".into(),
+                        Tag::String(spec.settings.to_string()),
+                    );
+                }
+                (spec.seed, gc)
+            }
+        });
 
         if let Some((seed, gen_compound)) = gen_compound {
             let mut overworld = Compound::new();
@@ -539,7 +549,7 @@ fn internal_to_vanilla_slot(slot: usize) -> Option<i8> {
     }
 }
 
-fn parse_generator_settings(data: &Compound) -> Option<LoadedGenerator> {
+fn parse_generator_settings(data: &Compound) -> Option<super::GeneratorSpec> {
     let world_gen = data.get("WorldGenSettings")?.as_compound()?;
     let seed = world_gen.get("seed").and_then(Tag::as_long).unwrap_or(0);
     let generator = world_gen
@@ -550,7 +560,7 @@ fn parse_generator_settings(data: &Compound) -> Option<LoadedGenerator> {
         .get("generator")?
         .as_compound()?;
     match generator.get("type")?.as_str()? {
-        "minecraft:noise" => Some(LoadedGenerator::Overworld { seed }),
+        "minecraft:noise" => Some(super::GeneratorSpec::overworld(seed)),
         "minecraft:flat" => {
             let settings = generator.get("settings")?.as_compound()?;
             let biome = settings
@@ -576,9 +586,20 @@ fn parse_generator_settings(data: &Compound) -> Option<LoadedGenerator> {
                 layers,
             };
             cfg.validate().ok()?;
-            Some(LoadedGenerator::Flat(cfg))
+            Some(super::GeneratorSpec::flat(&cfg))
         }
-        _ => None,
+        other => {
+            let settings = generator
+                .get("zcraft_settings")
+                .and_then(Tag::as_str)
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or(serde_json::Value::Null);
+            Some(super::GeneratorSpec {
+                id: other.to_string(),
+                seed,
+                settings,
+            })
+        }
     }
 }
 
@@ -1141,15 +1162,13 @@ mod tests {
             thundering: false,
             thunder_time: 9_000,
         };
+        let spec = crate::world::GeneratorSpec::flat(generator.config());
         storage
-            .save_level(clock, Some(generator.config()), None, [8.5, 65.0, 8.5])
+            .save_level(clock, Some(&spec), [8.5, 65.0, 8.5])
             .unwrap();
         let loaded_level = storage.load_level().unwrap().unwrap();
         assert_eq!(loaded_level.clock, clock);
-        assert_eq!(
-            loaded_level.generator,
-            Some(LoadedGenerator::Flat(generator.config().clone()))
-        );
+        assert_eq!(loaded_level.generator, Some(spec));
 
         // 2. Lazy single-chunk load/save across regions with block state properties & biomes
         let mut c0 = (*generator.generate_chunk(0, 0)).clone();

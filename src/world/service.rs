@@ -99,53 +99,45 @@ impl World {
         seed: Option<i64>,
         flat_config: Option<FlatGeneratorConfig>,
     ) -> io::Result<Self> {
+        let default_spec = match world_type {
+            crate::config::WorldType::Overworld => {
+                super::GeneratorSpec::overworld(seed.unwrap_or_else(rand::random))
+            }
+            crate::config::WorldType::Flat => {
+                super::GeneratorSpec::flat(&flat_config.unwrap_or_default())
+            }
+        };
+        Self::open_with_registry(dir, default_spec, &super::GeneratorRegistry::default())
+    }
+
+    /// Open (or initialize) a persisted Anvil world using a generic `GeneratorSpec`
+    /// and `GeneratorRegistry`, allowing custom generators to persist and reload
+    /// without modifying `World` or `AnvilStorage`.
+    pub fn open_with_registry(
+        dir: impl AsRef<Path>,
+        default_spec: super::GeneratorSpec,
+        registry: &super::GeneratorRegistry,
+    ) -> io::Result<Self> {
         let world_dir = dir.as_ref();
         let storage = AnvilStorage::new(world_dir);
         let loaded = storage.load_level()?;
 
-        let generator: Arc<dyn ChunkGenerator> =
-            match loaded.as_ref().and_then(|l| l.generator.clone()) {
-                Some(super::LoadedGenerator::Overworld { seed }) => {
-                    tracing::info!(
-                        world = %world_dir.display(),
-                        world_type = "overworld",
-                        seed,
-                        "Preparing level"
-                    );
-                    Arc::new(super::OverworldGenerator::new(seed))
-                }
-                Some(super::LoadedGenerator::Flat(cfg)) => {
-                    tracing::info!(
-                        world = %world_dir.display(),
-                        world_type = "flat",
-                        biome = %cfg.biome,
-                        "Preparing level"
-                    );
-                    Arc::new(FlatGenerator::from_config(cfg)?)
-                }
-                None => match world_type {
-                    crate::config::WorldType::Overworld => {
-                        let seed = seed.unwrap_or_else(rand::random);
-                        tracing::info!(
-                            world = %world_dir.display(),
-                            world_type = "overworld",
-                            seed,
-                            "Generating new level"
-                        );
-                        Arc::new(super::OverworldGenerator::new(seed))
-                    }
-                    crate::config::WorldType::Flat => {
-                        let cfg = flat_config.unwrap_or_default();
-                        tracing::info!(
-                            world = %world_dir.display(),
-                            world_type = "flat",
-                            biome = %cfg.biome,
-                            "Generating new level"
-                        );
-                        Arc::new(FlatGenerator::from_config(cfg)?)
-                    }
-                },
-            };
+        let spec = loaded
+            .as_ref()
+            .and_then(|l| l.generator.clone())
+            .unwrap_or(default_spec);
+        let action = if loaded.is_some() {
+            "Preparing level"
+        } else {
+            "Generating new level"
+        };
+        tracing::info!(
+            world = %world_dir.display(),
+            generator = %spec.id,
+            seed = spec.seed,
+            "{action}"
+        );
+        let generator = registry.build(&spec)?;
         let spawn = loaded
             .as_ref()
             .and_then(|l| l.spawn)
@@ -218,12 +210,12 @@ impl World {
         &self.generator
     }
 
-    pub fn flat_config(&self) -> Option<&FlatGeneratorConfig> {
-        self.generator.flat_config()
+    pub fn generator_spec(&self) -> Option<super::GeneratorSpec> {
+        self.generator.descriptor()
     }
 
-    pub fn overworld_seed(&self) -> Option<i64> {
-        self.generator.overworld_seed()
+    pub fn is_flat(&self) -> bool {
+        self.generator.is_flat()
     }
 
     /// Placeholder terrain buffer used by `ChunkStream::pump` before
@@ -491,13 +483,9 @@ impl World {
             .drain_dirty();
         let dirty_coords: Vec<[i32; 2]> = dirty.iter().map(|(c, _)| *c).collect();
 
+        let gen_spec = self.generator.descriptor();
         let write_result = (|| -> io::Result<usize> {
-            storage.save_level(
-                clock_state,
-                self.generator.flat_config(),
-                self.generator.overworld_seed(),
-                self.spawn,
-            )?;
+            storage.save_level(clock_state, gen_spec.as_ref(), self.spawn)?;
             storage.save_chunks(&dirty)
         })();
 
@@ -865,6 +853,71 @@ mod tests {
         assert_eq!(
             world.block_at(BlockPos([2, 64, 2])),
             crate::game::GLASS_STATE
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_third_generator_persists_and_reloads_via_registry() {
+        #[derive(Debug)]
+        struct StonePlatformGenerator {
+            seed: i64,
+            y: i32,
+        }
+        impl ChunkGenerator for StonePlatformGenerator {
+            fn generate_chunk(&self, _cx: i32, _cz: i32) -> Arc<Chunk> {
+                let mut chunk = Chunk::empty(0);
+                for z in 0..16 {
+                    for x in 0..16 {
+                        chunk.set_block(x, self.y, z, crate::game::STONE_STATE);
+                    }
+                }
+                Arc::new(chunk)
+            }
+            fn spawn_position(&self) -> [f64; 3] {
+                [0.5, f64::from(self.y + 1), 0.5]
+            }
+            fn descriptor(&self) -> Option<crate::world::GeneratorSpec> {
+                Some(crate::world::GeneratorSpec {
+                    id: "zcraft:stone_platform".into(),
+                    seed: self.seed,
+                    settings: serde_json::json!({ "y": self.y }),
+                })
+            }
+        }
+
+        let mut reg = crate::world::GeneratorRegistry::with_builtins();
+        reg.register("zcraft:stone_platform", |spec| {
+            let y = spec
+                .settings
+                .get("y")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(64) as i32;
+            Ok(Arc::new(StonePlatformGenerator { seed: spec.seed, y }))
+        });
+
+        let dir = std::env::temp_dir().join(format!("zcraft-custom-gen-{}", rand::random::<u64>()));
+        let spec = crate::world::GeneratorSpec {
+            id: "zcraft:stone_platform".into(),
+            seed: 42,
+            settings: serde_json::json!({ "y": 72 }),
+        };
+        {
+            let world = World::open_with_registry(&dir, spec.clone(), &reg).unwrap();
+            assert_eq!(
+                world.block_at(BlockPos([3, 72, 3])),
+                crate::game::STONE_STATE
+            );
+            assert!(!world.is_flat());
+            world.save_all().unwrap();
+        }
+        // Reopen with a different fallback spec; level.dat must restore the custom generator.
+        let fallback = crate::world::GeneratorSpec::flat(&FlatGeneratorConfig::default());
+        let reopened = World::open_with_registry(&dir, fallback, &reg).unwrap();
+        assert_eq!(reopened.generator_spec(), Some(spec));
+        assert_eq!(
+            reopened.block_at(BlockPos([50, 72, 50])),
+            crate::game::STONE_STATE
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

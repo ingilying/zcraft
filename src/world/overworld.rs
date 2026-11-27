@@ -499,8 +499,8 @@ impl ChunkGenerator for OverworldGenerator {
         self.spawn_position
     }
 
-    fn overworld_seed(&self) -> Option<i64> {
-        Some(self.seed)
+    fn descriptor(&self) -> Option<super::GeneratorSpec> {
+        Some(super::GeneratorSpec::overworld(self.seed))
     }
 }
 

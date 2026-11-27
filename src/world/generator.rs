@@ -4,7 +4,93 @@ use super::{
     SECTION_COUNT, put_bitset, put_varint,
 };
 use serde::{Deserialize, Serialize};
-use std::{fmt, io, sync::Arc};
+use std::{collections::HashMap, fmt, io, sync::Arc};
+
+/// Generic, serializable description of a `ChunkGenerator` instance used to
+/// persist and restore generators via `level.dat` and `GeneratorRegistry`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneratorSpec {
+    /// Canonical generator identifier (e.g. `"minecraft:flat"`, `"minecraft:noise"`).
+    pub id: String,
+    /// World seed (`0` for seedless generators such as Superflat).
+    pub seed: i64,
+    /// Generator-specific settings payload (serialized as JSON).
+    pub settings: serde_json::Value,
+}
+
+impl GeneratorSpec {
+    pub fn flat(config: &FlatGeneratorConfig) -> Self {
+        Self {
+            id: "minecraft:flat".into(),
+            seed: 0,
+            settings: serde_json::to_value(config).expect("FlatGeneratorConfig is serializable"),
+        }
+    }
+
+    pub fn overworld(seed: i64) -> Self {
+        Self {
+            id: "minecraft:noise".into(),
+            seed,
+            settings: serde_json::Value::String("minecraft:overworld".into()),
+        }
+    }
+}
+
+type GeneratorFactory =
+    Arc<dyn Fn(&GeneratorSpec) -> io::Result<Arc<dyn ChunkGenerator>> + Send + Sync>;
+
+/// Registry mapping canonical generator IDs to factory constructors.
+pub struct GeneratorRegistry {
+    factories: HashMap<String, GeneratorFactory>,
+}
+
+impl Default for GeneratorRegistry {
+    fn default() -> Self {
+        Self::with_builtins()
+    }
+}
+
+impl GeneratorRegistry {
+    pub fn with_builtins() -> Self {
+        let mut reg = Self {
+            factories: HashMap::new(),
+        };
+        reg.register("minecraft:flat", |spec| {
+            let cfg: FlatGeneratorConfig = if spec.settings.is_null() {
+                FlatGeneratorConfig::default()
+            } else {
+                serde_json::from_value(spec.settings.clone()).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid flat generator settings: {e}"),
+                    )
+                })?
+            };
+            Ok(Arc::new(FlatGenerator::from_config(cfg)?))
+        });
+        reg.register("minecraft:noise", |spec| {
+            Ok(Arc::new(super::OverworldGenerator::new(spec.seed)))
+        });
+        reg
+    }
+
+    pub fn register<F>(&mut self, id: impl Into<String>, factory: F)
+    where
+        F: Fn(&GeneratorSpec) -> io::Result<Arc<dyn ChunkGenerator>> + Send + Sync + 'static,
+    {
+        self.factories.insert(id.into(), Arc::new(factory));
+    }
+
+    pub fn build(&self, spec: &GeneratorSpec) -> io::Result<Arc<dyn ChunkGenerator>> {
+        let factory = self.factories.get(&spec.id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown world generator '{}'", spec.id),
+            )
+        })?;
+        factory(spec)
+    }
+}
 
 /// Pluggable terrain generator producing section-based `Chunk`s.
 pub trait ChunkGenerator: Send + Sync + fmt::Debug {
@@ -29,14 +115,14 @@ pub trait ChunkGenerator: Send + Sync + fmt::Debug {
         None
     }
 
-    /// Optional Superflat config for `level.dat` serialization.
-    fn flat_config(&self) -> Option<&FlatGeneratorConfig> {
+    /// Generic serializable descriptor for `level.dat` persistence and reload.
+    fn descriptor(&self) -> Option<GeneratorSpec> {
         None
     }
 
-    /// Optional Overworld noise seed for `level.dat` serialization.
-    fn overworld_seed(&self) -> Option<i64> {
-        None
+    /// True if the client should render a Superflat horizon (`is_flat` in `JoinGame`/`Respawn`).
+    fn is_flat(&self) -> bool {
+        false
     }
 }
 
@@ -265,8 +351,12 @@ impl ChunkGenerator for FlatGenerator {
         Some(&self.light_payload)
     }
 
-    fn flat_config(&self) -> Option<&FlatGeneratorConfig> {
-        Some(&self.config)
+    fn descriptor(&self) -> Option<GeneratorSpec> {
+        Some(GeneratorSpec::flat(&self.config))
+    }
+
+    fn is_flat(&self) -> bool {
+        true
     }
 }
 

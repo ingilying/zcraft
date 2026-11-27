@@ -137,7 +137,7 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         game_mode = ?game_mode,
         "joined the game"
     );
-    let is_flat = world.flat_config().is_some();
+    let is_flat = world.is_flat();
     let max_players = ctx.server.players().max_players() as i32;
     let mut replies = vec![
         JoinGame {
@@ -731,7 +731,7 @@ pub async fn handle_client_command(
     }
     let world = ctx.server.play.world().clone();
     let world_spawn = world.spawn_position();
-    let is_flat = world.flat_config().is_some();
+    let is_flat = world.is_flat();
     let view_distance = ctx
         .server
         .play
