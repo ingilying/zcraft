@@ -40,7 +40,7 @@ pub use clock::{
 pub use generator::{ChunkGenerator, FlatGenerator, FlatGeneratorConfig, FlatLayerConfig};
 pub(crate) use light::{Neighborhood, affected_light_chunks, chunk_light, is_uniform_template};
 pub use overworld::{OverworldGenerator, SEA_LEVEL};
-pub use service::{SaveSummary, World, WorldMutation};
+pub use service::{DIRTY_FLUSH_BATCH_SIZE, SaveSummary, World, WorldMutation};
 pub(crate) use store::ChunkStore;
 
 use std::io;

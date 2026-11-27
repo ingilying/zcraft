@@ -22,6 +22,8 @@ pub struct WorldMutation {
     pub light_changes: Vec<([i32; 2], Arc<[u8]>)>,
 }
 
+pub const DIRTY_FLUSH_BATCH_SIZE: usize = 256;
+
 /// Summary of a world persistence flush (`save_all`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaveSummary {
@@ -238,6 +240,79 @@ impl World {
         self.storage.is_some()
     }
 
+    /// True when dirty chunks have reached the incremental writeback threshold.
+    pub fn needs_dirty_flush(&self) -> bool {
+        self.store
+            .lock()
+            .expect("chunk store poisoned")
+            .needs_dirty_flush()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_chunk_len(&self) -> usize {
+        self.store
+            .lock()
+            .expect("chunk store poisoned")
+            .cached_len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dirty_chunk_len(&self) -> usize {
+        self.store.lock().expect("chunk store poisoned").dirty_len()
+    }
+
+    /// Incrementally flush up to `max_chunks` oldest dirty chunks to Anvil `.mca`
+    /// and immediately evict newly-clean entries if cache is above capacity.
+    pub fn flush_dirty_batch(&self, max_chunks: usize) -> io::Result<usize> {
+        let Some(storage) = &self.storage else {
+            return Ok(0);
+        };
+        if max_chunks == 0 {
+            return Ok(0);
+        }
+        let _save_guard = self.save_lock.lock().expect("world save lock poisoned");
+        let batch = self
+            .store
+            .lock()
+            .expect("chunk store poisoned")
+            .take_oldest_dirty(max_chunks);
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let batch_coords: Vec<[i32; 2]> = batch.iter().map(|(c, _)| *c).collect();
+        match storage.save_chunks(&batch) {
+            Ok(saved) => {
+                self.store
+                    .lock()
+                    .expect("chunk store poisoned")
+                    .evict_if_needed();
+                Ok(saved)
+            }
+            Err(error) => {
+                self.store
+                    .lock()
+                    .expect("chunk store poisoned")
+                    .mark_dirty(batch_coords);
+                Err(error)
+            }
+        }
+    }
+
+    /// Apply synchronous writeback backpressure if dirty chunks have pushed the
+    /// cache past `max_cached_chunks` despite clean LRU eviction.
+    fn apply_cache_backpressure(&self) {
+        let batch_size = {
+            let store = self.store.lock().expect("chunk store poisoned");
+            if !store.is_over_capacity() {
+                return;
+            }
+            store.backpressure_batch_size()
+        };
+        if let Err(error) = self.flush_dirty_batch(batch_size) {
+            tracing::error!(%error, "incremental dirty chunk backpressure flush failed");
+        }
+    }
+
     pub fn block_at(&self, pos: BlockPos) -> i32 {
         let chunk = self.ensure_chunk(pos.chunk());
         let (lx, y, lz) = pos.local();
@@ -258,10 +333,13 @@ impl World {
             self.storage.as_ref(),
             coords,
         );
-        self.store
+        let chunk = self
+            .store
             .lock()
             .expect("chunk store poisoned")
-            .commit_loaded(coords, loaded)
+            .commit_loaded(coords, loaded);
+        self.apply_cache_backpressure();
+        chunk
     }
 
     /// Ensure all 9 chunks in the 3x3 neighborhood of `center` are loaded,
@@ -311,6 +389,7 @@ impl World {
             }
             store.peek_light([cx, cz])
         };
+        self.apply_cache_backpressure();
 
         let neighborhood =
             std::array::from_fn(|dz| std::array::from_fn(|dx| slots[dz][dx].take().unwrap()));
@@ -567,6 +646,7 @@ impl World {
             .lock()
             .expect("physics scheduler poisoned")
             .schedule_samples(&samples);
+        self.apply_cache_backpressure();
         Some(WorldMutation {
             block_changes: vec![(pos, state)],
             light_changes,
@@ -744,5 +824,48 @@ mod tests {
         release_tx.send(()).unwrap();
         let prepared = slow_thread.join().unwrap();
         assert!(!prepared.payload.is_empty());
+    }
+
+    #[test]
+    fn dirty_chunks_exceeding_capacity_trigger_writeback_and_stay_bounded() {
+        let dir = std::env::temp_dir().join(format!("zcraft-dirty-cap-{}", rand::random::<u64>()));
+        let storage = AnvilStorage::new(&dir);
+        let generator: Arc<dyn ChunkGenerator> = Arc::new(FlatGenerator::default());
+        let capacity = 16usize;
+        let world = World {
+            generator: generator.clone(),
+            storage: Some(storage.clone()),
+            store: Mutex::new(ChunkStore::with_capacity(
+                generator,
+                Some(storage),
+                capacity,
+            )),
+            clock: Mutex::new(WorldClock::new()),
+            physics: Mutex::new(physics::PhysicsScheduler::new()),
+            save_lock: Mutex::new(()),
+            spawn: [8.5, 65.0, 8.5],
+            placeholder_terrain: Arc::from([]),
+        };
+
+        // Explore and mutate 64 distinct chunks (4x cache capacity), so every chunk is dirty.
+        for cx in 0..64 {
+            let pos = BlockPos([cx * 16 + 2, 64, 2]);
+            assert!(world.set_block(pos, crate::game::GLASS_STATE).is_some());
+            assert!(
+                world.cached_chunk_len() <= capacity,
+                "cache grew to {} (capacity {capacity}) at chunk {cx}",
+                world.cached_chunk_len()
+            );
+        }
+
+        // Dirty count stayed bounded well below total explored chunks (64).
+        assert!(world.dirty_chunk_len() <= capacity);
+
+        // Reloading an early evicted chunk [0, 0] from disk must preserve its edited block.
+        assert_eq!(
+            world.block_at(BlockPos([2, 64, 2])),
+            crate::game::GLASS_STATE
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -107,12 +107,24 @@ async fn serve_validated(
                 server.play.tick_furnaces(server.players());
                 server.play.tick_physics(server.players());
                 ticks_since_save += 1;
-                if ticks_since_save >= AUTOSAVE_TICKS {
-                    ticks_since_save = 0;
-                    if server.play.world().has_storage() && autosave.is_none() {
+                if server.play.world().has_storage() && autosave.is_none() {
+                    if ticks_since_save >= AUTOSAVE_TICKS {
+                        ticks_since_save = 0;
                         let save_server = server.clone();
                         autosave = Some(tokio::task::spawn_blocking(move || {
                             save_server.play.save_world()
+                        }));
+                    } else if server.play.world().needs_dirty_flush() {
+                        let save_server = server.clone();
+                        autosave = Some(tokio::task::spawn_blocking(move || {
+                            let chunks_saved = save_server
+                                .play
+                                .world()
+                                .flush_dirty_batch(crate::world::DIRTY_FLUSH_BATCH_SIZE)?;
+                            Ok(crate::world::SaveSummary {
+                                persisted: true,
+                                chunks_saved,
+                            })
                         }));
                     }
                 }

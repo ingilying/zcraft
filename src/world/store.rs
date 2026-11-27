@@ -125,12 +125,43 @@ impl ChunkStore {
         self.chunks.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn dirty_len(&self) -> usize {
+        self.dirty.len()
+    }
+
+    /// High-water mark for dirty chunks that triggers background incremental writeback.
+    pub(crate) fn dirty_flush_threshold(&self) -> usize {
+        (self.max_cached_chunks / 2).max(8)
+    }
+
+    /// True when dirty chunks have reached the incremental writeback threshold.
+    pub(crate) fn needs_dirty_flush(&self) -> bool {
+        self.storage.is_some() && self.dirty.len() >= self.dirty_flush_threshold()
+    }
+
+    /// True when clean LRU eviction alone could not keep `chunks.len() <= max_cached_chunks`
+    /// because too many cached chunks are still dirty.
+    pub(crate) fn is_over_capacity(&self) -> bool {
+        self.storage.is_some() && self.chunks.len() > self.max_cached_chunks
+    }
+
+    /// Recommended synchronous writeback batch size when applying loader backpressure.
+    pub(crate) fn backpressure_batch_size(&self) -> usize {
+        let target = self.max_cached_chunks - self.max_cached_chunks / 8;
+        self.chunks
+            .len()
+            .saturating_sub(target)
+            .max(self.max_cached_chunks / 4)
+            .max(1)
+    }
+
     fn touch(&mut self, coords: [i32; 2]) {
         self.access_clock = self.access_clock.wrapping_add(1);
         self.access_order.insert(coords, self.access_clock);
     }
 
-    fn evict_if_needed(&mut self) {
+    pub(crate) fn evict_if_needed(&mut self) {
         if self.chunks.len() <= self.max_cached_chunks {
             return;
         }
@@ -516,6 +547,29 @@ impl ChunkStore {
             .filter(|c| !self.load_failed.contains(c))
             .filter_map(|c| self.chunks.get(&c).cloned().map(|chunk| (c, chunk)))
             .collect()
+    }
+
+    /// Drain up to `max_chunks` least-recently-used dirty chunks for incremental writeback.
+    pub(crate) fn take_oldest_dirty(&mut self, max_chunks: usize) -> Vec<([i32; 2], Arc<Chunk>)> {
+        if max_chunks == 0 || self.dirty.is_empty() {
+            return Vec::new();
+        }
+        let mut candidates: Vec<([i32; 2], u64)> = self
+            .dirty
+            .iter()
+            .copied()
+            .filter(|c| !self.load_failed.contains(c))
+            .map(|c| (c, self.access_order.get(&c).copied().unwrap_or(0)))
+            .collect();
+        candidates.sort_unstable_by_key(|&(_, tick)| tick);
+        let mut out = Vec::with_capacity(candidates.len().min(max_chunks));
+        for (coords, _) in candidates.into_iter().take(max_chunks) {
+            self.dirty.remove(&coords);
+            if let Some(chunk) = self.chunks.get(&coords).cloned() {
+                out.push((coords, chunk));
+            }
+        }
+        out
     }
 
     pub(crate) fn mark_dirty(&mut self, chunks: impl IntoIterator<Item = [i32; 2]>) {
