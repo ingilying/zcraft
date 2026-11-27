@@ -1,32 +1,73 @@
 //! Unified `BlockBehavior` and `ItemBehavior` abstractions (mirroring vanilla
 //! `BlockBehaviour.useWithoutItem` and `Item.use` / `Item.finishUsingItem`).
 //!
-//! New interactive blocks (chests, crafting tables, furnaces, doors, beds, ...)
-//! and usable items (foods, buckets, bows, projectiles, ...) implement these
-//! traits instead of adding ad-hoc branches inside packet handlers.
-use super::{Hand, Item, ItemStack, Player, block_by_state, registry};
-use crate::world::{BlockPos, World};
+//! Behaviors execute domain logic directly against `UseContext` and return a
+//! closed set of primitive `GameEffects`. Adding new interactive blocks or
+//! usable items composes these effects without modifying network packet handlers.
+use super::{Hand, Inventory, Item, ItemStack, Player, block_by_state, registry};
+use crate::world::{BlockPos, DAY_LENGTH, World};
 
-/// Result of right-clicking a block (`BlockBehavior::on_use`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BlockUseOutcome {
-    /// Block has no right-click interaction; fall through to block placement / item use.
-    Pass,
-    OpenChest(BlockPos),
-    OpenCraftingTable,
-    OpenFurnace(BlockPos),
-    /// Toggle/update one or more block states (e.g., doors, trapdoors, fence gates).
-    SetBlocks(Vec<(BlockPos, i32)>),
-    /// Right-click a bed: set respawn point and skip night if nighttime/thunderstorm.
-    UseBed(BlockPos),
+/// Protocol-agnostic container screen opened by a block interaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerScreen {
+    Chest(BlockPos),
+    CraftingTable,
+    Furnace(BlockPos),
+}
+
+/// Mutable domain context passed into `BlockBehavior::on_use` and `ItemBehavior::on_use`.
+pub struct UseContext<'a> {
+    pub world: &'a World,
+    pub player: &'a mut Player,
+    pub inventory: &'a mut Inventory,
+}
+
+/// Unified domain side-effects returned by `BlockBehavior::on_use` and `ItemBehavior::on_use`.
+///
+/// The session layer applies these effects uniformly (broadcasting block updates,
+/// opening screens, syncing inventory, sending chat messages) without branching
+/// on individual block or item types.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GameEffects {
+    /// True if the interaction was consumed (prevents fallthrough to block placement).
+    pub handled: bool,
+    /// Block state mutations to apply to the world and broadcast to watchers.
+    pub block_updates: Vec<(BlockPos, i32)>,
+    /// Container screen to open for the acting player.
+    pub open_screen: Option<ContainerScreen>,
+    /// Private system chat messages for the acting player.
+    pub player_messages: Vec<String>,
+    /// Broadcast system chat messages for all online players.
+    pub broadcast_messages: Vec<String>,
+    /// Update world day time (e.g., sleeping through the night).
+    pub set_day_time: Option<i64>,
+    /// Clear active rain/thunder weather for the given duration in ticks.
+    pub clear_weather_ticks: Option<u32>,
+    /// Overflow items to drop at the acting player's position.
+    pub player_drops: Vec<ItemStack>,
+    /// True if the acting player's inventory/equipment changed and should be resynced.
+    pub inventory_changed: bool,
+}
+
+impl GameEffects {
+    pub fn pass() -> Self {
+        Self::default()
+    }
+
+    pub fn consumed() -> Self {
+        Self {
+            handled: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// Polymorphic behavior for a Minecraft block type.
 pub trait BlockBehavior: Send + Sync {
     /// Handle right-clicking this block without sneaking.
-    fn on_use(&self, world: &World, pos: BlockPos, state: i32) -> BlockUseOutcome {
-        let _ = (world, pos, state);
-        BlockUseOutcome::Pass
+    fn on_use(&self, ctx: &mut UseContext<'_>, pos: BlockPos, state: i32) -> GameEffects {
+        let _ = (ctx, pos, state);
+        GameEffects::pass()
     }
 
     /// Extra items to drop from block-entity storage when this block is broken.
@@ -46,22 +87,26 @@ impl BlockBehavior for DefaultBlock {}
 
 struct CraftingTableBlock;
 impl BlockBehavior for CraftingTableBlock {
-    fn on_use(&self, _world: &World, _pos: BlockPos, _state: i32) -> BlockUseOutcome {
-        BlockUseOutcome::OpenCraftingTable
+    fn on_use(&self, _ctx: &mut UseContext<'_>, _pos: BlockPos, _state: i32) -> GameEffects {
+        let mut effects = GameEffects::consumed();
+        effects.open_screen = Some(ContainerScreen::CraftingTable);
+        effects
     }
 }
 
 struct ChestBlock;
 impl BlockBehavior for ChestBlock {
-    fn on_use(&self, world: &World, pos: BlockPos, _state: i32) -> BlockUseOutcome {
+    fn on_use(&self, ctx: &mut UseContext<'_>, pos: BlockPos, _state: i32) -> GameEffects {
         let above = BlockPos([pos.0[0], pos.0[1] + 1, pos.0[2]]);
         let blocked = above.valid()
-            && block_by_state(world.block_at(above))
+            && block_by_state(ctx.world.block_at(above))
                 .is_some_and(|d| d.collision && d.light_block == 15);
-        if blocked || world.chest_items(pos).is_none() {
-            BlockUseOutcome::Pass
+        if blocked || ctx.world.chest_items(pos).is_none() {
+            GameEffects::pass()
         } else {
-            BlockUseOutcome::OpenChest(pos)
+            let mut effects = GameEffects::consumed();
+            effects.open_screen = Some(ContainerScreen::Chest(pos));
+            effects
         }
     }
 
@@ -75,11 +120,13 @@ impl BlockBehavior for ChestBlock {
 
 struct FurnaceBlock;
 impl BlockBehavior for FurnaceBlock {
-    fn on_use(&self, world: &World, pos: BlockPos, _state: i32) -> BlockUseOutcome {
-        if world.furnace_data(pos).is_some() {
-            BlockUseOutcome::OpenFurnace(pos)
+    fn on_use(&self, ctx: &mut UseContext<'_>, pos: BlockPos, _state: i32) -> GameEffects {
+        if ctx.world.furnace_data(pos).is_some() {
+            let mut effects = GameEffects::consumed();
+            effects.open_screen = Some(ContainerScreen::Furnace(pos));
+            effects
         } else {
-            BlockUseOutcome::Pass
+            GameEffects::pass()
         }
     }
 
@@ -93,25 +140,48 @@ impl BlockBehavior for FurnaceBlock {
 
 struct ToggleOpenBlock;
 impl BlockBehavior for ToggleOpenBlock {
-    fn on_use(&self, world: &World, pos: BlockPos, state: i32) -> BlockUseOutcome {
+    fn on_use(&self, ctx: &mut UseContext<'_>, pos: BlockPos, state: i32) -> GameEffects {
         let Some(next) = toggle_open_property(state) else {
-            return BlockUseOutcome::Pass;
+            return GameEffects::pass();
         };
-        let mut updates = vec![(pos, next)];
+        let mut effects = GameEffects::consumed();
+        effects.block_updates.push((pos, next));
         if let Some(other) = super::paired_block_pos(pos, state)
             && other.valid()
-            && let Some(other_next) = toggle_open_property(world.block_at(other))
+            && let Some(other_next) = toggle_open_property(ctx.world.block_at(other))
         {
-            updates.push((other, other_next));
+            effects.block_updates.push((other, other_next));
         }
-        BlockUseOutcome::SetBlocks(updates)
+        effects
     }
 }
 
 struct BedBlock;
 impl BlockBehavior for BedBlock {
-    fn on_use(&self, _world: &World, pos: BlockPos, _state: i32) -> BlockUseOutcome {
-        BlockUseOutcome::UseBed(pos)
+    fn on_use(&self, ctx: &mut UseContext<'_>, pos: BlockPos, _state: i32) -> GameEffects {
+        let mut effects = GameEffects::consumed();
+        if ctx.player.respawn_point != Some(pos) {
+            ctx.player.respawn_point = Some(pos);
+            effects.player_messages.push("Respawn point set".into());
+        }
+        let day_time = ctx.world.time().day_time;
+        let time_of_day = day_time.rem_euclid(DAY_LENGTH);
+        let weather = ctx.world.weather();
+        let can_sleep = (12_541..=23_458).contains(&time_of_day) || weather.thundering;
+        if can_sleep {
+            effects.set_day_time = Some(day_time - time_of_day + DAY_LENGTH);
+            if weather.raining || weather.thundering {
+                effects.clear_weather_ticks = Some(12_000);
+            }
+            effects
+                .broadcast_messages
+                .push("Sleeping through this night".into());
+        } else {
+            effects
+                .player_messages
+                .push("You can sleep only at night or during thunderstorms".into());
+        }
+        effects
     }
 }
 
@@ -169,36 +239,12 @@ pub fn block_behavior(state: i32) -> &'static dyn BlockBehavior {
     }
 }
 
-/// Result of right-clicking with an item (`ItemBehavior::on_use`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ItemUseOutcome {
-    Pass,
-    StartEating {
-        hand: Hand,
-        item: Item,
-        eat_ticks: u16,
-    },
-    /// Bucket picked up or placed a fluid (block update + survival item swap).
-    UseBucket {
-        hand: Hand,
-        pos: BlockPos,
-        new_state: i32,
-        result_item: Item,
-    },
-}
-
 /// Polymorphic behavior for a Minecraft item type.
 pub trait ItemBehavior: Send + Sync {
     /// Handle right-clicking with this item (`Item.use`).
-    fn on_use(
-        &self,
-        world: &World,
-        player: &Player,
-        hand: Hand,
-        stack: ItemStack,
-    ) -> ItemUseOutcome {
-        let _ = (world, player, hand, stack);
-        ItemUseOutcome::Pass
+    fn on_use(&self, ctx: &mut UseContext<'_>, hand: Hand, stack: ItemStack) -> GameEffects {
+        let _ = (ctx, hand, stack);
+        GameEffects::pass()
     }
 
     /// Apply effect when continuous use completes (`Item.finishUsingItem`).
@@ -214,27 +260,23 @@ impl ItemBehavior for DefaultItem {}
 
 struct FoodItem;
 impl ItemBehavior for FoodItem {
-    fn on_use(
-        &self,
-        _world: &World,
-        player: &Player,
-        hand: Hand,
-        stack: ItemStack,
-    ) -> ItemUseOutcome {
-        if !player.is_survival() || player.dead {
-            return ItemUseOutcome::Pass;
+    fn on_use(&self, ctx: &mut UseContext<'_>, hand: Hand, stack: ItemStack) -> GameEffects {
+        if !ctx.player.is_survival() || ctx.player.dead {
+            return GameEffects::pass();
         }
         let Some(props) = stack.definition().components.food else {
-            return ItemUseOutcome::Pass;
+            return GameEffects::pass();
         };
-        if props.always_edible || player.food < 20 {
-            ItemUseOutcome::StartEating {
+        if props.always_edible || ctx.player.food < 20 {
+            ctx.player.eating = Some((
                 hand,
-                item: stack.item,
-                eat_ticks: props.eat_ticks,
-            }
+                stack.item,
+                tokio::time::Instant::now(),
+                props.eat_ticks,
+            ));
+            GameEffects::consumed()
         } else {
-            ItemUseOutcome::Pass
+            GameEffects::pass()
         }
     }
 
@@ -255,126 +297,92 @@ impl ItemBehavior for FoodItem {
 
 struct BucketItem;
 impl ItemBehavior for BucketItem {
-    fn on_use(
-        &self,
-        world: &World,
-        player: &Player,
-        hand: Hand,
-        stack: ItemStack,
-    ) -> ItemUseOutcome {
-        if !player.can_interact() || player.dead {
-            return ItemUseOutcome::Pass;
+    fn on_use(&self, ctx: &mut UseContext<'_>, hand: Hand, stack: ItemStack) -> GameEffects {
+        if !ctx.player.can_interact() || ctx.player.dead {
+            return GameEffects::pass();
         }
-        let reach = if player.is_survival() { 5.0 } else { 5.5 };
-        match stack.item.name() {
+        let reach = if ctx.player.is_survival() { 5.0 } else { 5.5 };
+        let action: Option<(BlockPos, i32, Item)> = match stack.item.name() {
             "minecraft:bucket" => {
                 let Some((pos, _)) = raycast_block(
-                    world,
-                    player.eye_position(),
-                    player.yaw,
-                    player.pitch,
+                    ctx.world,
+                    ctx.player.eye_position(),
+                    ctx.player.yaw,
+                    ctx.player.pitch,
                     reach,
                     true,
                 ) else {
-                    return ItemUseOutcome::Pass;
+                    return GameEffects::pass();
                 };
-                let state = world.block_at(pos);
+                let state = ctx.world.block_at(pos);
                 let Some((_, bdef, sdef)) = registry().state_by_id(state) else {
-                    return ItemUseOutcome::Pass;
+                    return GameEffects::pass();
                 };
                 if bdef.name == "minecraft:water"
                     && sdef.properties.get("level").map(String::as_str) == Some("0")
-                    && let Some(wb) = Item::by_name("water_bucket")
                 {
-                    return ItemUseOutcome::UseBucket {
-                        hand,
-                        pos,
-                        new_state: super::AIR_STATE,
-                        result_item: wb,
-                    };
-                }
-                if bdef.name == "minecraft:lava"
+                    Item::by_name("water_bucket").map(|wb| (pos, super::AIR_STATE, wb))
+                } else if bdef.name == "minecraft:lava"
                     && sdef.properties.get("level").map(String::as_str) == Some("0")
-                    && let Some(lb) = Item::by_name("lava_bucket")
                 {
-                    return ItemUseOutcome::UseBucket {
-                        hand,
-                        pos,
-                        new_state: super::AIR_STATE,
-                        result_item: lb,
-                    };
-                }
-                if sdef.properties.get("waterlogged").map(String::as_str) == Some("true")
+                    Item::by_name("lava_bucket").map(|lb| (pos, super::AIR_STATE, lb))
+                } else if sdef.properties.get("waterlogged").map(String::as_str) == Some("true")
                     && let Some(unlogged) = set_waterlogged_property(state, false)
-                    && let Some(wb) = Item::by_name("water_bucket")
                 {
-                    return ItemUseOutcome::UseBucket {
-                        hand,
-                        pos,
-                        new_state: unlogged,
-                        result_item: wb,
-                    };
+                    Item::by_name("water_bucket").map(|wb| (pos, unlogged, wb))
+                } else {
+                    None
                 }
-                ItemUseOutcome::Pass
             }
             "minecraft:water_bucket" => {
                 let Some((hit_pos, normal)) = raycast_block(
-                    world,
-                    player.eye_position(),
-                    player.yaw,
-                    player.pitch,
+                    ctx.world,
+                    ctx.player.eye_position(),
+                    ctx.player.yaw,
+                    ctx.player.pitch,
                     reach,
                     false,
                 ) else {
-                    return ItemUseOutcome::Pass;
+                    return GameEffects::pass();
                 };
                 let Some(empty) = Item::by_name("bucket") else {
-                    return ItemUseOutcome::Pass;
+                    return GameEffects::pass();
                 };
-                let hit_state = world.block_at(hit_pos);
+                let hit_state = ctx.world.block_at(hit_pos);
                 if let Some((_, _, sdef)) = registry().state_by_id(hit_state)
                     && sdef.properties.get("waterlogged").map(String::as_str) == Some("false")
                     && let Some(logged) = set_waterlogged_property(hit_state, true)
                 {
-                    return ItemUseOutcome::UseBucket {
-                        hand,
-                        pos: hit_pos,
-                        new_state: logged,
-                        result_item: empty,
-                    };
+                    Some((hit_pos, logged, empty))
+                } else {
+                    let target = BlockPos([
+                        hit_pos.0[0] + normal[0],
+                        hit_pos.0[1] + normal[1],
+                        hit_pos.0[2] + normal[2],
+                    ]);
+                    if target.valid()
+                        && block_by_state(ctx.world.block_at(target))
+                            .is_some_and(|d| d.air || d.replaceable)
+                    {
+                        super::block_by_name("water").map(|w| (target, w.default_state, empty))
+                    } else {
+                        None
+                    }
                 }
-                let target = BlockPos([
-                    hit_pos.0[0] + normal[0],
-                    hit_pos.0[1] + normal[1],
-                    hit_pos.0[2] + normal[2],
-                ]);
-                if target.valid()
-                    && block_by_state(world.block_at(target))
-                        .is_some_and(|d| d.air || d.replaceable)
-                    && let Some(water) = super::block_by_name("water")
-                {
-                    return ItemUseOutcome::UseBucket {
-                        hand,
-                        pos: target,
-                        new_state: water.default_state,
-                        result_item: empty,
-                    };
-                }
-                ItemUseOutcome::Pass
             }
             "minecraft:lava_bucket" => {
                 let Some((hit_pos, normal)) = raycast_block(
-                    world,
-                    player.eye_position(),
-                    player.yaw,
-                    player.pitch,
+                    ctx.world,
+                    ctx.player.eye_position(),
+                    ctx.player.yaw,
+                    ctx.player.pitch,
                     reach,
                     false,
                 ) else {
-                    return ItemUseOutcome::Pass;
+                    return GameEffects::pass();
                 };
                 let Some(empty) = Item::by_name("bucket") else {
-                    return ItemUseOutcome::Pass;
+                    return GameEffects::pass();
                 };
                 let target = BlockPos([
                     hit_pos.0[0] + normal[0],
@@ -382,21 +390,34 @@ impl ItemBehavior for BucketItem {
                     hit_pos.0[2] + normal[2],
                 ]);
                 if target.valid()
-                    && block_by_state(world.block_at(target))
+                    && block_by_state(ctx.world.block_at(target))
                         .is_some_and(|d| d.air || d.replaceable)
-                    && let Some(lava) = super::block_by_name("lava")
                 {
-                    return ItemUseOutcome::UseBucket {
-                        hand,
-                        pos: target,
-                        new_state: lava.default_state,
-                        result_item: empty,
-                    };
+                    super::block_by_name("lava").map(|l| (target, l.default_state, empty))
+                } else {
+                    None
                 }
-                ItemUseOutcome::Pass
             }
-            _ => ItemUseOutcome::Pass,
+            _ => None,
+        };
+
+        let Some((pos, new_state, result_item)) = action else {
+            return GameEffects::pass();
+        };
+        if ctx.world.block_at(pos) == new_state {
+            return GameEffects::pass();
         }
+        let mut effects = GameEffects::consumed();
+        effects.block_updates.push((pos, new_state));
+        if ctx.player.is_survival()
+            && let Some(replacement) = ItemStack::new(result_item, 1)
+        {
+            if let Some(overflow) = ctx.inventory.replace_hand_one(hand, replacement) {
+                effects.player_drops.push(overflow);
+            }
+            effects.inventory_changed = true;
+        }
+        effects
     }
 }
 
@@ -548,20 +569,21 @@ mod tests {
     fn food_item_behavior_and_hunger_regen_match_vanilla() {
         let world = World::new();
         let mut player = Player::at_spawn(1, uuid::Uuid::nil(), "Steve".into(), GameMode::Survival);
+        let mut inv = Inventory::default();
         player.food = 10;
         player.saturation = 0.0;
         player.health = 14.0;
 
         let steak = Item::by_name("cooked_beef").unwrap();
         let stack = ItemStack::new(steak, 1).unwrap();
-        assert_eq!(
-            item_behavior(steak).on_use(&world, &player, Hand::Main, stack),
-            ItemUseOutcome::StartEating {
-                hand: Hand::Main,
-                item: steak,
-                eat_ticks: 32,
-            }
-        );
+        let mut ctx = UseContext {
+            world: &world,
+            player: &mut player,
+            inventory: &mut inv,
+        };
+        let effects = item_behavior(steak).on_use(&mut ctx, Hand::Main, stack);
+        assert!(effects.handled);
+        assert!(matches!(player.eating, Some((Hand::Main, item, _, 32)) if item == steak));
         assert!(item_behavior(steak).on_finish_use(&mut player, stack));
         assert_eq!(player.food, 18);
         assert!((player.saturation - 12.8).abs() < 0.01);
@@ -581,24 +603,36 @@ mod tests {
     }
 
     #[test]
-    fn block_behavior_dispatches_crafting_table_chest_and_furnace() {
+    fn block_behavior_dispatches_crafting_table_chest_furnace_doors_and_bed() {
         let world = World::new();
+        let mut player = Player::at_spawn(1, uuid::Uuid::nil(), "Steve".into(), GameMode::Survival);
+        let mut inv = Inventory::default();
         let pos = BlockPos([2, 64, 2]);
         let table = crate::game::block_by_name("crafting_table")
             .unwrap()
             .default_state;
         world.set_block(pos, table);
-        assert_eq!(
-            block_behavior(table).on_use(&world, pos, table),
-            BlockUseOutcome::OpenCraftingTable
-        );
+        {
+            let mut ctx = UseContext {
+                world: &world,
+                player: &mut player,
+                inventory: &mut inv,
+            };
+            let fx = block_behavior(table).on_use(&mut ctx, pos, table);
+            assert_eq!(fx.open_screen, Some(ContainerScreen::CraftingTable));
+        }
 
         let furnace = crate::game::block_by_name("furnace").unwrap().default_state;
         world.set_block(pos, furnace);
-        assert_eq!(
-            block_behavior(furnace).on_use(&world, pos, furnace),
-            BlockUseOutcome::OpenFurnace(pos)
-        );
+        {
+            let mut ctx = UseContext {
+                world: &world,
+                player: &mut player,
+                inventory: &mut inv,
+            };
+            let fx = block_behavior(furnace).on_use(&mut ctx, pos, furnace);
+            assert_eq!(fx.open_screen, Some(ContainerScreen::Furnace(pos)));
+        }
 
         // Two-block wooden door toggles open=true on BOTH lower and upper halves.
         let mut lower_p = std::collections::BTreeMap::new();
@@ -616,12 +650,16 @@ mod tests {
         let pos_up = BlockPos([pos.0[0], pos.0[1] + 1, pos.0[2]]);
         world.set_block(pos, lower);
         world.set_block(pos_up, upper);
-        let BlockUseOutcome::SetBlocks(updates) = block_behavior(lower).on_use(&world, pos, lower)
-        else {
-            panic!("expected SetBlocks for oak_door");
+        let fx = {
+            let mut ctx = UseContext {
+                world: &world,
+                player: &mut player,
+                inventory: &mut inv,
+            };
+            block_behavior(lower).on_use(&mut ctx, pos, lower)
         };
-        assert_eq!(updates.len(), 2);
-        for &(_, st) in &updates {
+        assert_eq!(fx.block_updates.len(), 2);
+        for &(_, st) in &fx.block_updates {
             assert_eq!(
                 registry()
                     .state_by_id(st)
@@ -638,17 +676,33 @@ mod tests {
         let iron_door = crate::game::block_by_name("iron_door")
             .unwrap()
             .default_state;
-        assert_eq!(
-            block_behavior(iron_door).on_use(&world, pos, iron_door),
-            BlockUseOutcome::Pass
-        );
+        {
+            let mut ctx = UseContext {
+                world: &world,
+                player: &mut player,
+                inventory: &mut inv,
+            };
+            assert!(
+                !block_behavior(iron_door)
+                    .on_use(&mut ctx, pos, iron_door)
+                    .handled
+            );
+        }
 
-        // Bed returns UseBed(pos).
+        // Bed sets respawn point and emits sleep effect at night.
         let red_bed = crate::game::block_by_name("red_bed").unwrap().default_state;
-        assert_eq!(
-            block_behavior(red_bed).on_use(&world, pos, red_bed),
-            BlockUseOutcome::UseBed(pos)
-        );
+        world.set_day_time(14_000);
+        let fx = {
+            let mut ctx = UseContext {
+                world: &world,
+                player: &mut player,
+                inventory: &mut inv,
+            };
+            block_behavior(red_bed).on_use(&mut ctx, pos, red_bed)
+        };
+        assert!(fx.handled);
+        assert_eq!(player.respawn_point, Some(pos));
+        assert_eq!(fx.set_day_time, Some(DAY_LENGTH));
 
         // Gravity blocks report falls_with_gravity() == true.
         let sand = crate::game::block_by_name("sand").unwrap().default_state;
@@ -660,6 +714,7 @@ mod tests {
     fn bucket_item_places_and_scoops_water_via_raycast() {
         let world = World::new();
         let mut player = Player::at_spawn(1, uuid::Uuid::nil(), "Steve".into(), GameMode::Survival);
+        let mut inv = Inventory::default();
         // Stand at (8.5, 64.0, 8.5) looking straight down at grass block (8, 63, 8).
         player.position = [8.5, 64.0, 8.5];
         player.yaw = 0.0;
@@ -668,39 +723,43 @@ mod tests {
         let water_bucket = Item::by_name("water_bucket").unwrap();
         let bucket = Item::by_name("bucket").unwrap();
         let water_source = crate::game::block_by_name("water").unwrap().default_state;
+        inv.set_slot(36, ItemStack::new(water_bucket, 1));
 
-        let place = item_behavior(water_bucket).on_use(
-            &world,
-            &player,
-            Hand::Main,
-            ItemStack::new(water_bucket, 1).unwrap(),
-        );
+        let place = {
+            let mut ctx = UseContext {
+                world: &world,
+                player: &mut player,
+                inventory: &mut inv,
+            };
+            item_behavior(water_bucket).on_use(
+                &mut ctx,
+                Hand::Main,
+                ItemStack::new(water_bucket, 1).unwrap(),
+            )
+        };
+        assert!(place.handled);
         assert_eq!(
-            place,
-            ItemUseOutcome::UseBucket {
-                hand: Hand::Main,
-                pos: BlockPos([8, 64, 8]),
-                new_state: water_source,
-                result_item: bucket,
-            }
+            place.block_updates,
+            vec![(BlockPos([8, 64, 8]), water_source)]
         );
+        assert!(place.inventory_changed);
+        assert_eq!(inv.hand(Hand::Main), ItemStack::new(bucket, 1));
         world.set_block(BlockPos([8, 64, 8]), water_source);
 
         // Empty bucket scoops the water source back up.
-        let scoop = item_behavior(bucket).on_use(
-            &world,
-            &player,
-            Hand::Main,
-            ItemStack::new(bucket, 1).unwrap(),
-        );
+        let scoop = {
+            let mut ctx = UseContext {
+                world: &world,
+                player: &mut player,
+                inventory: &mut inv,
+            };
+            item_behavior(bucket).on_use(&mut ctx, Hand::Main, ItemStack::new(bucket, 1).unwrap())
+        };
+        assert!(scoop.handled);
         assert_eq!(
-            scoop,
-            ItemUseOutcome::UseBucket {
-                hand: Hand::Main,
-                pos: BlockPos([8, 64, 8]),
-                new_state: crate::game::AIR_STATE,
-                result_item: water_bucket,
-            }
+            scoop.block_updates,
+            vec![(BlockPos([8, 64, 8]), crate::game::AIR_STATE)]
         );
+        assert_eq!(inv.hand(Hand::Main), ItemStack::new(water_bucket, 1));
     }
 }

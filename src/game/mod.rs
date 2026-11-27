@@ -1,6 +1,7 @@
 //! Data-driven Java 1.21.1 gameplay core. Protocol IDs live at the edge;
 //! generated definitions and shared behaviors replace per-item handler branches.
 mod behavior;
+pub mod containers;
 mod data;
 mod inventory;
 mod items;
@@ -10,7 +11,8 @@ mod player;
 mod recipes;
 
 pub use behavior::{
-    BlockBehavior, BlockUseOutcome, ItemBehavior, ItemUseOutcome, block_behavior, item_behavior,
+    BlockBehavior, ContainerScreen, GameEffects, ItemBehavior, UseContext, block_behavior,
+    item_behavior,
 };
 pub use data::{
     BlockDefinition, BlockStateDefinition, FoodProperties, GameRegistry, ItemComponents,

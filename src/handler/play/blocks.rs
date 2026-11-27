@@ -603,7 +603,7 @@ pub async fn handle_dig(ctx: &mut Context<'_>, p: PlayerDigging) -> io::Result<O
 
 pub async fn handle_place(ctx: &mut Context<'_>, p: BlockPlace) -> io::Result<Outcome> {
     // Dispatch right-click interaction through unified `BlockBehavior::on_use`.
-    if let Ok(state) = play(ctx.session)
+    let effects = if let Some(state) = ctx.session.play.as_mut()
         && state.player.can_interact()
         && !state.player.dead
         && !state.player.sneaking
@@ -612,147 +612,17 @@ pub async fn handle_place(ctx: &mut Context<'_>, p: BlockPlace) -> io::Result<Ou
     {
         let world = ctx.server.play.world();
         let clicked_state = world.block_at(p.pos);
-        match crate::game::block_behavior(clicked_state).on_use(world, p.pos, clicked_state) {
-            crate::game::BlockUseOutcome::OpenCraftingTable => {
-                let window_id = state.next_window_id;
-                state.next_window_id = if window_id >= 100 { 1 } else { window_id + 1 };
-                state.open_container = Some(OpenContainer {
-                    window_id,
-                    kind: ContainerKind::CraftingTable {
-                        grid: [None; 9],
-                        output: None,
-                    },
-                    state_id: 0,
-                });
-                let slots = crafting_table_slots(None, &[None; 9], &ctx.session.inventory);
-                return Ok(reply(vec![
-                    OpenScreen {
-                        window_id: i32::from(window_id),
-                        menu_type: 12, // crafting
-                        title: "Crafting".into(),
-                    }
-                    .into(),
-                    InventoryContent::container(
-                        window_id,
-                        0,
-                        slots,
-                        ctx.session.inventory.carried(),
-                    )
-                    .into(),
-                    BlockAck(p.sequence).into(),
-                ]));
-            }
-            crate::game::BlockUseOutcome::OpenFurnace(fpos) => {
-                if let Some(furnace) = world.furnace_data(fpos) {
-                    let uuid = state.player.uuid;
-                    let window_id = state.next_window_id;
-                    state.next_window_id = if window_id >= 100 { 1 } else { window_id + 1 };
-                    state.open_container = Some(OpenContainer {
-                        window_id,
-                        kind: ContainerKind::Furnace(fpos),
-                        state_id: 0,
-                    });
-                    let _ = ctx.server.play.open_chest_viewer(fpos, uuid);
-                    let slots = furnace_slots(&furnace, &ctx.session.inventory);
-                    let mut replies = vec![
-                        OpenScreen {
-                            window_id: i32::from(window_id),
-                            menu_type: 14, // furnace
-                            title: "Furnace".into(),
-                        }
-                        .into(),
-                        InventoryContent::container(
-                            window_id,
-                            0,
-                            slots,
-                            ctx.session.inventory.carried(),
-                        )
-                        .into(),
-                    ];
-                    replies.extend(furnace_property_packets(window_id, &furnace));
-                    replies.push(BlockAck(p.sequence).into());
-                    return Ok(reply(replies));
-                }
-            }
-            crate::game::BlockUseOutcome::OpenChest(cpos) => {
-                if let Some(chest_items) = world.chest_items(cpos) {
-                    let uuid = state.player.uuid;
-                    let window_id = state.next_window_id;
-                    state.next_window_id = if window_id >= 100 { 1 } else { window_id + 1 };
-                    state.open_container = Some(OpenContainer {
-                        window_id,
-                        kind: ContainerKind::Chest(cpos),
-                        state_id: 0,
-                    });
-                    let viewer_count = ctx.server.play.open_chest_viewer(cpos, uuid);
-                    broadcast_chest_lid_count(ctx.server.players(), cpos, viewer_count)?;
-                    let slots = container_slots(&chest_items, &ctx.session.inventory);
-                    return Ok(reply(vec![
-                        OpenScreen {
-                            window_id: i32::from(window_id),
-                            menu_type: 2, // generic_9x3
-                            title: "Chest".into(),
-                        }
-                        .into(),
-                        InventoryContent::container(
-                            window_id,
-                            0,
-                            slots,
-                            ctx.session.inventory.carried(),
-                        )
-                        .into(),
-                        BlockAck(p.sequence).into(),
-                    ]));
-                }
-            }
-            crate::game::BlockUseOutcome::SetBlocks(updates) => {
-                for (upos, ustate) in updates {
-                    let _ = ctx
-                        .server
-                        .play
-                        .set_block(ctx.server.players(), upos, ustate);
-                }
-                return Ok(reply(vec![BlockAck(p.sequence).into()]));
-            }
-            crate::game::BlockUseOutcome::UseBed(bed_pos) => {
-                let mut replies = Vec::new();
-                if state.player.respawn_point != Some(bed_pos) {
-                    state.player.respawn_point = Some(bed_pos);
-                    replies.push(
-                        crate::protocol::packets::play_chat::SystemChat("Respawn point set".into())
-                            .into(),
-                    );
-                }
-                let (_, day_time) = ctx.server.play.world_time();
-                let time_of_day = day_time.rem_euclid(crate::world::DAY_LENGTH);
-                let weather = ctx.server.play.weather();
-                let can_sleep = (12_541..=23_458).contains(&time_of_day) || weather.thundering;
-                if can_sleep {
-                    let next_morning = day_time - time_of_day + crate::world::DAY_LENGTH;
-                    let time_pkt = ctx.server.play.set_day_time(next_morning);
-                    let _ = ctx.server.players().broadcast(&time_pkt.into());
-                    if weather.raining || weather.thundering {
-                        for wpkt in ctx.server.play.set_weather(false, false, 12_000) {
-                            let _ = ctx.server.players().broadcast(&wpkt);
-                        }
-                    }
-                    let _ = ctx
-                        .server
-                        .players()
-                        .broadcast_system_chat("Sleeping through this night");
-                } else {
-                    replies.push(
-                        crate::protocol::packets::play_chat::SystemChat(
-                            "You can sleep only at night or during thunderstorms".into(),
-                        )
-                        .into(),
-                    );
-                }
-                replies.push(BlockAck(p.sequence).into());
-                return Ok(reply(replies));
-            }
-            crate::game::BlockUseOutcome::Pass => {}
-        }
+        let mut use_ctx = crate::game::UseContext {
+            world,
+            player: &mut state.player,
+            inventory: &mut ctx.session.inventory,
+        };
+        crate::game::block_behavior(clicked_state).on_use(&mut use_ctx, p.pos, clicked_state)
+    } else {
+        crate::game::GameEffects::pass()
+    };
+    if effects.handled {
+        return apply_game_effects(ctx, effects, p.sequence);
     }
     interact(
         ctx,
@@ -764,6 +634,182 @@ pub async fn handle_place(ctx: &mut Context<'_>, p: BlockPlace) -> io::Result<Ou
         },
         p.sequence,
     )
+}
+
+/// Apply unified `GameEffects` emitted by any `BlockBehavior` or `ItemBehavior`
+/// and translate them into protocol replies and broadcasts.
+fn apply_game_effects(
+    ctx: &mut Context<'_>,
+    effects: crate::game::GameEffects,
+    sequence: i32,
+) -> io::Result<Outcome> {
+    for (upos, ustate) in effects.block_updates {
+        let _ = ctx
+            .server
+            .play
+            .set_block(ctx.server.players(), upos, ustate)?;
+    }
+    if let Some(day_time) = effects.set_day_time {
+        let time_pkt = ctx.server.play.set_day_time(day_time);
+        let _ = ctx.server.players().broadcast(&time_pkt.into());
+    }
+    if let Some(duration) = effects.clear_weather_ticks {
+        for wpkt in ctx.server.play.set_weather(false, false, duration) {
+            let _ = ctx.server.players().broadcast(&wpkt);
+        }
+    }
+    for msg in effects.broadcast_messages {
+        let _ = ctx.server.players().broadcast_system_chat(&msg);
+    }
+    if !effects.player_drops.is_empty()
+        && let Ok(state) = play(ctx.session)
+    {
+        let ppos = state.player.position;
+        for stack in effects.player_drops {
+            let _ = ctx.server.play.spawn_item_drop_scatter(
+                ctx.server.players(),
+                [ppos[0], ppos[1] + 0.5, ppos[2]],
+                stack,
+                10,
+            );
+        }
+    }
+
+    let mut replies: Vec<Clientbound> = effects
+        .player_messages
+        .into_iter()
+        .map(|msg| crate::protocol::packets::play_chat::SystemChat(msg).into())
+        .collect();
+
+    if let Some(screen) = effects.open_screen {
+        let world = ctx.server.play.world().clone();
+        match screen {
+            crate::game::ContainerScreen::CraftingTable => {
+                let state = play(ctx.session)?;
+                let window_id = state.next_window_id;
+                state.next_window_id = if window_id >= 100 { 1 } else { window_id + 1 };
+                state.open_container = Some(OpenContainer {
+                    window_id,
+                    kind: ContainerKind::CraftingTable {
+                        grid: [None; 9],
+                        output: None,
+                    },
+                    state_id: 0,
+                });
+                let slots = crate::game::containers::crafting_table_slots(
+                    None,
+                    &[None; 9],
+                    &ctx.session.inventory,
+                );
+                replies.push(
+                    OpenScreen {
+                        window_id: i32::from(window_id),
+                        menu_type: 12, // crafting
+                        title: "Crafting".into(),
+                    }
+                    .into(),
+                );
+                replies.push(
+                    InventoryContent::container(
+                        window_id,
+                        0,
+                        slots,
+                        ctx.session.inventory.carried(),
+                    )
+                    .into(),
+                );
+            }
+            crate::game::ContainerScreen::Furnace(fpos) => {
+                if let Some(furnace) = world.furnace_data(fpos) {
+                    let state = play(ctx.session)?;
+                    let uuid = state.player.uuid;
+                    let window_id = state.next_window_id;
+                    state.next_window_id = if window_id >= 100 { 1 } else { window_id + 1 };
+                    state.open_container = Some(OpenContainer {
+                        window_id,
+                        kind: ContainerKind::Furnace(fpos),
+                        state_id: 0,
+                    });
+                    let _ = ctx.server.play.open_chest_viewer(fpos, uuid);
+                    let slots =
+                        crate::game::containers::furnace_slots(&furnace, &ctx.session.inventory);
+                    replies.push(
+                        OpenScreen {
+                            window_id: i32::from(window_id),
+                            menu_type: 14, // furnace
+                            title: "Furnace".into(),
+                        }
+                        .into(),
+                    );
+                    replies.push(
+                        InventoryContent::container(
+                            window_id,
+                            0,
+                            slots,
+                            ctx.session.inventory.carried(),
+                        )
+                        .into(),
+                    );
+                    replies.extend(furnace_property_packets(window_id, &furnace));
+                }
+            }
+            crate::game::ContainerScreen::Chest(cpos) => {
+                if let Some(chest_items) = world.chest_items(cpos) {
+                    let state = play(ctx.session)?;
+                    let uuid = state.player.uuid;
+                    let window_id = state.next_window_id;
+                    state.next_window_id = if window_id >= 100 { 1 } else { window_id + 1 };
+                    state.open_container = Some(OpenContainer {
+                        window_id,
+                        kind: ContainerKind::Chest(cpos),
+                        state_id: 0,
+                    });
+                    let viewer_count = ctx.server.play.open_chest_viewer(cpos, uuid);
+                    broadcast_chest_lid_count(ctx.server.players(), cpos, viewer_count)?;
+                    let slots = crate::game::containers::container_slots(
+                        &chest_items,
+                        &ctx.session.inventory,
+                    );
+                    replies.push(
+                        OpenScreen {
+                            window_id: i32::from(window_id),
+                            menu_type: 2, // generic_9x3
+                            title: "Chest".into(),
+                        }
+                        .into(),
+                    );
+                    replies.push(
+                        InventoryContent::container(
+                            window_id,
+                            0,
+                            slots,
+                            ctx.session.inventory.carried(),
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+    }
+
+    if effects.inventory_changed {
+        sync_equipment(ctx)?;
+        replies.push(InventoryContent::player(&ctx.session.inventory).into());
+    }
+    if replies.is_empty()
+        && let Some(slot) = &ctx.session.reservation
+        && ctx
+            .session
+            .play
+            .as_ref()
+            .is_some_and(|state| state.player.can_interact())
+    {
+        let ack = Clientbound::from(BlockAck(sequence)).encode()?.into();
+        slot.correct_blocks(Vec::new(), ack);
+        return Ok(Outcome::empty());
+    }
+    replies.push(BlockAck(sequence).into());
+    Ok(reply(replies))
 }
 
 pub async fn handle_close_window(ctx: &mut Context<'_>, p: CloseWindow) -> io::Result<Outcome> {
@@ -841,106 +887,22 @@ pub(super) fn broadcast_chest_lid_count(
     Ok(())
 }
 
-fn container_slots(
-    chest: &[Option<crate::game::ItemStack>; crate::world::CHEST_SLOTS],
-    inv: &crate::game::Inventory,
-) -> Vec<Option<crate::game::ItemStack>> {
-    let mut slots = Vec::with_capacity(crate::world::CHEST_SLOTS + 36);
-    slots.extend_from_slice(chest);
-    slots.extend_from_slice(&inv.slots()[9..45]);
-    slots
-}
-
-fn crafting_table_slots(
-    output: Option<crate::game::ItemStack>,
-    grid: &[Option<crate::game::ItemStack>; 9],
-    inv: &crate::game::Inventory,
-) -> Vec<Option<crate::game::ItemStack>> {
-    let mut slots = Vec::with_capacity(46);
-    slots.push(output);
-    slots.extend_from_slice(grid);
-    slots.extend_from_slice(&inv.slots()[9..45]);
-    slots
-}
-
-fn furnace_slots(
-    furnace: &crate::world::FurnaceData,
-    inv: &crate::game::Inventory,
-) -> Vec<Option<crate::game::ItemStack>> {
-    let mut slots = Vec::with_capacity(39);
-    slots.extend_from_slice(&furnace.slots());
-    slots.extend_from_slice(&inv.slots()[9..45]);
-    slots
-}
-
 pub async fn handle_use_item(ctx: &mut Context<'_>, p: UseItem) -> io::Result<Outcome> {
-    let mut bucket_action: Option<(Hand, BlockPos, i32, crate::game::Item, bool, [f64; 3])> = None;
-    if let Some(hand) = Hand::from_wire(p.hand)
+    let effects = if let Some(hand) = Hand::from_wire(p.hand)
         && let Some(stack) = ctx.session.inventory.hand(hand)
-        && let Ok(state) = play(ctx.session)
+        && let Some(state) = ctx.session.play.as_mut()
     {
         let world = ctx.server.play.world();
-        match crate::game::item_behavior(stack.item).on_use(world, &state.player, hand, stack) {
-            crate::game::ItemUseOutcome::StartEating {
-                hand,
-                item,
-                eat_ticks,
-            } => {
-                state.player.eating = Some((hand, item, tokio::time::Instant::now(), eat_ticks));
-            }
-            crate::game::ItemUseOutcome::UseBucket {
-                hand,
-                pos,
-                new_state,
-                result_item,
-            } => {
-                bucket_action = Some((
-                    hand,
-                    pos,
-                    new_state,
-                    result_item,
-                    state.player.is_survival(),
-                    state.player.position,
-                ));
-            }
-            crate::game::ItemUseOutcome::Pass => {}
-        }
-    }
-    if let Some((hand, pos, new_state, result_item, is_survival, player_pos)) = bucket_action {
-        let changed = ctx
-            .server
-            .play
-            .set_block(ctx.server.players(), pos, new_state)?;
-        if changed
-            && is_survival
-            && let Some(replacement) = crate::game::ItemStack::new(result_item, 1)
-        {
-            if let Some(overflow) = ctx.session.inventory.replace_hand_one(hand, replacement) {
-                let _ = ctx.server.play.spawn_item_drop_scatter(
-                    ctx.server.players(),
-                    [player_pos[0], player_pos[1] + 0.5, player_pos[2]],
-                    overflow,
-                    10,
-                );
-            }
-            sync_equipment(ctx)?;
-            let mut out = inventory(ctx)?;
-            out.replies.push(BlockAck(p.sequence).into());
-            return Ok(out);
-        }
-    }
-    if let Some(slot) = &ctx.session.reservation
-        && ctx
-            .session
-            .play
-            .as_ref()
-            .is_some_and(|state| state.player.can_interact())
-    {
-        let ack = Clientbound::from(BlockAck(p.sequence)).encode()?.into();
-        slot.correct_blocks(Vec::new(), ack);
-        return Ok(Outcome::empty());
-    }
-    Ok(reply(vec![BlockAck(p.sequence).into()]))
+        let mut use_ctx = crate::game::UseContext {
+            world,
+            player: &mut state.player,
+            inventory: &mut ctx.session.inventory,
+        };
+        crate::game::item_behavior(stack.item).on_use(&mut use_ctx, hand, stack)
+    } else {
+        crate::game::GameEffects::pass()
+    };
+    apply_game_effects(ctx, effects, p.sequence)
 }
 
 pub async fn handle_slot(ctx: &mut Context<'_>, p: HeldItemSlot) -> io::Result<Outcome> {
@@ -1044,7 +1006,8 @@ pub async fn handle_inventory_click(
                 let inv = &mut ctx.session.inventory;
                 let mut dropped: Option<crate::game::ItemStack> = None;
                 let updated = world.update_chest(cpos, |chest| {
-                    let (changed, drop) = apply_chest_click(chest, inv, p.click);
+                    let (changed, drop) =
+                        crate::game::containers::apply_chest_click(chest, inv, p.click);
                     dropped = drop;
                     changed
                 });
@@ -1066,7 +1029,8 @@ pub async fn handle_inventory_click(
                     state_id: next_state_id,
                 });
                 sync_equipment(ctx)?;
-                let slots = container_slots(&chest_items, &ctx.session.inventory);
+                let slots =
+                    crate::game::containers::container_slots(&chest_items, &ctx.session.inventory);
                 return Ok(reply(vec![
                     InventoryContent::container(
                         open.window_id,
@@ -1081,7 +1045,7 @@ pub async fn handle_inventory_click(
                 mut grid,
                 mut output,
             } => {
-                let dropped = apply_crafting_table_click(
+                let dropped = crate::game::containers::apply_crafting_table_click(
                     &mut grid,
                     &mut output,
                     &mut ctx.session.inventory,
@@ -1096,7 +1060,11 @@ pub async fn handle_inventory_click(
                     state_id: next_state_id,
                 });
                 sync_equipment(ctx)?;
-                let slots = crafting_table_slots(output, &grid, &ctx.session.inventory);
+                let slots = crate::game::containers::crafting_table_slots(
+                    output,
+                    &grid,
+                    &ctx.session.inventory,
+                );
                 return Ok(reply(vec![
                     InventoryContent::container(
                         open.window_id,
@@ -1112,7 +1080,8 @@ pub async fn handle_inventory_click(
                 let inv = &mut ctx.session.inventory;
                 let mut dropped: Option<crate::game::ItemStack> = None;
                 let updated = world.update_furnace(fpos, |furnace| {
-                    let (changed, drop) = apply_furnace_click(furnace, inv, p.click);
+                    let (changed, drop) =
+                        crate::game::containers::apply_furnace_click(furnace, inv, p.click);
                     dropped = drop;
                     changed
                 });
@@ -1134,7 +1103,8 @@ pub async fn handle_inventory_click(
                     state_id: next_state_id,
                 });
                 sync_equipment(ctx)?;
-                let slots = furnace_slots(&furnace, &ctx.session.inventory);
+                let slots =
+                    crate::game::containers::furnace_slots(&furnace, &ctx.session.inventory);
                 let mut replies = vec![
                     InventoryContent::container(
                         open.window_id,
@@ -1150,7 +1120,7 @@ pub async fn handle_inventory_click(
         }
     }
     if p.window == 0 && p.state_id == ctx.session.inventory.state_id() {
-        let dropped = preview_player_drop(&ctx.session.inventory, p.click);
+        let dropped = crate::game::containers::preview_player_drop(&ctx.session.inventory, p.click);
         if ctx.session.inventory.click(p.click) == crate::game::ClickResult::Changed {
             if let Some(stack) = dropped {
                 throw_item_from_player(ctx, stack)?;
@@ -1161,688 +1131,4 @@ pub async fn handle_inventory_click(
     // Full authoritative state keeps unsupported modes and stale client state
     // simple and makes adding containers later independent of player storage.
     inventory(ctx)
-}
-
-fn preview_player_drop(
-    inv: &crate::game::Inventory,
-    click: crate::game::InventoryClick,
-) -> Option<crate::game::ItemStack> {
-    if click.mode == 0 && click.slot == -999 {
-        let mut carried = inv.carried()?;
-        match click.button {
-            0 => Some(carried),
-            1 => {
-                carried.count = 1;
-                Some(carried)
-            }
-            _ => None,
-        }
-    } else if click.mode == 4 {
-        let slot = usize::try_from(click.slot).ok()?;
-        let mut stack = (*inv.slots().get(slot)?)?;
-        match click.button {
-            0 => {
-                stack.count = 1;
-                Some(stack)
-            }
-            1 => Some(stack),
-            _ => None,
-        }
-    } else {
-        None
-    }
-}
-
-fn apply_chest_click(
-    chest: &mut [Option<crate::game::ItemStack>; crate::world::CHEST_SLOTS],
-    inv: &mut crate::game::Inventory,
-    click: crate::game::InventoryClick,
-) -> (bool, Option<crate::game::ItemStack>) {
-    // Drop cursor item when clicking outside (-999) in mode 0.
-    if click.mode == 0 && click.slot == -999 {
-        let Some(mut car) = inv.carried() else {
-            return (false, None);
-        };
-        return match click.button {
-            0 => {
-                inv.set_carried(None);
-                (true, Some(car))
-            }
-            1 => {
-                let mut one = car;
-                one.count = 1;
-                car.count -= 1;
-                inv.set_carried((car.count > 0).then_some(car));
-                (true, Some(one))
-            }
-            _ => (false, None),
-        };
-    }
-
-    let Ok(slot) = usize::try_from(click.slot) else {
-        return (false, None);
-    };
-    let total = crate::world::CHEST_SLOTS + 36;
-    if slot >= total {
-        return (false, None);
-    }
-
-    let get_slot = |chest: &[Option<crate::game::ItemStack>; crate::world::CHEST_SLOTS],
-                    inv: &crate::game::Inventory,
-                    idx: usize| {
-        if idx < crate::world::CHEST_SLOTS {
-            chest[idx]
-        } else {
-            inv.slots()[9 + (idx - crate::world::CHEST_SLOTS)]
-        }
-    };
-    let set_slot = |chest: &mut [Option<crate::game::ItemStack>; crate::world::CHEST_SLOTS],
-                    inv: &mut crate::game::Inventory,
-                    idx: usize,
-                    val: Option<crate::game::ItemStack>| {
-        if idx < crate::world::CHEST_SLOTS {
-            chest[idx] = val;
-        } else {
-            inv.set_slot(9 + (idx - crate::world::CHEST_SLOTS), val);
-        }
-    };
-
-    // Mode 2: Number-key hotbar swap (0..=8) or offhand swap (40).
-    if click.mode == 2 {
-        let target_inv = match click.button {
-            0..=8 => 36 + click.button as usize,
-            40 => 45,
-            _ => return (false, None),
-        };
-        let a = get_slot(chest, inv, slot);
-        let b = inv.slots()[target_inv];
-        set_slot(chest, inv, slot, b);
-        inv.set_slot(target_inv, a);
-        return (true, None);
-    }
-
-    // Mode 4: Drop key (Q = 0 drops 1, Ctrl+Q = 1 drops full stack).
-    if click.mode == 4 {
-        let Some(mut cur) = get_slot(chest, inv, slot) else {
-            return (false, None);
-        };
-        return match click.button {
-            0 => {
-                let mut one = cur;
-                one.count = 1;
-                cur.count -= 1;
-                set_slot(chest, inv, slot, (cur.count > 0).then_some(cur));
-                (true, Some(one))
-            }
-            1 => {
-                set_slot(chest, inv, slot, None);
-                (true, Some(cur))
-            }
-            _ => (false, None),
-        };
-    }
-
-    // Mode 6: Double-click collect matching items into carried stack.
-    if click.mode == 6 {
-        if click.button != 0 {
-            return (false, None);
-        }
-        let Some(mut carried) = inv.carried() else {
-            return (false, None);
-        };
-        let max_stack = carried.definition().max_stack;
-        let mut changed = false;
-        for idx in 0..total {
-            if carried.count >= max_stack {
-                break;
-            }
-            if let Some(mut cur) = get_slot(chest, inv, idx)
-                && cur.item == carried.item
-                && cur.damage == carried.damage
-            {
-                let moved = (max_stack - carried.count).min(cur.count);
-                carried.count += moved;
-                cur.count -= moved;
-                set_slot(chest, inv, idx, (cur.count > 0).then_some(cur));
-                changed = true;
-            }
-        }
-        if changed {
-            inv.set_carried(Some(carried));
-        }
-        return (changed, None);
-    }
-
-    // Shift-click (mode 1): quick-move between chest (0..27) and player inventory (27..63).
-    if click.mode == 1 {
-        let Some(mut moving) = get_slot(chest, inv, slot) else {
-            return (false, None);
-        };
-        let max_stack = moving.definition().max_stack;
-        if slot < crate::world::CHEST_SLOTS {
-            for target in (9..45).rev() {
-                if let Some(mut existing) = inv.slots()[target]
-                    && existing.item == moving.item
-                    && existing.damage == moving.damage
-                    && existing.count < max_stack
-                {
-                    let add = (max_stack - existing.count).min(moving.count);
-                    existing.count += add;
-                    moving.count -= add;
-                    inv.set_slot(target, Some(existing));
-                    if moving.count == 0 {
-                        chest[slot] = None;
-                        return (true, None);
-                    }
-                }
-            }
-            for target in (9..45).rev() {
-                if inv.slots()[target].is_none() {
-                    inv.set_slot(target, Some(moving));
-                    chest[slot] = None;
-                    return (true, None);
-                }
-            }
-            chest[slot] = Some(moving);
-            return (true, None);
-        } else {
-            let inv_idx = 9 + (slot - crate::world::CHEST_SLOTS);
-            for slot_ref in chest.iter_mut() {
-                if let Some(mut existing) = *slot_ref
-                    && existing.item == moving.item
-                    && existing.damage == moving.damage
-                    && existing.count < max_stack
-                {
-                    let add = (max_stack - existing.count).min(moving.count);
-                    existing.count += add;
-                    moving.count -= add;
-                    *slot_ref = Some(existing);
-                    if moving.count == 0 {
-                        inv.set_slot(inv_idx, None);
-                        return (true, None);
-                    }
-                }
-            }
-            for slot_ref in chest.iter_mut() {
-                if slot_ref.is_none() {
-                    *slot_ref = Some(moving);
-                    inv.set_slot(inv_idx, None);
-                    return (true, None);
-                }
-            }
-            inv.set_slot(inv_idx, Some(moving));
-            return (true, None);
-        }
-    }
-
-    if click.mode != 0 || !matches!(click.button, 0 | 1) {
-        return (false, None);
-    }
-
-    let current = get_slot(chest, inv, slot);
-    let carried = inv.carried();
-
-    let (next_slot, next_carried) = match (click.button, current, carried) {
-        // Left click: pick up / put down / merge / swap.
-        (0, Some(mut cur), Some(mut car)) if cur.item == car.item && cur.damage == car.damage => {
-            let max_stack = cur.definition().max_stack;
-            let add = (max_stack - cur.count).min(car.count);
-            cur.count += add;
-            car.count -= add;
-            (Some(cur), (car.count > 0).then_some(car))
-        }
-        (0, cur, car) => (car, cur),
-        // Right click: split half when empty hand, or place 1 item.
-        (1, Some(mut cur), None) => {
-            let take = cur.count.div_ceil(2);
-            cur.count -= take;
-            let taken = crate::game::ItemStack::with_damage(cur.item, take, cur.damage);
-            ((cur.count > 0).then_some(cur), taken)
-        }
-        (1, None, Some(mut car)) => {
-            let placed = crate::game::ItemStack::with_damage(car.item, 1, car.damage);
-            car.count -= 1;
-            (placed, (car.count > 0).then_some(car))
-        }
-        (1, Some(mut cur), Some(mut car))
-            if cur.item == car.item
-                && cur.damage == car.damage
-                && cur.count < cur.definition().max_stack =>
-        {
-            cur.count += 1;
-            car.count -= 1;
-            (Some(cur), (car.count > 0).then_some(car))
-        }
-        (1, cur, car) => (car, cur),
-        _ => return (false, None),
-    };
-
-    set_slot(chest, inv, slot, next_slot);
-    inv.set_carried(next_carried);
-    (true, None)
-}
-
-fn apply_crafting_table_click(
-    grid: &mut [Option<crate::game::ItemStack>; 9],
-    output: &mut Option<crate::game::ItemStack>,
-    inv: &mut crate::game::Inventory,
-    click: crate::game::InventoryClick,
-) -> Option<crate::game::ItemStack> {
-    if click.mode == 0 && click.slot == -999 {
-        let mut car = inv.carried()?;
-        return match click.button {
-            0 => {
-                inv.set_carried(None);
-                Some(car)
-            }
-            1 => {
-                let mut one = car;
-                one.count = 1;
-                car.count -= 1;
-                inv.set_carried((car.count > 0).then_some(car));
-                Some(one)
-            }
-            _ => None,
-        };
-    }
-
-    let slot = usize::try_from(click.slot).ok()?;
-    if slot >= 46 {
-        return None;
-    }
-
-    let consume_one = |grid: &mut [Option<crate::game::ItemStack>; 9],
-                       output: &mut Option<crate::game::ItemStack>| {
-        for cell in grid.iter_mut() {
-            if let Some(mut s) = *cell {
-                if s.count > 1 {
-                    s.count -= 1;
-                    *cell = Some(s);
-                } else {
-                    *cell = crate::game::container_remainder(s.item);
-                }
-            }
-        }
-        *output = crate::game::match_crafting(3, 3, grid);
-    };
-
-    // Slot 0 = crafting output.
-    if slot == 0 {
-        if click.mode == 1 {
-            // Shift-click: craft up to 64 times while inventory has room.
-            for _ in 0..64 {
-                let Some(res) = *output else {
-                    break;
-                };
-                let added = inv.give_stack(res);
-                if added < res.count {
-                    // Undo partial insert? Better: check capacity beforehand; simple check:
-                    break;
-                }
-                consume_one(grid, output);
-            }
-            return None;
-        }
-        if click.mode == 0 && matches!(click.button, 0 | 1) {
-            let res = (*output)?;
-            match inv.carried() {
-                None => {
-                    inv.set_carried(Some(res));
-                    consume_one(grid, output);
-                }
-                Some(mut held)
-                    if held.item == res.item
-                        && held.damage == res.damage
-                        && u16::from(held.count) + u16::from(res.count)
-                            <= u16::from(res.definition().max_stack) =>
-                {
-                    held.count += res.count;
-                    inv.set_carried(Some(held));
-                    consume_one(grid, output);
-                }
-                _ => {}
-            }
-        }
-        return None;
-    }
-
-    let get_s =
-        |grid: &[Option<crate::game::ItemStack>; 9], inv: &crate::game::Inventory, idx: usize| {
-            if (1..=9).contains(&idx) {
-                grid[idx - 1]
-            } else {
-                inv.slots()[9 + (idx - 10)]
-            }
-        };
-    let set_s = |grid: &mut [Option<crate::game::ItemStack>; 9],
-                 inv: &mut crate::game::Inventory,
-                 idx: usize,
-                 val: Option<crate::game::ItemStack>| {
-        if (1..=9).contains(&idx) {
-            grid[idx - 1] = val;
-        } else {
-            inv.set_slot(9 + (idx - 10), val);
-        }
-    };
-
-    let mut dropped = None;
-    match click.mode {
-        0 if matches!(click.button, 0 | 1) => {
-            let cur = get_s(grid, inv, slot);
-            let car = inv.carried();
-            let (ns, nc) = merge_or_swap(click.button, cur, car);
-            set_s(grid, inv, slot, ns);
-            inv.set_carried(nc);
-        }
-        1 => {
-            if let Some(mut moving) = get_s(grid, inv, slot) {
-                if (1..=9).contains(&slot) {
-                    let added = inv.give_stack(moving);
-                    moving.count -= added;
-                    set_s(grid, inv, slot, (moving.count > 0).then_some(moving));
-                } else {
-                    // Move between main (10..37) and hotbar (37..46).
-                    let targets = if slot < 37 { 37..46 } else { 10..37 };
-                    let max_stack = moving.definition().max_stack;
-                    for t in targets.clone() {
-                        if let Some(mut ex) = get_s(grid, inv, t)
-                            && ex.item == moving.item
-                            && ex.damage == moving.damage
-                            && ex.count < max_stack
-                        {
-                            let add = (max_stack - ex.count).min(moving.count);
-                            ex.count += add;
-                            moving.count -= add;
-                            set_s(grid, inv, t, Some(ex));
-                            if moving.count == 0 {
-                                break;
-                            }
-                        }
-                    }
-                    if moving.count > 0 {
-                        for t in targets {
-                            if get_s(grid, inv, t).is_none() {
-                                set_s(grid, inv, t, Some(moving));
-                                moving.count = 0;
-                                break;
-                            }
-                        }
-                    }
-                    set_s(grid, inv, slot, (moving.count > 0).then_some(moving));
-                }
-            }
-        }
-        2 => {
-            let target_inv = match click.button {
-                0..=8 => Some(36 + click.button as usize),
-                40 => Some(45),
-                _ => None,
-            };
-            if let Some(tinv) = target_inv {
-                let a = get_s(grid, inv, slot);
-                let b = inv.slots()[tinv];
-                set_s(grid, inv, slot, b);
-                inv.set_slot(tinv, a);
-            }
-        }
-        4 => {
-            if let Some(mut cur) = get_s(grid, inv, slot) {
-                match click.button {
-                    0 => {
-                        let mut one = cur;
-                        one.count = 1;
-                        cur.count -= 1;
-                        set_s(grid, inv, slot, (cur.count > 0).then_some(cur));
-                        dropped = Some(one);
-                    }
-                    1 => {
-                        set_s(grid, inv, slot, None);
-                        dropped = Some(cur);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-
-    *output = crate::game::match_crafting(3, 3, grid);
-    dropped
-}
-
-fn apply_furnace_click(
-    furnace: &mut crate::world::FurnaceData,
-    inv: &mut crate::game::Inventory,
-    click: crate::game::InventoryClick,
-) -> (bool, Option<crate::game::ItemStack>) {
-    if click.mode == 0 && click.slot == -999 {
-        let Some(mut car) = inv.carried() else {
-            return (false, None);
-        };
-        return match click.button {
-            0 => {
-                inv.set_carried(None);
-                (true, Some(car))
-            }
-            1 => {
-                let mut one = car;
-                one.count = 1;
-                car.count -= 1;
-                inv.set_carried((car.count > 0).then_some(car));
-                (true, Some(one))
-            }
-            _ => (false, None),
-        };
-    }
-
-    let Ok(slot) = usize::try_from(click.slot) else {
-        return (false, None);
-    };
-    if slot >= 39 {
-        return (false, None);
-    }
-
-    let get_s = |f: &crate::world::FurnaceData, inv: &crate::game::Inventory, idx: usize| match idx
-    {
-        0 => f.input,
-        1 => f.fuel,
-        2 => f.output,
-        _ => inv.slots()[9 + (idx - 3)],
-    };
-    let set_s = |f: &mut crate::world::FurnaceData,
-                 inv: &mut crate::game::Inventory,
-                 idx: usize,
-                 val: Option<crate::game::ItemStack>| match idx {
-        0 => f.input = val,
-        1 => f.fuel = val,
-        2 => f.output = val,
-        _ => inv.set_slot(9 + (idx - 3), val),
-    };
-
-    // Output slot 2: only take out, never place in.
-    if slot == 2 {
-        if click.mode == 1 {
-            let Some(mut out) = furnace.output else {
-                return (false, None);
-            };
-            let added = inv.give_stack(out);
-            if added == 0 {
-                return (false, None);
-            }
-            out.count -= added;
-            furnace.output = (out.count > 0).then_some(out);
-            return (true, None);
-        }
-        if click.mode == 0 && matches!(click.button, 0 | 1) {
-            let Some(out) = furnace.output else {
-                return (false, None);
-            };
-            return match inv.carried() {
-                None => {
-                    inv.set_carried(Some(out));
-                    furnace.output = None;
-                    (true, None)
-                }
-                Some(mut held)
-                    if held.item == out.item
-                        && held.damage == out.damage
-                        && u16::from(held.count) + u16::from(out.count)
-                            <= u16::from(out.definition().max_stack) =>
-                {
-                    held.count += out.count;
-                    inv.set_carried(Some(held));
-                    furnace.output = None;
-                    (true, None)
-                }
-                _ => (false, None),
-            };
-        }
-        return (false, None);
-    }
-
-    match click.mode {
-        0 if matches!(click.button, 0 | 1) => {
-            let cur = get_s(furnace, inv, slot);
-            let car = inv.carried();
-            // Restrict fuel slot (1) to valid fuel items or empty bucket.
-            if slot == 1
-                && let Some(c) = car
-                && crate::game::fuel_burn_ticks(c.item).is_none()
-                && c.definition().name != "minecraft:bucket"
-            {
-                return (false, None);
-            }
-            let (ns, nc) = merge_or_swap(click.button, cur, car);
-            set_s(furnace, inv, slot, ns);
-            inv.set_carried(nc);
-            (true, None)
-        }
-        1 => {
-            let Some(mut moving) = get_s(furnace, inv, slot) else {
-                return (false, None);
-            };
-            if slot < 3 {
-                let added = inv.give_stack(moving);
-                if added == 0 {
-                    return (false, None);
-                }
-                moving.count -= added;
-                set_s(furnace, inv, slot, (moving.count > 0).then_some(moving));
-                (true, None)
-            } else {
-                // Shift-click from player inventory: fuel -> slot 1, smeltable -> slot 0.
-                let target_slot = if crate::game::match_smelting(Some(moving)).is_some() {
-                    Some(0)
-                } else if crate::game::fuel_burn_ticks(moving.item).is_some() {
-                    Some(1)
-                } else {
-                    None
-                };
-                if let Some(ts) = target_slot {
-                    let cur = get_s(furnace, inv, ts);
-                    match cur {
-                        None => {
-                            set_s(furnace, inv, ts, Some(moving));
-                            set_s(furnace, inv, slot, None);
-                            return (true, None);
-                        }
-                        Some(mut ex)
-                            if ex.item == moving.item
-                                && ex.damage == moving.damage
-                                && ex.count < ex.definition().max_stack =>
-                        {
-                            let add = (ex.definition().max_stack - ex.count).min(moving.count);
-                            ex.count += add;
-                            moving.count -= add;
-                            set_s(furnace, inv, ts, Some(ex));
-                            set_s(furnace, inv, slot, (moving.count > 0).then_some(moving));
-                            return (true, None);
-                        }
-                        _ => {}
-                    }
-                }
-                (false, None)
-            }
-        }
-        2 => {
-            let target_inv = match click.button {
-                0..=8 => 36 + click.button as usize,
-                40 => 45,
-                _ => return (false, None),
-            };
-            let b = inv.slots()[target_inv];
-            if slot == 1
-                && let Some(c) = b
-                && crate::game::fuel_burn_ticks(c.item).is_none()
-            {
-                return (false, None);
-            }
-            let a = get_s(furnace, inv, slot);
-            set_s(furnace, inv, slot, b);
-            inv.set_slot(target_inv, a);
-            (true, None)
-        }
-        4 => {
-            let Some(mut cur) = get_s(furnace, inv, slot) else {
-                return (false, None);
-            };
-            match click.button {
-                0 => {
-                    let mut one = cur;
-                    one.count = 1;
-                    cur.count -= 1;
-                    set_s(furnace, inv, slot, (cur.count > 0).then_some(cur));
-                    (true, Some(one))
-                }
-                1 => {
-                    set_s(furnace, inv, slot, None);
-                    (true, Some(cur))
-                }
-                _ => (false, None),
-            }
-        }
-        _ => (false, None),
-    }
-}
-
-fn merge_or_swap(
-    button: i8,
-    current: Option<crate::game::ItemStack>,
-    carried: Option<crate::game::ItemStack>,
-) -> (
-    Option<crate::game::ItemStack>,
-    Option<crate::game::ItemStack>,
-) {
-    match (button, current, carried) {
-        (0, Some(mut cur), Some(mut car)) if cur.item == car.item && cur.damage == car.damage => {
-            let max_stack = cur.definition().max_stack;
-            let add = (max_stack - cur.count).min(car.count);
-            cur.count += add;
-            car.count -= add;
-            (Some(cur), (car.count > 0).then_some(car))
-        }
-        (0, cur, car) => (car, cur),
-        (1, Some(mut cur), None) => {
-            let take = cur.count.div_ceil(2);
-            cur.count -= take;
-            let taken = crate::game::ItemStack::with_damage(cur.item, take, cur.damage);
-            ((cur.count > 0).then_some(cur), taken)
-        }
-        (1, None, Some(mut car)) => {
-            let placed = crate::game::ItemStack::with_damage(car.item, 1, car.damage);
-            car.count -= 1;
-            (placed, (car.count > 0).then_some(car))
-        }
-        (1, Some(mut cur), Some(mut car))
-            if cur.item == car.item
-                && cur.damage == car.damage
-                && cur.count < cur.definition().max_stack =>
-        {
-            cur.count += 1;
-            car.count -= 1;
-            (Some(cur), (car.count > 0).then_some(car))
-        }
-        (1, cur, car) => (car, cur),
-        _ => (current, carried),
-    }
 }
