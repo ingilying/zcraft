@@ -17,6 +17,10 @@ pub(crate) struct ChunkStore {
     chunks: HashMap<[i32; 2], Arc<Chunk>>,
     light_cache: HashMap<[i32; 2], Arc<[u8]>>,
     dirty: HashSet<[i32; 2]>,
+    /// Chunks that failed to load from Anvil due to corruption or I/O error.
+    /// Served from a temporary in-memory fallback and never persisted back to
+    /// disk so the original on-disk data is never silently overwritten.
+    load_failed: HashSet<[i32; 2]>,
     access_order: HashMap<[i32; 2], u64>,
     access_clock: u64,
     max_cached_chunks: usize,
@@ -38,9 +42,16 @@ impl ChunkStore {
             chunks: HashMap::new(),
             light_cache: HashMap::new(),
             dirty: HashSet::new(),
+            load_failed: HashSet::new(),
             access_order: HashMap::new(),
             access_clock: 0,
             max_cached_chunks: max_cached_chunks.max(16),
+        }
+    }
+
+    fn mark_chunk_dirty(&mut self, coords: [i32; 2]) {
+        if !self.load_failed.contains(&coords) {
+            self.dirty.insert(coords);
         }
     }
 
@@ -74,39 +85,62 @@ impl ChunkStore {
             self.chunks.remove(&coords);
             self.access_order.remove(&coords);
             self.light_cache.remove(&coords);
+            self.load_failed.remove(&coords);
         }
     }
 
     /// Return the chunk at `coords`, lazily loading from Anvil `.mca` on first
     /// access or generating via `ChunkGenerator` if absent on disk.
+    ///
+    /// If loading fails due to corruption or an I/O error, the chunk is served
+    /// from an in-memory fallback and quarantined in `load_failed` so it will
+    /// never be marked dirty or overwrite the existing on-disk region data.
     pub(crate) fn get_or_load(&mut self, coords: [i32; 2]) -> Arc<Chunk> {
         if let Some(chunk) = self.chunks.get(&coords).cloned() {
             self.touch(coords);
             return chunk;
         }
-        let loaded = self.storage.as_ref().and_then(|storage| {
-            match storage.load_chunk(coords[0], coords[1]) {
-                Ok(Some(chunk)) => Some(Arc::new(chunk)),
-                Ok(None) => None,
+        enum LoadOutcome {
+            Loaded(Arc<Chunk>),
+            Absent,
+            Failed,
+        }
+        let outcome = match self.storage.as_ref() {
+            Some(storage) => match storage.load_chunk(coords[0], coords[1]) {
+                Ok(Some(chunk)) => LoadOutcome::Loaded(Arc::new(chunk)),
+                Ok(None) => LoadOutcome::Absent,
                 Err(error) => {
                     tracing::error!(
                         cx = coords[0],
                         cz = coords[1],
                         %error,
-                        "failed to load Anvil chunk; falling back to generator"
+                        "failed to load Anvil chunk; using read-only fallback without overwriting disk"
                     );
-                    None
+                    LoadOutcome::Failed
                 }
+            },
+            None => LoadOutcome::Absent,
+        };
+        let chunk = match outcome {
+            LoadOutcome::Loaded(chunk) => {
+                self.load_failed.remove(&coords);
+                chunk
             }
-        });
-        let (chunk, newly_generated) = match loaded {
-            Some(chunk) => (chunk, false),
-            None => (self.generator.generate_chunk(coords[0], coords[1]), true),
+            LoadOutcome::Absent => {
+                self.load_failed.remove(&coords);
+                let chunk = self.generator.generate_chunk(coords[0], coords[1]);
+                if self.storage.is_some() {
+                    self.mark_chunk_dirty(coords);
+                }
+                chunk
+            }
+            LoadOutcome::Failed => {
+                self.load_failed.insert(coords);
+                self.dirty.remove(&coords);
+                self.generator.generate_chunk(coords[0], coords[1])
+            }
         };
         self.chunks.insert(coords, chunk.clone());
-        if newly_generated && self.storage.is_some() {
-            self.dirty.insert(coords);
-        }
         self.touch(coords);
         self.evict_if_needed();
         chunk
@@ -195,7 +229,7 @@ impl ChunkStore {
             if !is_chest_state(state) && !is_furnace_state(state) {
                 Arc::make_mut(chunk).remove_block_entity(pos.0);
             }
-            self.dirty.insert(coords);
+            self.mark_chunk_dirty(coords);
             self.touch(coords);
         }
         changed
@@ -240,7 +274,7 @@ impl ChunkStore {
                     items: Box::new(items),
                 },
             );
-            self.dirty.insert(coords);
+            self.mark_chunk_dirty(coords);
             self.touch(coords);
         }
         Some(items)
@@ -278,7 +312,7 @@ impl ChunkStore {
         if mutate(&mut data) {
             Arc::make_mut(chunk)
                 .set_block_entity(pos.0, super::BlockEntity::Furnace(Box::new(data.clone())));
-            self.dirty.insert(coords);
+            self.mark_chunk_dirty(coords);
             self.touch(coords);
         }
         Some(data)
@@ -389,7 +423,7 @@ impl ChunkStore {
                 };
                 Arc::make_mut(chunk)
                     .set_block_entity(pos.0, super::BlockEntity::Furnace(Box::new(data)));
-                self.dirty.insert(coords);
+                self.mark_chunk_dirty(coords);
                 updates.push((pos, new_block_state));
             }
         }
@@ -400,12 +434,15 @@ impl ChunkStore {
         let coords: Vec<[i32; 2]> = self.dirty.drain().collect();
         coords
             .into_iter()
+            .filter(|c| !self.load_failed.contains(c))
             .filter_map(|c| self.chunks.get(&c).cloned().map(|chunk| (c, chunk)))
             .collect()
     }
 
     pub(crate) fn mark_dirty(&mut self, chunks: impl IntoIterator<Item = [i32; 2]>) {
-        self.dirty.extend(chunks);
+        for coords in chunks {
+            self.mark_chunk_dirty(coords);
+        }
     }
 }
 
@@ -499,5 +536,47 @@ mod tests {
             data.output.unwrap().definition().name,
             "minecraft:iron_ingot"
         );
+    }
+
+    #[test]
+    fn failed_chunk_load_never_marks_dirty_or_overwrites_disk() {
+        let dir =
+            std::env::temp_dir().join(format!("zcraft-corrupt-chunk-{}", rand::random::<u64>()));
+        let region_dir = dir.join("region");
+        std::fs::create_dir_all(&region_dir).unwrap();
+        let mca_path = region_dir.join("r.0.0.mca");
+
+        // Build a valid 8 KiB header + 1 sector with corrupted zlib payload for chunk [0, 0].
+        let mut raw = vec![0u8; 3 * 4096];
+        // Location table entry 0 (chunk [0, 0]): offset = 2, sector_count = 1.
+        raw[0..4].copy_from_slice(&((2u32 << 8) | 1u32).to_be_bytes());
+        // Sector 2: length = 16, compression = 2 (zlib), followed by invalid zlib bytes.
+        let s2 = 2 * 4096;
+        raw[s2..s2 + 4].copy_from_slice(&16u32.to_be_bytes());
+        raw[s2 + 4] = 2;
+        raw[s2 + 5..s2 + 20].fill(0xde);
+        std::fs::write(&mca_path, &raw).unwrap();
+
+        let storage = AnvilStorage::new(&dir);
+        let generator = Arc::new(FlatGenerator::default());
+        let mut store = ChunkStore::new(generator, Some(storage.clone()));
+
+        // Loading the corrupted chunk [0, 0] falls back in memory without marking dirty.
+        let _ = store.get_or_load([0, 0]);
+        assert!(store.drain_dirty().is_empty());
+
+        // Even subsequent edits to [0, 0] must NOT mark it dirty or overwrite the .mca file.
+        assert!(store.set_block(BlockPos([1, 64, 1]), crate::game::GLASS_STATE));
+        assert!(store.drain_dirty().is_empty());
+
+        // Meanwhile, a genuinely absent chunk [1, 0] IS marked dirty as newly generated.
+        let _ = store.get_or_load([1, 0]);
+        let dirty = store.drain_dirty();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].0, [1, 0]);
+
+        // On-disk corrupted region file bytes remain untouched.
+        assert_eq!(std::fs::read(&mca_path).unwrap(), raw);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
