@@ -61,28 +61,28 @@ pub struct Velocity(pub [f64; 3]);
 // Granular Player Components
 // ============================================================================
 
-/// Authenticated display name of a player entity.
+/// Low-frequency player identity, game mode, and respawn metadata.
 #[derive(Component, Debug, Clone, PartialEq, Eq)]
-pub struct PlayerName(pub String);
+pub struct PlayerProfile {
+    pub name: String,
+    pub game_mode: GameMode,
+    pub respawn_point: Option<BlockPos>,
+}
 
-/// Authoritative game mode of a player entity.
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlayerGameMode(pub GameMode);
-
-impl PlayerGameMode {
-    pub fn is_creative(self) -> bool {
-        self.0 == GameMode::Creative
+impl PlayerProfile {
+    pub fn is_creative(&self) -> bool {
+        self.game_mode == GameMode::Creative
     }
 
-    pub fn is_survival(self) -> bool {
-        self.0 == GameMode::Survival
+    pub fn is_survival(&self) -> bool {
+        self.game_mode == GameMode::Survival
     }
 
-    pub fn can_interact(self) -> bool {
-        matches!(self.0, GameMode::Creative | GameMode::Survival)
+    pub fn can_interact(&self) -> bool {
+        matches!(self.game_mode, GameMode::Creative | GameMode::Survival)
     }
 
-    pub fn block_reach(self) -> f64 {
+    pub fn block_reach(&self) -> f64 {
         if self.is_creative() {
             CREATIVE_BLOCK_REACH
         } else {
@@ -91,17 +91,14 @@ impl PlayerGameMode {
     }
 }
 
-/// Movement & posture flags synced from client actions.
-#[derive(Component, Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct MovementFlags {
+/// Movement posture flags and accumulated fall distance.
+#[derive(Component, Debug, Default, Clone, Copy, PartialEq)]
+pub struct MovementState {
     pub on_ground: bool,
     pub sneaking: bool,
     pub sprinting: bool,
+    pub fall_distance: f64,
 }
-
-/// Accumulated downward fall distance in blocks (reset on landing/liquid/death).
-#[derive(Component, Debug, Default, Clone, Copy, PartialEq)]
-pub struct FallDistance(pub f64);
 
 /// Living entity health and hurt invulnerability timestamp (in ticks).
 #[derive(Component, Debug, Clone, Copy, PartialEq)]
@@ -138,10 +135,6 @@ impl Default for Hunger {
         }
     }
 }
-
-/// Optional bed/anchor respawn point for a player.
-#[derive(Component, Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct RespawnPoint(pub Option<BlockPos>);
 
 /// Authoritative 46-slot player inventory.
 #[derive(Component, Debug, Clone)]
@@ -220,16 +213,16 @@ pub struct DropSyncState {
 // Pure Stateless Gameplay Helpers over Granular Components
 // ============================================================================
 
-pub fn entity_pose(pos: Position, rot: Rotation, flags: MovementFlags) -> EntityPose {
-    EntityPose::new(pos.0, rot.yaw, rot.pitch, flags.on_ground)
+pub fn entity_pose(pos: Position, rot: Rotation, movement: MovementState) -> EntityPose {
+    EntityPose::new(pos.0, rot.yaw, rot.pitch, movement.on_ground)
 }
 
 pub fn player_eye_position(pos: Position) -> [f64; 3] {
     [pos.0[0], pos.0[1] + PLAYER_EYE_HEIGHT, pos.0[2]]
 }
 
-pub fn player_in_reach(pos: Position, mode: PlayerGameMode, target: BlockPos) -> bool {
-    let reach = mode.block_reach();
+pub fn player_in_reach(pos: Position, profile: &PlayerProfile, target: BlockPos) -> bool {
+    let reach = profile.block_reach();
     player_eye_position(pos)
         .into_iter()
         .zip(target.0)
@@ -253,8 +246,8 @@ pub fn player_intersects_block(pos: Position, target: BlockPos) -> bool {
 }
 
 /// Accumulate vanilla `FoodData` exhaustion (clamped at 40.0).
-pub fn add_exhaustion(hunger: &mut Hunger, mode: PlayerGameMode, is_dead: bool, amount: f32) {
-    if mode.is_survival() && !is_dead && amount > 0.0 && amount.is_finite() {
+pub fn add_exhaustion(hunger: &mut Hunger, is_survival: bool, is_dead: bool, amount: f32) {
+    if is_survival && !is_dead && amount > 0.0 && amount.is_finite() {
         hunger.exhaustion = (hunger.exhaustion + amount).min(40.0);
     }
 }
@@ -263,13 +256,13 @@ pub fn add_exhaustion(hunger: &mut Hunger, mode: PlayerGameMode, is_dead: bool, 
 /// Returns `(damaged, died)`.
 pub fn apply_damage_at_tick(
     health: &mut Health,
-    fall: &mut FallDistance,
-    mode: PlayerGameMode,
+    movement: &mut MovementState,
+    is_survival: bool,
     is_dead: bool,
     amount: f32,
     tick: u64,
 ) -> (bool, bool) {
-    if !mode.is_survival() || is_dead || amount <= 0.0 || !amount.is_finite() {
+    if !is_survival || is_dead || amount <= 0.0 || !amount.is_finite() {
         return (false, false);
     }
     if let Some(last) = health.last_hurt_tick
@@ -281,7 +274,7 @@ pub fn apply_damage_at_tick(
     health.last_hurt_tick = Some(tick);
     let died = health.current <= 0.0;
     if died {
-        fall.0 = 0.0;
+        movement.fall_distance = 0.0;
     }
     (true, died)
 }
@@ -337,15 +330,12 @@ pub fn tick_hunger_and_regen(health: &mut Health, hunger: &mut Hunger) -> (bool,
 pub fn snapshot_player_dto(ecs: &World, entity: Entity) -> Option<Player> {
     let entity_id = ecs.get::<NetworkEntityId>(entity)?.0;
     let uuid = ecs.get::<EntityUuid>(entity)?.0;
-    let name = ecs.get::<PlayerName>(entity)?.0.clone();
-    let game_mode = ecs.get::<PlayerGameMode>(entity)?.0;
+    let profile = ecs.get::<PlayerProfile>(entity)?;
     let pos = ecs.get::<Position>(entity)?.0;
     let rot = *ecs.get::<Rotation>(entity)?;
-    let flags = *ecs.get::<MovementFlags>(entity)?;
+    let movement = *ecs.get::<MovementState>(entity)?;
     let health = *ecs.get::<Health>(entity)?;
     let hunger = *ecs.get::<Hunger>(entity)?;
-    let fall_distance = ecs.get::<FallDistance>(entity)?.0;
-    let respawn_point = ecs.get::<RespawnPoint>(entity)?.0;
     let dead = ecs.get::<Dead>(entity).is_some();
     let eating = ecs
         .get::<EatingState>(entity)
@@ -353,24 +343,24 @@ pub fn snapshot_player_dto(ecs: &World, entity: Entity) -> Option<Player> {
     Some(Player {
         entity_id,
         uuid,
-        name,
-        game_mode,
+        name: profile.name.clone(),
+        game_mode: profile.game_mode,
         position: pos,
         yaw: rot.yaw,
         pitch: rot.pitch,
-        on_ground: flags.on_ground,
-        sneaking: flags.sneaking,
-        sprinting: flags.sprinting,
+        on_ground: movement.on_ground,
+        sneaking: movement.sneaking,
+        sprinting: movement.sprinting,
         health: health.current,
         food: hunger.food,
         saturation: hunger.saturation,
         exhaustion: hunger.exhaustion,
         food_tick_timer: hunger.tick_timer,
         eating,
-        fall_distance,
+        fall_distance: movement.fall_distance,
         dead,
         last_hurt_tick: health.last_hurt_tick,
-        respawn_point,
+        respawn_point: profile.respawn_point,
     })
 }
 
@@ -384,13 +374,15 @@ pub fn apply_player_dto(ecs: &mut World, entity: Entity, player: &Player) {
         rot.yaw = player.yaw;
         rot.pitch = player.pitch;
     }
-    if let Some(mut flags) = ecs.get_mut::<MovementFlags>(entity) {
-        flags.on_ground = player.on_ground;
-        flags.sneaking = player.sneaking;
-        flags.sprinting = player.sprinting;
+    if let Some(mut movement) = ecs.get_mut::<MovementState>(entity) {
+        movement.on_ground = player.on_ground;
+        movement.sneaking = player.sneaking;
+        movement.sprinting = player.sprinting;
+        movement.fall_distance = player.fall_distance;
     }
-    if let Some(mut gm) = ecs.get_mut::<PlayerGameMode>(entity) {
-        gm.0 = player.game_mode;
+    if let Some(mut profile) = ecs.get_mut::<PlayerProfile>(entity) {
+        profile.game_mode = player.game_mode;
+        profile.respawn_point = player.respawn_point;
     }
     if let Some(mut health) = ecs.get_mut::<Health>(entity) {
         health.current = player.health;
@@ -401,12 +393,6 @@ pub fn apply_player_dto(ecs: &mut World, entity: Entity, player: &Player) {
         hunger.saturation = player.saturation;
         hunger.exhaustion = player.exhaustion;
         hunger.tick_timer = player.food_tick_timer;
-    }
-    if let Some(mut fall) = ecs.get_mut::<FallDistance>(entity) {
-        fall.0 = player.fall_distance;
-    }
-    if let Some(mut respawn) = ecs.get_mut::<RespawnPoint>(entity) {
-        respawn.0 = player.respawn_point;
     }
     if let Ok(mut e) = ecs.get_entity_mut(entity) {
         if player.dead {

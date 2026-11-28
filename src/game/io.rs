@@ -1,12 +1,13 @@
-//! Protocol-agnostic input actions and output state-synchronization events
+//! Protocol-agnostic snapshots and outbound state-synchronization events
 //! forming the strict boundary between Network IO and the ECS Game Engine.
+//! `GameInput` is generated alongside typed ECS messages in `super::events`.
+pub use super::events::GameInput;
 use crate::{
     config::GameMode,
-    game::{Inventory, InventoryClick, Item, ItemStack, Player},
+    game::{Inventory, ItemStack, Player},
     protocol::packets::play_entities::EntityPose,
     world::{BlockPos, TimeSnapshot, WeatherEvent, WorldMutation},
 };
-use std::{collections::HashSet, io, sync::mpsc::SyncSender};
 use uuid::Uuid;
 
 /// Protocol-agnostic open container state tracked on a player entity.
@@ -68,128 +69,6 @@ pub struct PlayerSnapshot {
     pub on_ground: bool,
     pub pose: EntityPose,
     pub respawn_point: Option<BlockPos>,
-}
-
-/// Inbound actions sent from Network IO or server commands into the ECS Game Engine.
-#[derive(Debug)]
-pub enum GameInput {
-    // --- Player lifecycle & protocol-edge view notifications ---
-    PlayerJoin {
-        player: Box<Player>,
-        inventory: Box<Inventory>,
-    },
-    PlayerLeave {
-        uuid: Uuid,
-        persist: bool,
-    },
-    PlayerChunkTracked {
-        uuid: Uuid,
-        chunk: [i32; 2],
-    },
-    PlayerChunksUntracked {
-        uuid: Uuid,
-        chunks: HashSet<[i32; 2]>,
-    },
-    PlayerTeleportConfirmed {
-        uuid: Uuid,
-    },
-
-    // --- Client gameplay actions ---
-    PlayerMove {
-        uuid: Uuid,
-        position: Option<[f64; 3]>,
-        rotation: Option<[f32; 2]>,
-        on_ground: bool,
-    },
-    PlayerEntityAction {
-        uuid: Uuid,
-        action: i32,
-    },
-    PlayerArmAnimation {
-        uuid: Uuid,
-        hand: i32,
-    },
-    PlayerRespawn {
-        uuid: Uuid,
-    },
-    PlayerDig {
-        uuid: Uuid,
-        action: i32,
-        pos: BlockPos,
-        face: u8,
-        sequence: i32,
-    },
-    PlayerPlace {
-        uuid: Uuid,
-        pos: BlockPos,
-        face: i32,
-        hand: i32,
-        hit: [f32; 3],
-        sequence: i32,
-    },
-    PlayerUseItem {
-        uuid: Uuid,
-        hand: i32,
-        sequence: i32,
-    },
-    PlayerSelectSlot {
-        uuid: Uuid,
-        slot: u8,
-    },
-    PlayerCreativeSlot {
-        uuid: Uuid,
-        slot: i16,
-        /// `Some(stack_or_none)` if supported by the game registry, `None` if unsupported.
-        item: Option<Option<ItemStack>>,
-    },
-    PlayerInventoryClick {
-        uuid: Uuid,
-        window: u8,
-        state_id: i32,
-        click: InventoryClick,
-    },
-    PlayerCloseWindow {
-        uuid: Uuid,
-        window_id: u8,
-    },
-
-    // --- Server/admin gameplay controls ---
-    ControlTeleport {
-        uuid: Uuid,
-        position: [f64; 3],
-        yaw: Option<f32>,
-        pitch: Option<f32>,
-    },
-    ControlGive {
-        uuid: Uuid,
-        item: Item,
-        count: u32,
-    },
-    ControlSetGameMode {
-        uuid: Uuid,
-        mode: GameMode,
-    },
-    ControlSetBlock {
-        pos: BlockPos,
-        state: i32,
-        reply: Option<SyncSender<bool>>,
-    },
-    ControlFillBlocks {
-        from: BlockPos,
-        to: BlockPos,
-        state: i32,
-        reply: Option<SyncSender<io::Result<usize>>>,
-    },
-    ControlSetDayTime {
-        day_time: i64,
-        reply: Option<SyncSender<TimeSnapshot>>,
-    },
-    ControlSetWeather {
-        raining: bool,
-        thundering: bool,
-        duration: u32,
-        reply: Option<SyncSender<Vec<WeatherEvent>>>,
-    },
 }
 
 /// Outbound domain state-synchronization events emitted by the ECS Game Engine

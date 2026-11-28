@@ -1,296 +1,347 @@
-//! Player movement, survival exhaustion, void/fall damage, death, and entity actions.
-use super::drops::spawn_drop_scatter;
+//! Declarative ECS system for player movement, survival exhaustion, void/fall
+//! damage, death, entity actions, arm swings, and respawn.
 use crate::{
     game::{
         Hand, Player,
         components::{
-            Dead, FallDistance, Health, Hunger, MovementFlags, NetworkEntityId, PlayerGameMode,
-            PlayerInventory, PlayerName, PlayerViewState, Position, Rotation, add_exhaustion,
-            apply_damage_at_tick, entity_pose,
+            Dead, EatingState, Health, Hunger, MiningState, MovementState, NetworkEntityId,
+            PlayerContainer, PlayerInventory, PlayerMarker, PlayerProfile, PlayerViewState,
+            Position, Rotation, add_exhaustion, apply_damage_at_tick, entity_pose,
         },
+        events::{MovementMsg, SpawnDropMsg},
         io::GameOutput,
-        resources::{EntityRegistry, OutputQueue, VoxelWorld},
+        resources::{EntityRegistry, OutputQueue, TickClock, VoxelWorld},
     },
     world::{self, BlockPos},
 };
-use bevy_ecs::prelude::World;
-use uuid::Uuid;
+use bevy_ecs::prelude::{Commands, MessageReader, MessageWriter, Query, Res, ResMut, With};
 
-pub(crate) fn handle_move(
-    ecs: &mut World,
-    uuid: Uuid,
-    position: Option<[f64; 3]>,
-    rotation: Option<[f32; 2]>,
-    on_ground: bool,
-    tick: u64,
+/// Process player movement, posture flags, arm animation, and respawn requests.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn player_movement_system(
+    mut messages: MessageReader<MovementMsg>,
+    clock: Res<TickClock>,
+    world: Res<VoxelWorld>,
+    registry: Res<EntityRegistry>,
+    mut players: Query<
+        (
+            &NetworkEntityId,
+            &mut PlayerProfile,
+            &mut Position,
+            &mut Rotation,
+            &mut MovementState,
+            &mut Health,
+            &mut Hunger,
+            Option<&Dead>,
+            &mut PlayerInventory,
+            &mut PlayerContainer,
+            &mut PlayerViewState,
+        ),
+        With<PlayerMarker>,
+    >,
+    mut commands: Commands,
+    mut drops: MessageWriter<SpawnDropMsg>,
+    mut out: ResMut<OutputQueue>,
 ) {
-    let Some(&entity) = ecs.resource::<EntityRegistry>().players.get(&uuid) else {
-        return;
-    };
-    if ecs
-        .get::<PlayerViewState>(entity)
-        .is_none_or(|v| v.pending_teleport)
-    {
-        return;
-    }
-
-    let world = ecs.resource::<VoxelWorld>().0.clone();
-
-    if let Some(pos) = position
-        && !Player::position_in_bounds(pos)
-    {
-        let spawn = world.spawn_position();
-        if let Some(mut p) = ecs.get_mut::<Position>(entity) {
-            p.0 = spawn;
-        }
-        if let Some(mut r) = ecs.get_mut::<Rotation>(entity) {
-            *r = Rotation::default();
-        }
-        if let Some(mut f) = ecs.get_mut::<MovementFlags>(entity) {
-            f.on_ground = false;
-        }
-        if let Some(mut fall) = ecs.get_mut::<FallDistance>(entity) {
-            fall.0 = 0.0;
-        }
-        if let Some(mut view) = ecs.get_mut::<PlayerViewState>(entity) {
-            view.pending_teleport = true;
-        }
-        ecs.resource_mut::<OutputQueue>()
-            .push(GameOutput::PlayerTeleported {
+    let tick = clock.tick;
+    for msg in messages.read() {
+        match *msg {
+            MovementMsg::Move {
                 uuid,
-                position: spawn,
-                yaw: 0.0,
-                pitch: 0.0,
-            });
-        return;
-    }
-
-    let Some(entity_id) = ecs.get::<NetworkEntityId>(entity).map(|id| id.0) else {
-        return;
-    };
-    let Some(&mode) = ecs.get::<PlayerGameMode>(entity) else {
-        return;
-    };
-    let Some(&old_pos) = ecs.get::<Position>(entity) else {
-        return;
-    };
-    let Some(&old_flags) = ecs.get::<MovementFlags>(entity) else {
-        return;
-    };
-    let is_dead = ecs.get::<Dead>(entity).is_some();
-
-    let new_pos = position.unwrap_or(old_pos.0);
-    if position.is_some()
-        && let Some(mut p) = ecs.get_mut::<Position>(entity)
-    {
-        p.0 = new_pos;
-    }
-    let new_rot = {
-        let Some(mut r) = ecs.get_mut::<Rotation>(entity) else {
-            return;
-        };
-        if let Some([yaw, pitch]) = rotation {
-            r.yaw = yaw;
-            r.pitch = pitch;
-        }
-        *r
-    };
-    let new_flags = {
-        let Some(mut f) = ecs.get_mut::<MovementFlags>(entity) else {
-            return;
-        };
-        f.on_ground = on_ground;
-        *f
-    };
-
-    let mut hurt_event = false;
-    let mut vitals_update = None;
-    let mut death_reason: Option<&'static str> = None;
-
-    if mode.is_survival() && !is_dead {
-        let [old_x, old_y, old_z] = old_pos.0;
-        let [px, py, pz] = new_pos;
-        let horiz = ((px - old_x).powi(2) + (pz - old_z).powi(2)).sqrt();
-        if let Some(mut hunger) = ecs.get_mut::<Hunger>(entity) {
-            if new_flags.sprinting && horiz > 0.0 && horiz < 10.0 {
-                add_exhaustion(&mut hunger, mode, false, 0.1 * horiz as f32);
-            }
-            if old_flags.on_ground && !on_ground && py > old_y {
-                add_exhaustion(
-                    &mut hunger,
-                    mode,
-                    false,
-                    if new_flags.sprinting { 0.2 } else { 0.05 },
-                );
-            }
-        }
-
-        let mut health = *ecs.get::<Health>(entity).expect("player health");
-        let mut fall = *ecs.get::<FallDistance>(entity).expect("player fall distance");
-        let (food, saturation) = ecs
-            .get::<Hunger>(entity)
-            .map_or((20, 5.0), |h| (h.food, h.saturation));
-
-        if py < f64::from(world::MIN_Y) - 64.0 {
-            let (damaged, died) =
-                apply_damage_at_tick(&mut health, &mut fall, mode, false, 4.0, tick);
-            if damaged {
-                hurt_event = true;
-                vitals_update = Some((health.current, food, saturation));
-                if died {
-                    death_reason = Some("fell out of the world");
+                position,
+                rotation,
+                on_ground,
+            } => {
+                let Some(&entity) = registry.players.get(&uuid) else {
+                    continue;
+                };
+                let Ok((
+                    net_id,
+                    profile,
+                    mut pos,
+                    mut rot,
+                    mut movement,
+                    mut health,
+                    mut hunger,
+                    dead,
+                    mut inv,
+                    _,
+                    mut view,
+                )) = players.get_mut(entity)
+                else {
+                    continue;
+                };
+                if view.pending_teleport {
+                    continue;
                 }
-            }
-        } else {
-            let feet_pos = BlockPos([px.floor() as i32, py.floor() as i32, pz.floor() as i32]);
-            let in_liquid = world
-                .block_at_if_loaded(feet_pos)
-                .and_then(crate::game::block_by_state)
-                .is_some_and(|d| d.liquid);
-            if in_liquid {
-                fall.0 = 0.0;
-            } else if on_ground {
-                let fell = std::mem::take(&mut fall.0);
-                if fell > 3.0 {
-                    let damage = (fell - 3.0).ceil() as f32;
-                    let (damaged, died) =
-                        apply_damage_at_tick(&mut health, &mut fall, mode, false, damage, tick);
-                    if damaged {
-                        hurt_event = true;
-                        vitals_update = Some((health.current, food, saturation));
-                        if died {
-                            death_reason = Some("fell from a high place");
+
+                if let Some(target_pos) = position
+                    && !Player::position_in_bounds(target_pos)
+                {
+                    let spawn = world.0.spawn_position();
+                    pos.0 = spawn;
+                    *rot = Rotation::default();
+                    movement.on_ground = false;
+                    movement.fall_distance = 0.0;
+                    view.pending_teleport = true;
+                    out.push(GameOutput::PlayerTeleported {
+                        uuid,
+                        position: spawn,
+                        yaw: 0.0,
+                        pitch: 0.0,
+                    });
+                    continue;
+                }
+
+                let old_pos = pos.0;
+                let was_on_ground = movement.on_ground;
+                if let Some(p) = position {
+                    pos.0 = p;
+                }
+                if let Some([yaw, pitch]) = rotation {
+                    rot.yaw = yaw;
+                    rot.pitch = pitch;
+                }
+                movement.on_ground = on_ground;
+
+                let is_survival = profile.is_survival();
+                let is_dead = dead.is_some() || health.current <= 0.0;
+                let mut death_reason: Option<&'static str> = None;
+
+                if is_survival && !is_dead {
+                    let [old_x, old_y, old_z] = old_pos;
+                    let [px, py, pz] = pos.0;
+                    let horiz = ((px - old_x).powi(2) + (pz - old_z).powi(2)).sqrt();
+                    if movement.sprinting && horiz > 0.0 && horiz < 10.0 {
+                        add_exhaustion(&mut hunger, true, false, 0.1 * horiz as f32);
+                    }
+                    if was_on_ground && !on_ground && py > old_y {
+                        add_exhaustion(
+                            &mut hunger,
+                            true,
+                            false,
+                            if movement.sprinting { 0.2 } else { 0.05 },
+                        );
+                    }
+
+                    if py < f64::from(world::MIN_Y) - 64.0 {
+                        let (damaged, died) = apply_damage_at_tick(
+                            &mut health,
+                            &mut movement,
+                            true,
+                            false,
+                            4.0,
+                            tick,
+                        );
+                        if damaged {
+                            out.push(GameOutput::PlayerHurt {
+                                uuid,
+                                entity_id: net_id.0,
+                            });
+                            out.push(GameOutput::PlayerVitalsUpdated {
+                                uuid,
+                                health: health.current,
+                                food: hunger.food,
+                                saturation: hunger.saturation,
+                            });
+                            if died {
+                                death_reason = Some("fell out of the world");
+                            }
+                        }
+                    } else {
+                        let feet_pos =
+                            BlockPos([px.floor() as i32, py.floor() as i32, pz.floor() as i32]);
+                        let in_liquid = world
+                            .0
+                            .block_at_if_loaded(feet_pos)
+                            .and_then(crate::game::block_by_state)
+                            .is_some_and(|d| d.liquid);
+                        if in_liquid {
+                            movement.fall_distance = 0.0;
+                        } else if on_ground {
+                            let fell = std::mem::take(&mut movement.fall_distance);
+                            if fell > 3.0 {
+                                let damage = (fell - 3.0).ceil() as f32;
+                                let (damaged, died) = apply_damage_at_tick(
+                                    &mut health,
+                                    &mut movement,
+                                    true,
+                                    false,
+                                    damage,
+                                    tick,
+                                );
+                                if damaged {
+                                    out.push(GameOutput::PlayerHurt {
+                                        uuid,
+                                        entity_id: net_id.0,
+                                    });
+                                    out.push(GameOutput::PlayerVitalsUpdated {
+                                        uuid,
+                                        health: health.current,
+                                        food: hunger.food,
+                                        saturation: hunger.saturation,
+                                    });
+                                    if died {
+                                        death_reason = Some("fell from a high place");
+                                    }
+                                }
+                            }
+                        } else if py < old_y {
+                            movement.fall_distance += old_y - py;
                         }
                     }
                 }
-            } else if py < old_y {
-                fall.0 += old_y - py;
+
+                let pose = entity_pose(*pos, *rot, *movement);
+                out.push(GameOutput::PlayerPoseUpdated { uuid, pose });
+
+                if let Some(reason) = death_reason {
+                    commands.entity(entity).insert(Dead);
+                    let dropped = inv.0.drain_all();
+                    let snapshot = inv.0.clone();
+                    let main_hand = inv.0.hand(Hand::Main);
+                    let off_hand = inv.0.hand(Hand::Off);
+                    let drop_pos = [pos.0[0], pos.0[1] + 0.5, pos.0[2]];
+                    for stack in dropped {
+                        drops.write(SpawnDropMsg::scatter(drop_pos, stack, 40));
+                    }
+                    out.push(GameOutput::PlayerInventorySynced {
+                        uuid,
+                        inventory: snapshot,
+                    });
+                    out.push(GameOutput::PlayerEquipmentChanged {
+                        uuid,
+                        entity_id: net_id.0,
+                        main_hand,
+                        off_hand,
+                    });
+                    out.push(GameOutput::BroadcastSystemChat(format!(
+                        "{} {reason}",
+                        profile.name
+                    )));
+                }
+            }
+            MovementMsg::EntityAction { uuid, action } => {
+                let Some(&entity) = registry.players.get(&uuid) else {
+                    continue;
+                };
+                let Ok((net_id, _, _, _, mut movement, ..)) = players.get_mut(entity) else {
+                    continue;
+                };
+                let mut changed = false;
+                match action {
+                    0 if !movement.sneaking => {
+                        movement.sneaking = true;
+                        changed = true;
+                    }
+                    1 if movement.sneaking => {
+                        movement.sneaking = false;
+                        changed = true;
+                    }
+                    3 if !movement.sprinting => {
+                        movement.sprinting = true;
+                        changed = true;
+                    }
+                    4 if movement.sprinting => {
+                        movement.sprinting = false;
+                        changed = true;
+                    }
+                    _ => {}
+                }
+                if changed {
+                    out.push(GameOutput::PlayerMetadataChanged {
+                        uuid,
+                        entity_id: net_id.0,
+                        sneaking: movement.sneaking,
+                        sprinting: movement.sprinting,
+                    });
+                }
+            }
+            MovementMsg::ArmAnimation { uuid, hand } => {
+                let Some(&entity) = registry.players.get(&uuid) else {
+                    continue;
+                };
+                if let Ok((net_id, ..)) = players.get(entity) {
+                    out.push(GameOutput::PlayerArmSwing {
+                        uuid,
+                        entity_id: net_id.0,
+                        hand,
+                    });
+                }
+            }
+            MovementMsg::Respawn { uuid } => {
+                let Some(&entity) = registry.players.get(&uuid) else {
+                    continue;
+                };
+                let Ok((
+                    _,
+                    mut profile,
+                    mut pos,
+                    mut rot,
+                    mut movement,
+                    mut health,
+                    mut hunger,
+                    dead,
+                    inv,
+                    mut container,
+                    mut view,
+                )) = players.get_mut(entity)
+                else {
+                    continue;
+                };
+                if dead.is_none() {
+                    continue;
+                }
+
+                let world_spawn = world.0.spawn_position();
+                let mut missing_bed = false;
+                let spawn = if let Some(bed_pos) = profile.respawn_point {
+                    let is_bed = bed_pos.valid()
+                        && crate::game::registry()
+                            .state_by_id(world.0.block_at(bed_pos))
+                            .is_some_and(|(_, def, _)| def.name.ends_with("_bed"));
+                    if is_bed {
+                        [
+                            f64::from(bed_pos.0[0]) + 0.5,
+                            f64::from(bed_pos.0[1]) + 0.6,
+                            f64::from(bed_pos.0[2]) + 0.5,
+                        ]
+                    } else {
+                        missing_bed = true;
+                        world_spawn
+                    }
+                } else {
+                    world_spawn
+                };
+
+                if missing_bed {
+                    profile.respawn_point = None;
+                }
+                pos.0 = spawn;
+                *rot = Rotation::default();
+                *movement = MovementState::default();
+                *health = Health::default();
+                *hunger = Hunger::default();
+                container.open = None;
+                view.tracked_chunks.clear();
+                view.pending_teleport = true;
+                commands
+                    .entity(entity)
+                    .remove::<(Dead, EatingState, MiningState)>();
+
+                let pose = entity_pose(*pos, *rot, *movement);
+                out.push(GameOutput::PlayerPoseUpdated { uuid, pose });
+                out.push(GameOutput::PlayerRespawned {
+                    uuid,
+                    spawn,
+                    game_mode: profile.game_mode,
+                    health: health.current,
+                    food: hunger.food,
+                    saturation: hunger.saturation,
+                    missing_bed,
+                    inventory: inv.0.clone(),
+                });
             }
         }
-
-        if let Some(mut h) = ecs.get_mut::<Health>(entity) {
-            *h = health;
-        }
-        if let Some(mut f) = ecs.get_mut::<FallDistance>(entity) {
-            *f = fall;
-        }
-    }
-
-    let pose = entity_pose(Position(new_pos), new_rot, new_flags);
-    {
-        let mut out = ecs.resource_mut::<OutputQueue>();
-        if hurt_event {
-            out.push(GameOutput::PlayerHurt { uuid, entity_id });
-        }
-        if let Some((health, food, saturation)) = vitals_update {
-            out.push(GameOutput::PlayerVitalsUpdated {
-                uuid,
-                health,
-                food,
-                saturation,
-            });
-        }
-        out.push(GameOutput::PlayerPoseUpdated { uuid, pose });
-    }
-
-    if let Some(reason) = death_reason {
-        if let Ok(mut e) = ecs.get_entity_mut(entity) {
-            e.insert(Dead);
-        }
-        let player_name = ecs
-            .get::<PlayerName>(entity)
-            .map(|n| n.0.clone())
-            .unwrap_or_default();
-        let (dropped, inv_snapshot, main_hand, off_hand) = {
-            let mut inv = ecs
-                .get_mut::<PlayerInventory>(entity)
-                .expect("player inventory");
-            let dropped = inv.0.drain_all();
-            let snapshot = inv.0.clone();
-            let main = inv.0.hand(Hand::Main);
-            let off = inv.0.hand(Hand::Off);
-            (dropped, snapshot, main, off)
-        };
-        for stack in dropped {
-            spawn_drop_scatter(
-                ecs,
-                [new_pos[0], new_pos[1] + 0.5, new_pos[2]],
-                stack,
-                40,
-            );
-        }
-        let mut out = ecs.resource_mut::<OutputQueue>();
-        out.push(GameOutput::PlayerInventorySynced {
-            uuid,
-            inventory: inv_snapshot,
-        });
-        out.push(GameOutput::PlayerEquipmentChanged {
-            uuid,
-            entity_id,
-            main_hand,
-            off_hand,
-        });
-        out.push(GameOutput::BroadcastSystemChat(format!(
-            "{player_name} {reason}"
-        )));
-    }
-}
-
-pub(crate) fn handle_entity_action(ecs: &mut World, uuid: Uuid, action: i32) {
-    let Some(&entity) = ecs.resource::<EntityRegistry>().players.get(&uuid) else {
-        return;
-    };
-    let Some(entity_id) = ecs.get::<NetworkEntityId>(entity).map(|id| id.0) else {
-        return;
-    };
-    let changed = {
-        let Some(mut flags) = ecs.get_mut::<MovementFlags>(entity) else {
-            return;
-        };
-        let mut c = false;
-        match action {
-            0 if !flags.sneaking => {
-                flags.sneaking = true;
-                c = true;
-            }
-            1 if flags.sneaking => {
-                flags.sneaking = false;
-                c = true;
-            }
-            3 if !flags.sprinting => {
-                flags.sprinting = true;
-                c = true;
-            }
-            4 if flags.sprinting => {
-                flags.sprinting = false;
-                c = true;
-            }
-            _ => {}
-        }
-        c.then_some((flags.sneaking, flags.sprinting))
-    };
-    if let Some((sneaking, sprinting)) = changed {
-        ecs.resource_mut::<OutputQueue>()
-            .push(GameOutput::PlayerMetadataChanged {
-                uuid,
-                entity_id,
-                sneaking,
-                sprinting,
-            });
-    }
-}
-
-pub(crate) fn handle_arm_animation(ecs: &mut World, uuid: Uuid, hand: i32) {
-    let Some(&entity) = ecs.resource::<EntityRegistry>().players.get(&uuid) else {
-        return;
-    };
-    if let Some(id) = ecs.get::<NetworkEntityId>(entity) {
-        let entity_id = id.0;
-        ecs.resource_mut::<OutputQueue>()
-            .push(GameOutput::PlayerArmSwing {
-                uuid,
-                entity_id,
-                hand,
-            });
     }
 }

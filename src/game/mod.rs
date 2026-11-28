@@ -2,6 +2,7 @@
 //! gameplay rules, isolated from network IO, sockets, and protocol framing.
 pub mod components;
 mod engine;
+pub mod events;
 pub mod io;
 pub mod resources;
 pub mod rules;

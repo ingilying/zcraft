@@ -3,10 +3,10 @@ use super::{emit_equipment, emit_inventory_if_can_interact, throw_from_player};
 use crate::{
     game::{
         InventoryClick, ItemStack,
-        components::{PlayerContainer, PlayerGameMode, PlayerInventory, Position},
+        components::{PlayerContainer, PlayerInventory, PlayerProfile, Position},
         io::{ContainerKind, GameOutput, OpenContainer},
         resources::{ChestViewers, EntityRegistry, OutputQueue, VoxelWorld},
-        systems::drops::spawn_drop_scatter,
+        systems::drops::queue_drop_scatter,
     },
     world::BlockPos,
 };
@@ -163,7 +163,7 @@ pub(crate) fn handle_close_window(ecs: &mut World, uuid: Uuid, window_id: u8) {
             }
         }
         for stack in overflow {
-            spawn_drop_scatter(ecs, [pos[0], pos[1] + 0.5, pos[2]], stack, 40);
+            queue_drop_scatter(ecs, [pos[0], pos[1] + 0.5, pos[2]], stack, 40);
         }
         emit_equipment(ecs, uuid, entity);
         emit_inventory_if_can_interact(ecs, uuid, entity);
@@ -181,8 +181,8 @@ pub(crate) fn handle_inventory_click(
         return;
     };
     if !ecs
-        .get::<PlayerGameMode>(entity)
-        .is_some_and(|gm| gm.can_interact())
+        .get::<PlayerProfile>(entity)
+        .is_some_and(PlayerProfile::can_interact)
     {
         return;
     }

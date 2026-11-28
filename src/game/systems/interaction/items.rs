@@ -3,7 +3,7 @@ use super::{blocks::apply_game_effects, emit_equipment};
 use crate::game::{
     Hand, ItemStack,
     components::{
-        EatingState, PlayerGameMode, PlayerInventory, apply_player_dto, snapshot_player_dto,
+        EatingState, PlayerInventory, PlayerProfile, apply_player_dto, snapshot_player_dto,
     },
     io::GameOutput,
     resources::{EntityRegistry, OutputQueue, TickClock, VoxelWorld},
@@ -63,8 +63,8 @@ pub(crate) fn handle_creative_slot(
         return;
     };
     if !ecs
-        .get::<PlayerGameMode>(entity)
-        .is_some_and(|gm| gm.is_creative())
+        .get::<PlayerProfile>(entity)
+        .is_some_and(PlayerProfile::is_creative)
     {
         return;
     }

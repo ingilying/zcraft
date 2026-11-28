@@ -8,14 +8,14 @@ use crate::{
     game::{
         Hand, ItemStack,
         components::{
-            Dead, EatingState, Hunger, MiningState, MovementFlags, NetworkEntityId,
-            PlayerContainer, PlayerGameMode, PlayerInventory, PlayerViewState, Position, Rotation,
+            Dead, EatingState, Hunger, MiningState, MovementState, NetworkEntityId,
+            PlayerContainer, PlayerInventory, PlayerProfile, PlayerViewState, Position, Rotation,
             add_exhaustion, apply_player_dto, player_eye_position, player_in_reach,
             player_intersects_block, snapshot_player_dto,
         },
         io::{ContainerKind, ContainerOpenSync, GameOutput, OpenContainer},
         resources::{ChestViewers, EntityRegistry, OutputQueue, TickClock, VoxelWorld},
-        systems::drops::spawn_drop_scatter,
+        systems::drops::queue_drop_scatter,
     },
     world::BlockPos,
 };
@@ -47,7 +47,7 @@ fn interact_block(
     let Some(&entity) = ecs.resource::<EntityRegistry>().players.get(&uuid) else {
         return;
     };
-    let Some(&mode) = ecs.get::<PlayerGameMode>(entity) else {
+    let Some(profile) = ecs.get::<PlayerProfile>(entity).cloned() else {
         return;
     };
     let Some(entity_id) = ecs.get::<NetworkEntityId>(entity).map(|id| id.0) else {
@@ -59,15 +59,15 @@ fn interact_block(
     let Some(&player_rot) = ecs.get::<Rotation>(entity) else {
         return;
     };
-    let Some(&player_flags) = ecs.get::<MovementFlags>(entity) else {
+    let Some(&player_move) = ecs.get::<MovementState>(entity) else {
         return;
     };
     let dead = ecs.get::<Dead>(entity).is_some();
     let pending_teleport = ecs
         .get::<PlayerViewState>(entity)
         .is_none_or(|v| v.pending_teleport);
-    let can_interact = mode.can_interact();
-    let is_survival = mode.is_survival();
+    let can_interact = profile.can_interact();
+    let is_survival = profile.is_survival();
     if !can_interact || dead {
         ecs.resource_mut::<OutputQueue>()
             .push(GameOutput::BlockAckOnly {
@@ -105,7 +105,7 @@ fn interact_block(
                 && ecs
                     .get::<PlayerViewState>(entity)
                     .is_some_and(|v| v.tracked_chunks.contains(&pos.chunk()));
-            let reachable = valid && player_in_reach(player_pos, mode, pos);
+            let reachable = valid && player_in_reach(player_pos, &profile, pos);
             let current = world.block_at(pos);
             if face < 6
                 && reachable
@@ -139,7 +139,7 @@ fn interact_block(
         .map(|v| v.tracked_chunks.clone())
         .unwrap_or_default();
     let valid = |pos: BlockPos| pos.valid() && tracked.contains(&pos.chunk());
-    let reachable = |pos: BlockPos| valid(pos) && player_in_reach(player_pos, mode, pos);
+    let reachable = |pos: BlockPos| valid(pos) && player_in_reach(player_pos, &profile, pos);
 
     let mut survival_dig_drops: Vec<(BlockPos, ItemStack)> = Vec::new();
     let mut survival_tool_damage: u32 = 0;
@@ -180,7 +180,7 @@ fn interact_block(
                             } else {
                                 1.0
                             };
-                            if !player_flags.on_ground {
+                            if !player_move.on_ground {
                                 speed /= 5.0;
                             }
                             let eye = player_eye_position(player_pos);
@@ -233,7 +233,7 @@ fn interact_block(
                 if is_survival
                     && let Some(mut hunger) = ecs.get_mut::<Hunger>(entity)
                 {
-                    add_exhaustion(&mut hunger, mode, false, 0.005);
+                    add_exhaustion(&mut hunger, true, false, 0.005);
                 }
                 let drops = crate::game::block_behavior(current).container_drops(&world, pos);
                 if !drops.is_empty()
@@ -418,7 +418,7 @@ fn interact_block(
                 f64::from(cpos.0[2]) + 0.5,
             ];
             for stack in broken_chest_items {
-                spawn_drop_scatter(ecs, drop_xyz, stack, 10);
+                queue_drop_scatter(ecs, drop_xyz, stack, 10);
             }
             refresh_container_viewers(ecs, cpos, Uuid::nil());
         }
@@ -441,7 +441,7 @@ fn interact_block(
                 f64::from(drop_pos.0[1]) + 0.5,
                 f64::from(drop_pos.0[2]) + 0.5,
             ];
-            spawn_drop_scatter(ecs, drop_xyz, stack, 10);
+            queue_drop_scatter(ecs, drop_xyz, stack, 10);
         }
         if inv_changed {
             emit_equipment(ecs, uuid, entity);
@@ -542,14 +542,14 @@ pub(crate) fn handle_place(
     };
     let world = ecs.resource::<VoxelWorld>().0.clone();
     let can_use_block = ecs
-        .get::<PlayerGameMode>(entity)
+        .get::<PlayerProfile>(entity)
         .zip(ecs.get::<Position>(entity))
-        .zip(ecs.get::<MovementFlags>(entity))
-        .is_some_and(|((&mode, &ppos), &flags)| {
-            mode.can_interact()
+        .zip(ecs.get::<MovementState>(entity))
+        .is_some_and(|((profile, &ppos), &movement)| {
+            profile.can_interact()
                 && ecs.get::<Dead>(entity).is_none()
-                && !flags.sneaking
-                && player_in_reach(ppos, mode, pos)
+                && !movement.sneaking
+                && player_in_reach(ppos, profile, pos)
         })
         && ecs
             .get::<PlayerViewState>(entity)
@@ -627,7 +627,7 @@ pub(super) fn apply_game_effects(
         && let Some(ppos) = ecs.get::<Position>(entity).map(|p| p.0)
     {
         for stack in effects.player_drops {
-            spawn_drop_scatter(ecs, [ppos[0], ppos[1] + 0.5, ppos[2]], stack, 10);
+            queue_drop_scatter(ecs, [ppos[0], ppos[1] + 0.5, ppos[2]], stack, 10);
         }
     }
     for message in effects.player_messages {

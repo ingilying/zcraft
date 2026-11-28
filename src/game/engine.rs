@@ -1,16 +1,28 @@
-//! `GameEngine`: self-contained `bevy_ecs` World + Schedules with zero network IO.
+//! `GameEngine`: self-contained `bevy_ecs` World + ordered `GamePhase` Schedule
+//! with zero network IO.
 use super::{
     components::{
-        EntityUuid, ItemDropMarker, ItemStackComp, MovementFlags, NetworkEntityId, PlayerGameMode,
-        PlayerInventory, PlayerName, Position, RespawnPoint, Rotation, Velocity, entity_pose,
+        EntityUuid, ItemDropMarker, ItemStackComp, MovementState, NetworkEntityId,
+        PlayerInventory, PlayerProfile, Position, Rotation, Velocity, entity_pose,
     },
+    events::{init_messages, update_messages},
     io::{DropSnapshot, GameInput, GameOutput, PlayerSnapshot},
     resources::{ChestViewers, EntityRegistry, InputQueue, OutputQueue, TickClock, VoxelWorld},
     systems::{
-        process_inputs_system,
+        GamePhase,
+        drops::spawn_item_drops_system,
+        ingress_inputs_system,
+        interaction::player_interaction_system,
+        lifecycle::{
+            player_control_system, player_join_system, player_leave_system, player_view_system,
+            world_control_system,
+        },
+        movement::player_movement_system,
         world_tick::{
-            tick_block_physics_system, tick_furnaces_system, tick_item_drops_system,
-            tick_player_eating_system, tick_player_food_system, tick_world_clock_system,
+            drop_age_and_despawn_system, drop_merge_system, drop_network_sync_system,
+            drop_physics_system, drop_pickup_system, tick_block_physics_system,
+            tick_furnaces_system, tick_player_eating_system, tick_player_food_system,
+            tick_world_clock_system,
         },
     },
 };
@@ -19,14 +31,37 @@ use bevy_ecs::prelude::{IntoScheduleConfigs, Schedule, With, World};
 use std::sync::{Arc, atomic::AtomicI32};
 use uuid::Uuid;
 
+fn add_input_phases(schedule: &mut Schedule) {
+    schedule.add_systems(ingress_inputs_system.in_set(GamePhase::InputIngress));
+    schedule.add_systems(
+        (player_join_system, player_view_system)
+            .chain()
+            .in_set(GamePhase::PlayerJoin),
+    );
+    schedule.add_systems(
+        (
+            player_control_system,
+            world_control_system,
+            player_movement_system,
+            player_interaction_system,
+            player_leave_system,
+        )
+            .chain()
+            .in_set(GamePhase::GameplayActions),
+    );
+    schedule.add_systems(spawn_item_drops_system.in_set(GamePhase::DropSpawn));
+}
+
 /// Authoritative game simulation engine powered by `bevy_ecs`.
 ///
 /// Owns all player entities, item drop entities, container viewers, and runs a
-/// single deterministic fixed-timestep 20 TPS ECS schedule.
-/// Has zero dependency on sockets, sessions, or protocol framing.
+/// deterministic fixed-timestep 20 TPS ECS schedule organized into ordered
+/// `GamePhase` `SystemSet`s. Has zero dependency on sockets, sessions, or
+/// protocol framing.
 pub struct GameEngine {
     ecs: World,
     tick_schedule: Schedule,
+    drain_schedule: Schedule,
 }
 
 impl GameEngine {
@@ -38,22 +73,62 @@ impl GameEngine {
         ecs.insert_resource(TickClock::default());
         ecs.insert_resource(InputQueue::default());
         ecs.insert_resource(OutputQueue::default());
+        init_messages(&mut ecs);
 
         let mut tick_schedule = Schedule::default();
-        tick_schedule.add_systems(
+        tick_schedule.configure_sets(
             (
-                tick_world_clock_system,
-                process_inputs_system,
-                tick_player_eating_system,
-                tick_player_food_system,
-                tick_item_drops_system,
-                tick_furnaces_system,
-                tick_block_physics_system,
+                GamePhase::WorldClock,
+                GamePhase::InputIngress,
+                GamePhase::PlayerJoin,
+                GamePhase::GameplayActions,
+                GamePhase::DropSpawn,
+                GamePhase::WorldSimulation,
+                GamePhase::DropSimulation,
             )
                 .chain(),
         );
+        tick_schedule.add_systems(tick_world_clock_system.in_set(GamePhase::WorldClock));
+        add_input_phases(&mut tick_schedule);
+        tick_schedule.add_systems(
+            (
+                tick_player_eating_system,
+                tick_player_food_system,
+                tick_furnaces_system,
+                tick_block_physics_system,
+            )
+                .chain()
+                .in_set(GamePhase::WorldSimulation),
+        );
+        tick_schedule.add_systems(
+            (
+                drop_age_and_despawn_system,
+                drop_physics_system,
+                drop_pickup_system,
+                drop_merge_system,
+                drop_network_sync_system,
+            )
+                .chain()
+                .in_set(GamePhase::DropSimulation),
+        );
 
-        Self { ecs, tick_schedule }
+        let mut drain_schedule = Schedule::default();
+        drain_schedule.configure_sets(
+            (
+                GamePhase::InputIngress,
+                GamePhase::PlayerJoin,
+                GamePhase::GameplayActions,
+                GamePhase::DropSpawn,
+            )
+                .chain(),
+        );
+        add_input_phases(&mut drain_schedule);
+
+        Self {
+            ecs,
+            tick_schedule,
+            drain_schedule,
+        }
     }
 
     /// Queue an inbound action for the next authoritative `tick()` call.
@@ -65,19 +140,22 @@ impl GameEngine {
     /// Used only for headless (no game-loop thread) calls and graceful shutdown drain.
     pub(crate) fn drain_inputs_only(&mut self) -> Vec<GameOutput> {
         if !self.ecs.resource::<InputQueue>().0.is_empty() {
-            process_inputs_system(&mut self.ecs);
+            self.drain_schedule.run(&mut self.ecs);
+            update_messages(&mut self.ecs);
         }
         self.ecs.resource_mut::<OutputQueue>().drain()
     }
 
     /// Advance the entire game simulation by one authoritative 20 TPS tick:
-    /// increments `TickClock`, then runs the unified fixed-timestep ECS schedule.
+    /// increments `TickClock`, runs the ordered `GamePhase` ECS schedule, and
+    /// drains emitted outbound sync events.
     pub fn tick(&mut self) -> Vec<GameOutput> {
         {
             let mut clock = self.ecs.resource_mut::<TickClock>();
             clock.tick = clock.tick.wrapping_add(1);
         }
         self.tick_schedule.run(&mut self.ecs);
+        update_messages(&mut self.ecs);
         self.ecs.resource_mut::<OutputQueue>().drain()
     }
 
@@ -111,23 +189,21 @@ impl GameEngine {
     pub fn player_snapshot(&self, uuid: Uuid) -> Option<PlayerSnapshot> {
         let &entity = self.ecs.resource::<EntityRegistry>().players.get(&uuid)?;
         let entity_id = self.ecs.get::<NetworkEntityId>(entity)?.0;
-        let name = self.ecs.get::<PlayerName>(entity)?.0.clone();
-        let game_mode = self.ecs.get::<PlayerGameMode>(entity)?.0;
+        let profile = self.ecs.get::<PlayerProfile>(entity)?;
         let pos = *self.ecs.get::<Position>(entity)?;
         let rot = *self.ecs.get::<Rotation>(entity)?;
-        let flags = *self.ecs.get::<MovementFlags>(entity)?;
-        let respawn_point = self.ecs.get::<RespawnPoint>(entity)?.0;
+        let movement = *self.ecs.get::<MovementState>(entity)?;
         Some(PlayerSnapshot {
             entity_id,
             uuid,
-            name,
-            game_mode,
+            name: profile.name.clone(),
+            game_mode: profile.game_mode,
             position: pos.0,
             yaw: rot.yaw,
             pitch: rot.pitch,
-            on_ground: flags.on_ground,
-            pose: entity_pose(pos, rot, flags),
-            respawn_point,
+            on_ground: movement.on_ground,
+            pose: entity_pose(pos, rot, movement),
+            respawn_point: profile.respawn_point,
         })
     }
 
