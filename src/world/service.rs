@@ -7,12 +7,55 @@ use super::{
 };
 use crate::game::{Inventory, Player};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     io,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
 };
 use uuid::Uuid;
+
+#[derive(Debug, Default)]
+struct InFlightSlot {
+    /// `None` = still loading; `Some(Some(chunk))` = loaded; `Some(None)` = leader panicked.
+    result: Mutex<Option<Option<Arc<Chunk>>>>,
+    ready: Condvar,
+}
+
+struct InFlightGuard<'a> {
+    map: &'a Mutex<HashMap<[i32; 2], Arc<InFlightSlot>>>,
+    coords: [i32; 2],
+    slot: Arc<InFlightSlot>,
+    completed: bool,
+}
+
+impl InFlightGuard<'_> {
+    fn complete(mut self, chunk: Arc<Chunk>) -> Arc<Chunk> {
+        self.completed = true;
+        {
+            *self.slot.result.lock().expect("in-flight slot poisoned") = Some(Some(chunk.clone()));
+        }
+        self.map
+            .lock()
+            .expect("in-flight map poisoned")
+            .remove(&self.coords);
+        self.slot.ready.notify_all();
+        chunk
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            if let Ok(mut guard) = self.slot.result.lock() {
+                *guard = Some(None);
+            }
+            if let Ok(mut map) = self.map.lock() {
+                map.remove(&self.coords);
+            }
+            self.slot.ready.notify_all();
+        }
+    }
+}
 
 /// Result of a world block mutation, computed under a single world lock and
 /// returned without holding any lock so callers can encode and fan out safely.
@@ -45,6 +88,7 @@ pub struct World {
     generator: Arc<dyn ChunkGenerator>,
     storage: Option<AnvilStorage>,
     store: Mutex<ChunkStore>,
+    in_flight: Mutex<HashMap<[i32; 2], Arc<InFlightSlot>>>,
     clock: Mutex<WorldClock>,
     physics: Mutex<physics::PhysicsScheduler>,
     save_lock: Mutex<()>,
@@ -74,6 +118,7 @@ impl World {
             generator,
             storage: None,
             store,
+            in_flight: Mutex::new(HashMap::new()),
             clock: Mutex::new(WorldClock::new()),
             physics: Mutex::new(physics::PhysicsScheduler::new()),
             save_lock: Mutex::new(()),
@@ -156,6 +201,7 @@ impl World {
             generator,
             storage: Some(storage),
             store,
+            in_flight: Mutex::new(HashMap::new()),
             clock: Mutex::new(clock),
             physics: Mutex::new(physics::PhysicsScheduler::new()),
             save_lock: Mutex::new(()),
@@ -311,31 +357,107 @@ impl World {
         chunk.get_block(lx, y, lz)
     }
 
-    /// Return `coords` from cache under a short lock, or load/generate it
-    /// **outside** the store lock and commit with compare-and-insert.
-    fn ensure_chunk(&self, coords: [i32; 2]) -> Arc<Chunk> {
-        {
-            let mut store = self.store.lock().expect("chunk store poisoned");
-            if let Some(chunk) = store.peek_cached(coords) {
-                return chunk;
-            }
+    /// Non-loading block lookup for game-loop hot paths (movement, item drops,
+    /// block/fluid physics). Returns `None` if `pos` is out of bounds or its
+    /// chunk is not currently cached in memory — never triggers disk I/O or
+    /// terrain generation.
+    pub fn block_at_if_loaded(&self, pos: BlockPos) -> Option<i32> {
+        if !pos.valid() {
+            return None;
         }
-        let loaded = super::store::load_or_generate_uncached(
-            &*self.generator,
-            self.storage.as_ref(),
-            coords,
-        );
         let chunk = self
             .store
             .lock()
             .expect("chunk store poisoned")
-            .commit_loaded(coords, loaded);
-        self.apply_cache_backpressure();
-        chunk
+            .peek_cached(pos.chunk())?;
+        let (lx, y, lz) = pos.local();
+        Some(chunk.get_block(lx, y, lz))
+    }
+
+    /// Preload a chunk into the in-memory LRU cache (intended to be called from
+    /// `tokio::task::spawn_blocking` before dispatching cross-chunk game actions
+    /// such as bed respawn verification).
+    pub fn ensure_chunk_loaded(&self, coords: [i32; 2]) {
+        let _ = self.ensure_chunk(coords);
+    }
+
+    /// Return `coords` from cache under a short lock, or load/generate it
+    /// **outside** the store lock with per-chunk singleflight deduplication so
+    /// concurrent callers approaching the same uncached chunk share one load/generation.
+    fn ensure_chunk(&self, coords: [i32; 2]) -> Arc<Chunk> {
+        enum Flight {
+            Leader(Arc<InFlightSlot>),
+            Follower(Arc<InFlightSlot>),
+        }
+
+        loop {
+            {
+                let mut store = self.store.lock().expect("chunk store poisoned");
+                if let Some(chunk) = store.peek_cached(coords) {
+                    return chunk;
+                }
+            }
+
+            let flight = {
+                let mut map = self.in_flight.lock().expect("in-flight map poisoned");
+                if let Some(existing) = map.get(&coords) {
+                    Flight::Follower(existing.clone())
+                } else {
+                    let slot = Arc::new(InFlightSlot::default());
+                    map.insert(coords, slot.clone());
+                    Flight::Leader(slot)
+                }
+            };
+
+            let slot = match flight {
+                Flight::Follower(slot) => {
+                    let mut res = slot.result.lock().expect("in-flight slot poisoned");
+                    while res.is_none() {
+                        res = slot.ready.wait(res).expect("in-flight slot poisoned");
+                    }
+                    if let Some(Some(chunk)) = res.as_ref() {
+                        return chunk.clone();
+                    }
+                    // Leader panicked before publishing a chunk; retry cleanly.
+                    continue;
+                }
+                Flight::Leader(slot) => slot,
+            };
+
+            let guard = InFlightGuard {
+                map: &self.in_flight,
+                coords,
+                slot,
+                completed: false,
+            };
+
+            // Re-check cache once in case a prior leader committed right before we registered.
+            {
+                let mut store = self.store.lock().expect("chunk store poisoned");
+                if let Some(chunk) = store.peek_cached(coords) {
+                    return guard.complete(chunk);
+                }
+            }
+
+            let loaded = super::store::load_or_generate_uncached(
+                &*self.generator,
+                self.storage.as_ref(),
+                coords,
+            );
+            let chunk = self
+                .store
+                .lock()
+                .expect("chunk store poisoned")
+                .commit_loaded(coords, loaded);
+            let chunk = guard.complete(chunk);
+            self.apply_cache_backpressure();
+            return chunk;
+        }
     }
 
     /// Ensure all 9 chunks in the 3x3 neighborhood of `center` are loaded,
-    /// performing all disk I/O and terrain generation outside the store lock.
+    /// performing all disk I/O and terrain generation outside the store lock
+    /// with per-chunk singleflight deduplication.
     fn ensure_neighborhood(&self, [cx, cz]: [i32; 2]) -> (super::Neighborhood, Option<Arc<[u8]>>) {
         let mut slots: [[Option<Arc<Chunk>>; 3]; 3] = Default::default();
         let mut missing = Vec::new();
@@ -361,27 +483,15 @@ impl World {
             return (neighborhood, cached_light);
         }
 
-        // Load / generate missing chunks outside the world lock.
-        let loaded: Vec<_> = missing
-            .into_iter()
-            .map(|(dx, dz, coords)| {
-                let chunk = super::store::load_or_generate_uncached(
-                    &*self.generator,
-                    self.storage.as_ref(),
-                    coords,
-                );
-                (dx, dz, coords, chunk)
-            })
-            .collect();
+        for (dx, dz, coords) in missing {
+            slots[dz][dx] = Some(self.ensure_chunk(coords));
+        }
 
-        let cached_light = {
-            let mut store = self.store.lock().expect("chunk store poisoned");
-            for (dx, dz, coords, chunk) in loaded {
-                slots[dz][dx] = Some(store.commit_loaded(coords, chunk));
-            }
-            store.peek_light([cx, cz])
-        };
-        self.apply_cache_backpressure();
+        let cached_light = self
+            .store
+            .lock()
+            .expect("chunk store poisoned")
+            .peek_light([cx, cz]);
 
         let neighborhood =
             std::array::from_fn(|dz| std::array::from_fn(|dx| slots[dz][dx].take().unwrap()));
@@ -589,8 +699,17 @@ impl World {
         }
         let mut mutations = Vec::new();
         for (pos, kind) in due {
-            let edits = physics::evaluate_tick(pos, kind, |p| self.block_at(p));
+            if self.block_at_if_loaded(pos).is_none() {
+                continue;
+            }
+            let edits = physics::evaluate_tick(pos, kind, |p| {
+                self.block_at_if_loaded(p)
+                    .unwrap_or(crate::game::BEDROCK_STATE)
+            });
             for (epos, estate) in edits {
+                if self.block_at_if_loaded(epos).is_none() {
+                    continue;
+                }
                 if let Some(mutation) = self.set_block(epos, estate) {
                     mutations.push(mutation);
                 }
@@ -828,6 +947,7 @@ mod tests {
                 Some(storage),
                 capacity,
             )),
+            in_flight: Mutex::new(HashMap::new()),
             clock: Mutex::new(WorldClock::new()),
             physics: Mutex::new(physics::PhysicsScheduler::new()),
             save_lock: Mutex::new(()),
@@ -920,5 +1040,83 @@ mod tests {
             crate::game::STONE_STATE
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_chunk_requests_deduplicate_generation_via_singleflight() {
+        use std::sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        #[derive(Debug)]
+        struct CountingGenerator {
+            calls: Arc<AtomicUsize>,
+        }
+        impl ChunkGenerator for CountingGenerator {
+            fn generate_chunk(&self, _cx: i32, _cz: i32) -> Arc<Chunk> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                Arc::new(Chunk::empty(0))
+            }
+            fn spawn_position(&self) -> [f64; 3] {
+                [8.5, 65.0, 8.5]
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let world = Arc::new(World::with_generator(Arc::new(CountingGenerator {
+            calls: calls.clone(),
+        })));
+        let threads = 6usize;
+        let barrier = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let world = world.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                world.block_at(BlockPos([128, 64, 128]))
+            }));
+        }
+        for h in handles {
+            assert_eq!(h.join().unwrap(), crate::game::AIR_STATE);
+        }
+        // All 6 concurrent threads targeted chunk [8, 8]; singleflight must
+        // execute `generate_chunk` exactly once.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn block_at_if_loaded_never_triggers_generation_for_uncached_chunks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct CountingGenerator {
+            calls: Arc<AtomicUsize>,
+        }
+        impl ChunkGenerator for CountingGenerator {
+            fn generate_chunk(&self, _cx: i32, _cz: i32) -> Arc<Chunk> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Arc::new(Chunk::empty(0))
+            }
+            fn spawn_position(&self) -> [f64; 3] {
+                [8.5, 65.0, 8.5]
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let world = World::with_generator(Arc::new(CountingGenerator {
+            calls: calls.clone(),
+        }));
+        assert_eq!(world.block_at_if_loaded(BlockPos([500, 64, 500])), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        world.ensure_chunk_loaded(BlockPos([500, 64, 500]).chunk());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            world.block_at_if_loaded(BlockPos([500, 64, 500])),
+            Some(crate::game::AIR_STATE)
+        );
     }
 }
