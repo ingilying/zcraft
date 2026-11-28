@@ -155,9 +155,10 @@ impl<H: crate::command::CommandHost> crate::command::WorldCommandHost for Server
         Ok(self.server.play.world_time())
     }
     fn set_time(&mut self, day_time: i64) -> std::io::Result<i64> {
-        let packet = self.server.play.set_day_time(day_time);
-        let _ = self.server.players().broadcast(&packet.into());
-        Ok(packet.time_of_day)
+        self.server
+            .play
+            .set_day_time_for(self.server.players(), day_time)
+            .map(|packet| packet.time_of_day)
     }
     fn set_weather(
         &mut self,
@@ -165,9 +166,9 @@ impl<H: crate::command::CommandHost> crate::command::WorldCommandHost for Server
         thundering: bool,
         duration: u32,
     ) -> std::io::Result<()> {
-        for packet in self.server.play.set_weather(raining, thundering, duration) {
-            let _ = self.server.players().broadcast(&packet);
-        }
+        self.server
+            .play
+            .set_weather_for(self.server.players(), raining, thundering, duration)?;
         Ok(())
     }
     fn set_block(&mut self, pos: [i32; 3], state: i32) -> std::io::Result<bool> {

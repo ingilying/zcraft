@@ -206,7 +206,15 @@ async fn configuration_end(client: &mut Transport<TcpStream>) {
     }
     outside.push(0);
     client.write_frame(&outside).await.unwrap();
-    let correction = client.read_frame().await.unwrap().unwrap();
+    // Chunk streaming (0x0d/0x27/0x0c) and periodic TimeUpdate (0x64) can
+    // arrive before the next 20 TPS game tick emits the teleport correction.
+    let correction = loop {
+        let frame = client.read_frame().await.unwrap().unwrap();
+        match frame[0] {
+            0x0c | 0x0d | 0x27 | 0x64 => continue,
+            _ => break frame,
+        }
+    };
     assert_eq!(correction[0], 0x40);
     assert_eq!(*correction.last().unwrap(), 1);
     client.write_frame(&[0, 1]).await.unwrap();

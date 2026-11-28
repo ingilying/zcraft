@@ -20,12 +20,11 @@ use uuid::Uuid;
 
 /// Authoritative game simulation engine powered by `bevy_ecs`.
 ///
-/// Owns all player entities, item drop entities, container viewers, and runs
-/// deterministic ECS schedules for both inbound client actions and 20 TPS ticks.
+/// Owns all player entities, item drop entities, container viewers, and runs a
+/// single deterministic fixed-timestep 20 TPS ECS schedule.
 /// Has zero dependency on sockets, sessions, or protocol framing.
 pub struct GameEngine {
     ecs: World,
-    input_schedule: Schedule,
     tick_schedule: Schedule,
 }
 
@@ -39,13 +38,11 @@ impl GameEngine {
         ecs.insert_resource(InputQueue::default());
         ecs.insert_resource(OutputQueue::default());
 
-        let mut input_schedule = Schedule::default();
-        input_schedule.add_systems(process_inputs_system);
-
         let mut tick_schedule = Schedule::default();
         tick_schedule.add_systems(
             (
                 tick_world_clock_system,
+                process_inputs_system,
                 tick_player_vitals_system,
                 tick_item_drops_system,
                 tick_furnaces_system,
@@ -54,35 +51,29 @@ impl GameEngine {
                 .chain(),
         );
 
-        Self {
-            ecs,
-            input_schedule,
-            tick_schedule,
-        }
+        Self { ecs, tick_schedule }
     }
 
-    /// Queue an inbound action for the next `process_inputs` or `tick` call.
+    /// Queue an inbound action for the next authoritative `tick()` call.
     pub fn push_input(&mut self, input: GameInput) {
         self.ecs.resource_mut::<InputQueue>().0.push(input);
     }
 
-    /// Process all queued inbound inputs immediately and drain emitted sync events.
-    pub fn process_inputs(&mut self) -> Vec<GameOutput> {
+    /// Drain queued inputs without advancing world simulation ticks.
+    /// Used only for headless (no game-loop thread) calls and graceful shutdown drain.
+    pub(crate) fn drain_inputs_only(&mut self) -> Vec<GameOutput> {
         if !self.ecs.resource::<InputQueue>().0.is_empty() {
-            self.input_schedule.run(&mut self.ecs);
+            process_inputs_system(&mut self.ecs);
         }
         self.ecs.resource_mut::<OutputQueue>().drain()
     }
 
     /// Advance the entire game simulation by one authoritative 20 TPS tick:
-    /// drains any pending inputs first, then executes the chained ECS tick schedule.
+    /// increments `TickClock`, then runs the unified fixed-timestep ECS schedule.
     pub fn tick(&mut self) -> Vec<GameOutput> {
         {
             let mut clock = self.ecs.resource_mut::<TickClock>();
             clock.tick = clock.tick.wrapping_add(1);
-        }
-        if !self.ecs.resource::<InputQueue>().0.is_empty() {
-            self.input_schedule.run(&mut self.ecs);
         }
         self.tick_schedule.run(&mut self.ecs);
         self.ecs.resource_mut::<OutputQueue>().drain()

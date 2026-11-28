@@ -49,6 +49,28 @@ pub(crate) fn process_inputs_system(ecs: &mut World) {
             GameInput::ControlSetGameMode { uuid, mode } => {
                 lifecycle::handle_control_game_mode(ecs, uuid, mode);
             }
+            GameInput::ControlSetBlock { pos, state, reply } => {
+                lifecycle::handle_control_set_block(ecs, pos, state, reply);
+            }
+            GameInput::ControlFillBlocks {
+                from,
+                to,
+                state,
+                reply,
+            } => {
+                lifecycle::handle_control_fill_blocks(ecs, from, to, state, reply);
+            }
+            GameInput::ControlSetDayTime { day_time, reply } => {
+                lifecycle::handle_control_set_day_time(ecs, day_time, reply);
+            }
+            GameInput::ControlSetWeather {
+                raining,
+                thundering,
+                duration,
+                reply,
+            } => {
+                lifecycle::handle_control_set_weather(ecs, raining, thundering, duration, reply);
+            }
             GameInput::PlayerMove {
                 uuid,
                 position,

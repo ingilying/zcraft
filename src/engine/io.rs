@@ -6,7 +6,7 @@ use crate::{
     protocol::packets::play_entities::EntityPose,
     world::{BlockPos, TimeSnapshot, WeatherEvent, WorldMutation},
 };
-use std::collections::HashSet;
+use std::{collections::HashSet, io, sync::mpsc::SyncSender};
 use uuid::Uuid;
 
 /// Protocol-agnostic open container state tracked on a player entity.
@@ -168,6 +168,27 @@ pub enum GameInput {
     ControlSetGameMode {
         uuid: Uuid,
         mode: GameMode,
+    },
+    ControlSetBlock {
+        pos: BlockPos,
+        state: i32,
+        reply: Option<SyncSender<bool>>,
+    },
+    ControlFillBlocks {
+        from: BlockPos,
+        to: BlockPos,
+        state: i32,
+        reply: Option<SyncSender<io::Result<usize>>>,
+    },
+    ControlSetDayTime {
+        day_time: i64,
+        reply: Option<SyncSender<TimeSnapshot>>,
+    },
+    ControlSetWeather {
+        raining: bool,
+        thundering: bool,
+        duration: u32,
+        reply: Option<SyncSender<Vec<WeatherEvent>>>,
     },
 }
 

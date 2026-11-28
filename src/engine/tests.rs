@@ -35,7 +35,7 @@ fn ecs_handles_movement_fall_damage_death_and_item_drop_pickup_without_network()
         inventory: Box::new(alice_inv),
     });
     engine.push_input(GameInput::PlayerTeleportConfirmed { uuid: alice_id });
-    let _ = engine.process_inputs();
+    let _ = engine.tick();
 
     // Alice falls 25 blocks onto ground (y=64 is the flat world surface; damage = ceil(26 - 3) = 23 -> fatal).
     engine.push_input(GameInput::PlayerMove {
@@ -50,7 +50,7 @@ fn ecs_handles_movement_fall_damage_death_and_item_drop_pickup_without_network()
         rotation: None,
         on_ground: true,
     });
-    let outputs = engine.process_inputs();
+    let outputs = engine.tick();
 
     assert!(
         outputs
@@ -79,7 +79,7 @@ fn ecs_handles_movement_fall_damage_death_and_item_drop_pickup_without_network()
         inventory: Box::new(bob_inv),
     });
     engine.push_input(GameInput::PlayerTeleportConfirmed { uuid: bob_id });
-    let _ = engine.process_inputs();
+    let _ = engine.tick();
 
     let mut collected = false;
     for step in 1..=45 {
@@ -137,7 +137,7 @@ fn ecs_ticks_food_eating_and_block_interaction_end_to_end() {
         uuid,
         chunk: [0, 0],
     });
-    let _ = engine.process_inputs();
+    let _ = engine.tick();
 
     // Start eating steak via UseItem.
     engine.push_input(GameInput::PlayerUseItem {
@@ -145,7 +145,7 @@ fn ecs_ticks_food_eating_and_block_interaction_end_to_end() {
         hand: 0,
         sequence: 1,
     });
-    let _ = engine.process_inputs();
+    let _ = engine.tick();
 
     // Advance 32 discrete ticks -> eating completes inside tick_player_vitals_system.
     let mut outputs = Vec::new();
@@ -171,7 +171,7 @@ fn ecs_ticks_food_eating_and_block_interaction_end_to_end() {
         face: 1,
         sequence: 2,
     });
-    let outputs = engine.process_inputs();
+    let outputs = engine.tick();
     assert!(outputs.iter().any(|o| matches!(
         o,
         GameOutput::WorldMutatedWithAck { actor, sequence: 2, .. } if *actor == uuid

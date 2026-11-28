@@ -3,7 +3,7 @@
 use super::sync;
 use crate::{
     config::GameMode,
-    engine::{GameEngine, GameInput, PlayerSnapshot},
+    engine::{GameEngine, GameInput, GameOutput, PlayerSnapshot},
     game::Inventory,
     players::Players,
     protocol::{
@@ -36,14 +36,6 @@ pub const GAME_INPUT_QUEUE_CAPACITY: usize = 4096;
 /// Prevents sustained input floods from starving periodic world/entity simulation ticks.
 pub const MAX_INPUT_BATCH_PER_TURN: usize = 256;
 
-/// When fewer than 4ms remain until the next 20 TPS tick, defer non-barrier
-/// inputs into the tick boundary instead of running a separate off-tick pass.
-const DEFER_NEAR_TICK_WINDOW: Duration = Duration::from_millis(4);
-
-/// When exponential-moving-average tick duration reaches 10ms, adaptively coalesce
-/// non-barrier inputs onto tick boundaries to reduce `Players::registry` lock churn.
-const DEFER_MSPT_THRESHOLD_US: u64 = 10_000;
-
 /// Minimum interval between slow-tick overload warnings (`Can't keep up!`).
 const OVERLOAD_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -68,6 +60,11 @@ impl<T> Reply<T> {
 enum PlayerSaveCommand {
     Save(Box<crate::game::Player>, Box<Inventory>),
     Flush(Reply<()>),
+}
+
+struct OutputBatch {
+    outputs: Vec<GameOutput>,
+    barriers: Vec<Reply<io::Result<()>>>,
 }
 
 pub(crate) enum EngineCommand {
@@ -99,21 +96,24 @@ pub(crate) enum EngineCommand {
     Shutdown,
 }
 
-/// Handle owning the dedicated OS game-loop thread and its background player-save worker.
+/// Handle owning the dedicated OS game-loop thread, its outbound network sync
+/// worker, and its background player-save worker.
 /// Calling `shutdown()` (or dropping the handle) stops the loop cleanly,
-/// drains remaining queued commands, joins both threads, and returns `GameEngine`
-/// ownership back to `PlayService`.
+/// drains remaining queued commands, flushes outbound sync and playerdata saves,
+/// joins all threads, and returns `GameEngine` ownership back to `PlayService`.
 pub struct GameLoopHandle {
     loop_tx: Arc<Mutex<Option<SyncSender<EngineCommand>>>>,
     player_save_tx: Arc<Mutex<Option<mpsc::Sender<PlayerSaveCommand>>>>,
     tx: Option<SyncSender<EngineCommand>>,
     thread: Option<JoinHandle<()>>,
+    sync_thread: Option<JoinHandle<()>>,
     save_thread: Option<JoinHandle<()>>,
 }
 
 impl GameLoopHandle {
     /// Gracefully stop the dedicated game-loop thread, draining queued commands,
-    /// flushing all pending playerdata saves, and returning `GameEngine` ownership.
+    /// flushing all outbound sync batches and pending playerdata writes, and
+    /// returning `GameEngine` ownership.
     pub fn shutdown(mut self) {
         self.stop_inner();
     }
@@ -130,7 +130,14 @@ impl GameLoopHandle {
         {
             tracing::error!(?error, "dedicated game loop thread panicked");
         }
-        // 2. Game loop has drained all PlayerLeave events and dropped its save sender.
+        // 2. Game loop has drained all remaining inputs and dropped `output_tx`.
+        //    Wait for the outbound sync worker to finish applying outputs and enqueuing saves.
+        if let Some(handle) = self.sync_thread.take()
+            && let Err(error) = handle.join()
+        {
+            tracing::error!(?error, "outbound sync worker thread panicked");
+        }
+        // 3. Outbound sync worker has dropped its `save_tx`.
         //    Detach the shared save sender and wait for all pending playerdata writes.
         *self.player_save_tx.lock().expect("player_save_tx poisoned") = None;
         if let Some(handle) = self.save_thread.take()
@@ -251,6 +258,25 @@ impl PlayService {
             })?;
         *self.player_save_tx.lock().expect("player_save_tx poisoned") = Some(save_tx.clone());
 
+        let (output_tx, output_rx) = mpsc::channel::<OutputBatch>();
+        let sync_players = players.clone();
+        let sync_save_tx = save_tx.clone();
+        let sync_thread = match thread::Builder::new()
+            .name("zcraft-output-sync".into())
+            .spawn(move || {
+                run_output_sync_thread(output_rx, sync_players, sync_save_tx);
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                *self.engine.lock().expect("game engine poisoned") = Some(engine);
+                *self.player_save_tx.lock().expect("player_save_tx poisoned") = None;
+                drop(save_tx);
+                let _ = save_thread.join();
+                return Err(error);
+            }
+        };
+        drop(save_tx);
+
         let (tx, rx) = mpsc::sync_channel(capacity.max(1));
         *self.loop_tx.lock().expect("loop_tx poisoned") = Some(tx.clone());
 
@@ -265,8 +291,7 @@ impl PlayService {
                     engine_slot,
                     loop_tx_slot,
                     rx,
-                    players,
-                    save_tx,
+                    output_tx,
                     mspt_micros,
                     tick_notify,
                 );
@@ -274,6 +299,7 @@ impl PlayService {
             Ok(handle) => handle,
             Err(error) => {
                 *self.loop_tx.lock().expect("loop_tx poisoned") = None;
+                let _ = sync_thread.join();
                 *self.player_save_tx.lock().expect("player_save_tx poisoned") = None;
                 let _ = save_thread.join();
                 return Err(error);
@@ -285,6 +311,7 @@ impl PlayService {
             player_save_tx: self.player_save_tx.clone(),
             tx: Some(tx),
             thread: Some(thread),
+            sync_thread: Some(sync_thread),
             save_thread: Some(save_thread),
         })
     }
@@ -428,7 +455,7 @@ impl PlayService {
     fn submit_input_inline(&self, input: GameInput, players: &Players) -> io::Result<()> {
         let outputs = self.with_inline_engine(|engine| {
             engine.push_input(input);
-            engine.process_inputs()
+            engine.drain_inputs_only()
         })?;
         sync::apply_outputs(players, outputs, |p, inv| self.persist_inline(p, inv))
     }
@@ -612,11 +639,18 @@ impl PlayService {
         pos: world::BlockPos,
         state: i32,
     ) -> io::Result<bool> {
-        let Some(mutation) = self.world.set_block(pos, state) else {
-            return Ok(false);
-        };
-        sync::publish_mutation(players, mutation)?;
-        Ok(true)
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.submit_input_sync(
+            GameInput::ControlSetBlock {
+                pos,
+                state,
+                reply: Some(reply_tx),
+            },
+            players,
+        )?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("game loop terminated"))
     }
 
     pub fn fill_blocks(
@@ -626,10 +660,19 @@ impl PlayService {
         to: world::BlockPos,
         state: i32,
     ) -> io::Result<usize> {
-        let mutation = self.world.fill_blocks(from, to, state)?;
-        let count = mutation.block_changes.len();
-        sync::publish_mutation(players, mutation)?;
-        Ok(count)
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.submit_input_sync(
+            GameInput::ControlFillBlocks {
+                from,
+                to,
+                state,
+                reply: Some(reply_tx),
+            },
+            players,
+        )?;
+        reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("game loop terminated"))?
     }
 
     /// Build spawn/metadata/velocity packets for all active item drop entities.
@@ -696,15 +739,123 @@ impl PlayService {
     }
 
     pub fn set_day_time(&self, day_time: i64) -> TimeUpdate {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        if let Some(tx) = self.current_loop_tx() {
+            let (done_tx, done_rx) = mpsc::sync_channel(1);
+            if tx
+                .send(EngineCommand::InputSync {
+                    input: GameInput::ControlSetDayTime {
+                        day_time,
+                        reply: Some(reply_tx),
+                    },
+                    done: Reply::Sync(done_tx),
+                })
+                .is_ok()
+            {
+                let _ = done_rx.recv();
+                if let Ok(snap) = reply_rx.recv() {
+                    return sync::encode_time(snap);
+                }
+            }
+        } else if self
+            .with_inline_engine(|engine| {
+                engine.push_input(GameInput::ControlSetDayTime {
+                    day_time,
+                    reply: Some(reply_tx),
+                });
+                let _ = engine.drain_inputs_only();
+            })
+            .is_ok()
+            && let Ok(snap) = reply_rx.recv()
+        {
+            return sync::encode_time(snap);
+        }
         sync::encode_time(self.world.set_day_time(day_time))
     }
 
+    pub(crate) fn set_day_time_for(
+        &self,
+        players: &Players,
+        day_time: i64,
+    ) -> io::Result<TimeUpdate> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.submit_input_sync(
+            GameInput::ControlSetDayTime {
+                day_time,
+                reply: Some(reply_tx),
+            },
+            players,
+        )?;
+        let snap = reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("game loop terminated"))?;
+        Ok(sync::encode_time(snap))
+    }
+
     pub fn set_weather(&self, raining: bool, thundering: bool, duration: u32) -> Vec<Clientbound> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        if let Some(tx) = self.current_loop_tx() {
+            let (done_tx, done_rx) = mpsc::sync_channel(1);
+            if tx
+                .send(EngineCommand::InputSync {
+                    input: GameInput::ControlSetWeather {
+                        raining,
+                        thundering,
+                        duration,
+                        reply: Some(reply_tx),
+                    },
+                    done: Reply::Sync(done_tx),
+                })
+                .is_ok()
+            {
+                let _ = done_rx.recv();
+                if let Ok(events) = reply_rx.recv() {
+                    return events.into_iter().map(sync::encode_weather).collect();
+                }
+            }
+        } else if self
+            .with_inline_engine(|engine| {
+                engine.push_input(GameInput::ControlSetWeather {
+                    raining,
+                    thundering,
+                    duration,
+                    reply: Some(reply_tx),
+                });
+                let _ = engine.drain_inputs_only();
+            })
+            .is_ok()
+            && let Ok(events) = reply_rx.recv()
+        {
+            return events.into_iter().map(sync::encode_weather).collect();
+        }
         self.world
             .set_weather(raining, thundering, duration)
             .into_iter()
             .map(sync::encode_weather)
             .collect()
+    }
+
+    pub(crate) fn set_weather_for(
+        &self,
+        players: &Players,
+        raining: bool,
+        thundering: bool,
+        duration: u32,
+    ) -> io::Result<Vec<Clientbound>> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.submit_input_sync(
+            GameInput::ControlSetWeather {
+                raining,
+                thundering,
+                duration,
+                reply: Some(reply_tx),
+            },
+            players,
+        )?;
+        let events = reply_rx
+            .recv()
+            .map_err(|_| io::Error::other("game loop terminated"))?;
+        Ok(events.into_iter().map(sync::encode_weather).collect())
     }
 
     pub(super) fn initial_environment_packets(&self) -> Vec<Clientbound> {
@@ -809,87 +960,88 @@ fn enqueue_player_save(
     }
 }
 
-/// Decide dynamically whether non-barrier inputs should defer to the upcoming
-/// 20 TPS tick boundary instead of executing in an immediate off-tick pass.
-fn should_defer_inputs(
-    remaining_until_tick: Duration,
-    ema_mspt_us: u64,
-    buffered_len: usize,
-) -> bool {
-    remaining_until_tick <= DEFER_NEAR_TICK_WINDOW
-        || ema_mspt_us >= DEFER_MSPT_THRESHOLD_US
-        || buffered_len >= MAX_INPUT_BATCH_PER_TURN
+/// Dedicated outbound network synchronization worker: encodes `GameOutput`
+/// events into protocol packets, fans out through `Players`, forwards player
+/// persistence to the save worker, and completes FIFO barriers once synced.
+fn run_output_sync_thread(
+    output_rx: mpsc::Receiver<OutputBatch>,
+    players: Players,
+    save_tx: mpsc::Sender<PlayerSaveCommand>,
+) {
+    while let Ok(batch) = output_rx.recv() {
+        let result = if batch.outputs.is_empty() {
+            Ok(())
+        } else {
+            sync::apply_outputs(&players, batch.outputs, |p, inv| {
+                enqueue_player_save(&save_tx, p, inv)
+            })
+        };
+        if let Err(error) = &result {
+            tracing::warn!(%error, "failed to sync ECS outputs");
+        }
+        for barrier in batch.barriers {
+            let reply = match &result {
+                Ok(()) => Ok(()),
+                Err(error) => Err(io::Error::new(error.kind(), error.to_string())),
+            };
+            barrier.send(reply);
+        }
+    }
 }
 
-fn flush_inputs(
+fn dispatch_tick_batch(
     engine: &mut GameEngine,
-    players: &Players,
-    save_tx: &mpsc::Sender<PlayerSaveCommand>,
-    pending: &mut Vec<GameInput>,
+    output_tx: &mpsc::Sender<OutputBatch>,
+    pending_inputs: &mut Vec<GameInput>,
+    pending_barriers: &mut Vec<Reply<io::Result<()>>>,
+    extra_barrier: Option<Reply<io::Result<()>>>,
 ) {
-    for input in pending.drain(..) {
+    for input in pending_inputs.drain(..) {
         engine.push_input(input);
     }
-    let outputs = engine.process_inputs();
-    if let Err(error) = sync::apply_outputs(players, outputs, |p, inv| {
-        enqueue_player_save(save_tx, p, inv)
-    }) {
-        tracing::warn!(%error, "failed to sync ECS input batch");
+    let mut barriers = std::mem::take(pending_barriers);
+    if let Some(done) = extra_barrier {
+        barriers.push(done);
+    }
+    let outputs = engine.tick();
+    if !outputs.is_empty() || !barriers.is_empty() {
+        let _ = output_tx.send(OutputBatch { outputs, barriers });
     }
 }
 
-fn execute_command(
+fn drain_shutdown_batch(
     engine: &mut GameEngine,
-    players: &Players,
-    save_tx: &mpsc::Sender<PlayerSaveCommand>,
-    cmd: EngineCommand,
+    output_tx: &mpsc::Sender<OutputBatch>,
+    pending_inputs: &mut Vec<GameInput>,
+    pending_barriers: &mut Vec<Reply<io::Result<()>>>,
 ) {
-    match cmd {
-        EngineCommand::Input(input) => {
-            engine.push_input(input);
-            let outputs = engine.process_inputs();
-            if let Err(error) = sync::apply_outputs(players, outputs, |p, inv| {
-                enqueue_player_save(save_tx, p, inv)
-            }) {
-                tracing::warn!(%error, "failed to sync ECS input");
-            }
-        }
-        EngineCommand::InputSync { input, done } => {
-            engine.push_input(input);
-            let outputs = engine.process_inputs();
-            let result = sync::apply_outputs(players, outputs, |p, inv| {
-                enqueue_player_save(save_tx, p, inv)
-            });
-            done.send(result);
-        }
-        EngineCommand::Tick { done } => {
-            let outputs = engine.tick();
-            let result = sync::apply_outputs(players, outputs, |p, inv| {
-                enqueue_player_save(save_tx, p, inv)
-            });
-            done.send(result);
-        }
-        EngineCommand::PlayerSnapshot { uuid, reply } => {
-            reply.send(engine.player_snapshot(uuid));
-        }
-        EngineCommand::PlayerInventory { uuid, reply } => {
-            reply.send(engine.player_inventory(uuid));
-        }
-        EngineCommand::ExistingDrops { reply } => {
-            reply.send(engine.existing_drops());
-        }
-        EngineCommand::Shutdown => {}
+    for input in pending_inputs.drain(..) {
+        engine.push_input(input);
+    }
+    let barriers = std::mem::take(pending_barriers);
+    let outputs = engine.drain_inputs_only();
+    if !outputs.is_empty() || !barriers.is_empty() {
+        let _ = output_tx.send(OutputBatch { outputs, barriers });
     }
 }
 
+/// Dedicated 20 TPS fixed-timestep game loop thread.
+///
+/// Strict fixed-timestep contract:
+/// - All state-mutating inputs (`Input`, `InputSync`) are buffered and executed
+///   exclusively on 20 TPS tick boundaries inside `GameEngine::tick()`.
+/// - Read-only snapshot queries (`PlayerSnapshot`, `PlayerInventory`, `ExistingDrops`)
+///   are served immediately between ticks from the last completed tick's authoritative
+///   state without flushing or advancing buffered inputs.
+/// - Protocol encoding and `Players` fanout run asynchronously on `zcraft-output-sync`
+///   so network lock contention never stalls the simulation loop.
 #[allow(clippy::too_many_arguments)]
 fn run_game_loop_thread(
     mut engine: GameEngine,
     engine_slot: Arc<Mutex<Option<GameEngine>>>,
     loop_tx_slot: Arc<Mutex<Option<SyncSender<EngineCommand>>>>,
     rx: mpsc::Receiver<EngineCommand>,
-    players: Players,
-    save_tx: mpsc::Sender<PlayerSaveCommand>,
+    output_tx: mpsc::Sender<OutputBatch>,
     mspt_micros: Arc<AtomicU64>,
     tick_notify: Option<tokio::sync::mpsc::Sender<()>>,
 ) {
@@ -898,7 +1050,8 @@ fn run_game_loop_thread(
     };
     let mut next_tick = std::time::Instant::now() + world::TICK_INTERVAL;
     let mut shutting_down = false;
-    let mut deferred_inputs: Vec<GameInput> = Vec::new();
+    let mut pending_inputs: Vec<GameInput> = Vec::new();
+    let mut pending_barriers: Vec<Reply<io::Result<()>>> = Vec::new();
     let mut ema_mspt_us: u64 = 0;
     let mut last_overload_warn: Option<std::time::Instant> = None;
 
@@ -907,18 +1060,63 @@ fn run_game_loop_thread(
             // Drain all remaining queued commands in strict FIFO order before exit.
             while let Ok(cmd) = rx.try_recv() {
                 match cmd {
-                    EngineCommand::Input(input) => deferred_inputs.push(input),
-                    EngineCommand::Shutdown => {}
-                    other => {
-                        if !deferred_inputs.is_empty() {
-                            flush_inputs(&mut engine, &players, &save_tx, &mut deferred_inputs);
-                        }
-                        execute_command(&mut engine, &players, &save_tx, other);
+                    EngineCommand::Input(input) => pending_inputs.push(input),
+                    EngineCommand::InputSync { input, done } => {
+                        pending_inputs.push(input);
+                        pending_barriers.push(done);
                     }
+                    EngineCommand::Tick { done } => {
+                        dispatch_tick_batch(
+                            &mut engine,
+                            &output_tx,
+                            &mut pending_inputs,
+                            &mut pending_barriers,
+                            Some(done),
+                        );
+                    }
+                    EngineCommand::PlayerSnapshot { uuid, reply } => {
+                        if !pending_inputs.is_empty() || !pending_barriers.is_empty() {
+                            drain_shutdown_batch(
+                                &mut engine,
+                                &output_tx,
+                                &mut pending_inputs,
+                                &mut pending_barriers,
+                            );
+                        }
+                        reply.send(engine.player_snapshot(uuid));
+                    }
+                    EngineCommand::PlayerInventory { uuid, reply } => {
+                        if !pending_inputs.is_empty() || !pending_barriers.is_empty() {
+                            drain_shutdown_batch(
+                                &mut engine,
+                                &output_tx,
+                                &mut pending_inputs,
+                                &mut pending_barriers,
+                            );
+                        }
+                        reply.send(engine.player_inventory(uuid));
+                    }
+                    EngineCommand::ExistingDrops { reply } => {
+                        if !pending_inputs.is_empty() || !pending_barriers.is_empty() {
+                            drain_shutdown_batch(
+                                &mut engine,
+                                &output_tx,
+                                &mut pending_inputs,
+                                &mut pending_barriers,
+                            );
+                        }
+                        reply.send(engine.existing_drops());
+                    }
+                    EngineCommand::Shutdown => {}
                 }
             }
-            if !deferred_inputs.is_empty() {
-                flush_inputs(&mut engine, &players, &save_tx, &mut deferred_inputs);
+            if !pending_inputs.is_empty() || !pending_barriers.is_empty() {
+                drain_shutdown_batch(
+                    &mut engine,
+                    &output_tx,
+                    &mut pending_inputs,
+                    &mut pending_barriers,
+                );
             }
             break;
         }
@@ -926,15 +1124,13 @@ fn run_game_loop_thread(
         let now_std = std::time::Instant::now();
         if now_std >= next_tick {
             let tick_start = now_std;
-            for input in deferred_inputs.drain(..) {
-                engine.push_input(input);
-            }
-            let outputs = engine.tick();
-            if let Err(error) = sync::apply_outputs(&players, outputs, |p, inv| {
-                enqueue_player_save(&save_tx, p, inv)
-            }) {
-                tracing::warn!(%error, "failed to sync ECS game tick outputs");
-            }
+            dispatch_tick_batch(
+                &mut engine,
+                &output_tx,
+                &mut pending_inputs,
+                &mut pending_barriers,
+                None,
+            );
             let tick_elapsed = tick_start.elapsed();
             let elapsed_us = tick_elapsed.as_micros() as u64;
             ema_mspt_us = if ema_mspt_us == 0 {
@@ -974,17 +1170,32 @@ fn run_game_loop_thread(
                 while let Some(cmd) = current.take() {
                     processed += 1;
                     match cmd {
-                        EngineCommand::Input(input) => deferred_inputs.push(input),
+                        EngineCommand::Input(input) => pending_inputs.push(input),
+                        EngineCommand::InputSync { input, done } => {
+                            pending_inputs.push(input);
+                            pending_barriers.push(done);
+                        }
+                        EngineCommand::Tick { done } => {
+                            dispatch_tick_batch(
+                                &mut engine,
+                                &output_tx,
+                                &mut pending_inputs,
+                                &mut pending_barriers,
+                                Some(done),
+                            );
+                        }
+                        EngineCommand::PlayerSnapshot { uuid, reply } => {
+                            reply.send(engine.player_snapshot(uuid));
+                        }
+                        EngineCommand::PlayerInventory { uuid, reply } => {
+                            reply.send(engine.player_inventory(uuid));
+                        }
+                        EngineCommand::ExistingDrops { reply } => {
+                            reply.send(engine.existing_drops());
+                        }
                         EngineCommand::Shutdown => {
                             shutting_down = true;
                             break;
-                        }
-                        other => {
-                            // Always flush buffered inputs before barriers/queries for strict FIFO.
-                            if !deferred_inputs.is_empty() {
-                                flush_inputs(&mut engine, &players, &save_tx, &mut deferred_inputs);
-                            }
-                            execute_command(&mut engine, &players, &save_tx, other);
                         }
                     }
                     if processed >= MAX_INPUT_BATCH_PER_TURN
@@ -1001,14 +1212,6 @@ fn run_game_loop_thread(
                         }
                     }
                 }
-                // Dynamically decide whether to flush immediately (low latency) or
-                // keep buffered until the upcoming 20 TPS tick boundary (coalesced).
-                if !deferred_inputs.is_empty() {
-                    let remaining = next_tick.saturating_duration_since(std::time::Instant::now());
-                    if !should_defer_inputs(remaining, ema_mspt_us, deferred_inputs.len()) {
-                        flush_inputs(&mut engine, &players, &save_tx, &mut deferred_inputs);
-                    }
-                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -1021,7 +1224,7 @@ fn run_game_loop_thread(
     // observing `Disconnected` is guaranteed to find `Some(engine)` in `engine_slot`.
     *loop_tx_slot.lock().expect("loop_tx poisoned") = None;
     *engine_slot.lock().expect("game engine poisoned") = Some(engine);
-    drop(save_tx);
+    drop(output_tx);
     drop(rx);
 }
 
@@ -1163,18 +1366,49 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_input_deferral_switches_by_deadline_load_and_batch_size() {
-        // Light load and plenty of time before next tick -> execute immediately.
-        assert!(!should_defer_inputs(Duration::from_millis(20), 2_000, 10));
-        // Near tick boundary (<= 4ms) -> defer to tick boundary.
-        assert!(should_defer_inputs(Duration::from_millis(3), 2_000, 1));
-        // High MSPT (>= 10ms) -> defer to coalesce onto tick boundary.
-        assert!(should_defer_inputs(Duration::from_millis(20), 12_000, 1));
-        // Burst reached batch cap -> defer remaining.
-        assert!(should_defer_inputs(
-            Duration::from_millis(20),
-            2_000,
-            MAX_INPUT_BATCH_PER_TURN
-        ));
+    fn strict_fixed_timestep_defers_inputs_to_tick_boundary_and_keeps_queries_readonly() {
+        let service = PlayService::new().unwrap();
+        let players = Players::new(4);
+        let handle = service.start_game_loop(players.clone(), None).unwrap();
+
+        let uuid = Uuid::from_u128(4004);
+        let player = Player::at_spawn(1, uuid, "Steve".into(), GameMode::Creative);
+        service
+            .submit_input_sync(
+                GameInput::PlayerJoin {
+                    player: Box::new(player),
+                    inventory: Box::new(Inventory::default()),
+                },
+                &players,
+            )
+            .unwrap();
+
+        // Queue a fire-and-forget ControlSetGameMode right after a tick completed.
+        // Read-only queries between ticks must NOT flush buffered inputs off-tick.
+        service
+            .dispatch_input(
+                GameInput::ControlSetGameMode {
+                    uuid,
+                    mode: GameMode::Survival,
+                },
+                &players,
+            )
+            .unwrap();
+        let snap_mid_tick = service.player_snapshot(uuid).expect("online snapshot");
+        assert_eq!(snap_mid_tick.game_mode, GameMode::Creative);
+
+        // Once the next authoritative tick executes, the buffered input takes effect.
+        service.tick_engine(&players).unwrap();
+        let snap_after_tick = service.player_snapshot(uuid).expect("online snapshot");
+        assert_eq!(snap_after_tick.game_mode, GameMode::Survival);
+
+        // World mutations also route through the ECS game loop.
+        let pos = world::BlockPos([2, 65, 2]);
+        assert!(service.set_block(&players, pos, crate::game::GLASS_STATE).unwrap());
+        assert_eq!(service.world().block_at(pos), crate::game::GLASS_STATE);
+        let time = service.set_day_time_for(&players, 6_000).unwrap();
+        assert_eq!(time.time_of_day, 6_000);
+
+        handle.shutdown();
     }
 }

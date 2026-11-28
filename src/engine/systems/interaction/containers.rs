@@ -13,7 +13,7 @@ use crate::{
 use bevy_ecs::prelude::World;
 use uuid::Uuid;
 
-pub(super) fn refresh_container_viewers(ecs: &mut World, pos: BlockPos, exclude: Uuid) {
+pub(crate) fn refresh_container_viewers(ecs: &mut World, pos: BlockPos, exclude: Uuid) {
     let others = ecs.resource::<ChestViewers>().others(pos, exclude);
     if others.is_empty() {
         return;

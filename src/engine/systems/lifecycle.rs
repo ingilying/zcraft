@@ -1,5 +1,5 @@
 //! Player entity lifecycle & server control ECS handlers.
-use super::drops::spawn_drop_scatter;
+use super::{drops::spawn_drop_scatter, interaction::refresh_container_viewers};
 use crate::{
     config::GameMode,
     engine::{
@@ -11,9 +11,10 @@ use crate::{
         resources::{ChestViewers, EntityRegistry, OutputQueue, VoxelWorld},
     },
     game::{Inventory, Item, Player},
+    world::{BlockPos, TimeSnapshot, WeatherEvent},
 };
 use bevy_ecs::prelude::World;
-use std::collections::HashSet;
+use std::{collections::HashSet, io, sync::mpsc::SyncSender};
 use uuid::Uuid;
 
 pub(crate) fn handle_join(ecs: &mut World, player: Player, inventory: Inventory) {
@@ -304,4 +305,103 @@ pub(crate) fn handle_control_game_mode(ecs: &mut World, uuid: Uuid, mode: GameMo
             saturation,
             inventory,
         });
+}
+
+fn reconcile_container_at(ecs: &mut World, pos: BlockPos) {
+    if !ecs.resource::<ChestViewers>().0.contains_key(&pos) {
+        return;
+    }
+    refresh_container_viewers(ecs, pos, Uuid::nil());
+    let world = ecs.resource::<VoxelWorld>().0.clone();
+    if world.chest_items(pos).is_none() && world.furnace_data(pos).is_none() {
+        ecs.resource_mut::<ChestViewers>().0.remove(&pos);
+        ecs.resource_mut::<OutputQueue>()
+            .push(GameOutput::ChestLidUpdated {
+                pos,
+                viewer_count: 0,
+            });
+    }
+}
+
+pub(crate) fn handle_control_set_block(
+    ecs: &mut World,
+    pos: BlockPos,
+    state: i32,
+    reply: Option<SyncSender<bool>>,
+) {
+    let world = ecs.resource::<VoxelWorld>().0.clone();
+    let changed = if let Some(mutation) = world.set_block(pos, state) {
+        reconcile_container_at(ecs, pos);
+        ecs.resource_mut::<OutputQueue>()
+            .push(GameOutput::WorldMutated(mutation));
+        true
+    } else {
+        false
+    };
+    if let Some(tx) = reply {
+        let _ = tx.send(changed);
+    }
+}
+
+pub(crate) fn handle_control_fill_blocks(
+    ecs: &mut World,
+    from: BlockPos,
+    to: BlockPos,
+    state: i32,
+    reply: Option<SyncSender<io::Result<usize>>>,
+) {
+    let world = ecs.resource::<VoxelWorld>().0.clone();
+    let result = match world.fill_blocks(from, to, state) {
+        Ok(mutation) => {
+            let count = mutation.block_changes.len();
+            if !ecs.resource::<ChestViewers>().0.is_empty() {
+                let positions: Vec<BlockPos> =
+                    mutation.block_changes.iter().map(|&(pos, _)| pos).collect();
+                for pos in positions {
+                    reconcile_container_at(ecs, pos);
+                }
+            }
+            ecs.resource_mut::<OutputQueue>()
+                .push(GameOutput::WorldMutated(mutation));
+            Ok(count)
+        }
+        Err(error) => Err(error),
+    };
+    if let Some(tx) = reply {
+        let _ = tx.send(result);
+    }
+}
+
+pub(crate) fn handle_control_set_day_time(
+    ecs: &mut World,
+    day_time: i64,
+    reply: Option<SyncSender<TimeSnapshot>>,
+) {
+    let world = ecs.resource::<VoxelWorld>().0.clone();
+    let snap = world.set_day_time(day_time);
+    ecs.resource_mut::<OutputQueue>()
+        .push(GameOutput::TimeUpdated(snap));
+    if let Some(tx) = reply {
+        let _ = tx.send(snap);
+    }
+}
+
+pub(crate) fn handle_control_set_weather(
+    ecs: &mut World,
+    raining: bool,
+    thundering: bool,
+    duration: u32,
+    reply: Option<SyncSender<Vec<WeatherEvent>>>,
+) {
+    let world = ecs.resource::<VoxelWorld>().0.clone();
+    let events = world.set_weather(raining, thundering, duration);
+    {
+        let mut out = ecs.resource_mut::<OutputQueue>();
+        for &event in &events {
+            out.push(GameOutput::WeatherChanged(event));
+        }
+    }
+    if let Some(tx) = reply {
+        let _ = tx.send(events);
+    }
 }
