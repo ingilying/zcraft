@@ -8,7 +8,10 @@ use crate::{
     protocol::{
         Clientbound,
         packets::{
-            play::{BlockDestruction, GameEvent, HurtAnimation, PlayerAbilities, TimeUpdate, UpdateHealth},
+            play::{
+                BlockDestruction, GameEvent, HurtAnimation, PlayerAbilities, TimeUpdate,
+                UpdateHealth,
+            },
             play_blocks::{
                 BlockAck, BlockAction, BlockUpdate, CloseContainer, ContainerSetData,
                 InventoryContent, LightUpdate, OpenScreen, SelectedSlot, SetInventorySlot,
@@ -199,14 +202,11 @@ pub(crate) fn apply_outputs(
                 let _ = players.broadcast_entity_packet(
                     &SpawnEntity::item(id, uuid, position, velocity).into(),
                 );
-                let _ =
-                    players.broadcast_entity_packet(&EntityMetadata::Item { id, stack }.into());
-                let _ =
-                    players.broadcast_entity_packet(&EntityVelocity::new(id, velocity).into());
+                let _ = players.broadcast_entity_packet(&EntityMetadata::Item { id, stack }.into());
+                let _ = players.broadcast_entity_packet(&EntityVelocity::new(id, velocity).into());
             }
             GameOutput::ItemDropUpdated { id, stack } => {
-                let _ =
-                    players.broadcast_entity_packet(&EntityMetadata::Item { id, stack }.into());
+                let _ = players.broadcast_entity_packet(&EntityMetadata::Item { id, stack }.into());
             }
             GameOutput::ItemDropMoved {
                 id,
@@ -220,8 +220,7 @@ pub(crate) fn apply_outputs(
                     }
                     .into(),
                 );
-                let _ =
-                    players.broadcast_entity_packet(&EntityVelocity::new(id, velocity).into());
+                let _ = players.broadcast_entity_packet(&EntityVelocity::new(id, velocity).into());
             }
             GameOutput::ItemDropCollected {
                 drop_id,
@@ -293,7 +292,7 @@ pub(crate) fn apply_outputs(
                         food,
                         saturation,
                         missing_bed,
-                        inventory,
+                        inventory: Box::new(inventory),
                     },
                 );
             }
@@ -313,8 +312,7 @@ pub(crate) fn apply_outputs(
                         .send_packet(uuid, &UpdateHealth::new(health, food, saturation).into());
                 }
                 if mode != GameMode::Spectator {
-                    let _ =
-                        players.send_packet(uuid, &InventoryContent::player(&inventory).into());
+                    let _ = players.send_packet(uuid, &InventoryContent::player(&inventory).into());
                     let _ = players.send_packet(uuid, &SelectedSlot(inventory.selected()).into());
                 }
             }

@@ -448,7 +448,11 @@ impl Players {
     }
 
     /// Broadcast an entity-scoped packet to all other ready players watching `uuid`'s chunk.
-    pub(crate) fn broadcast_to_viewers_of(&self, uuid: Uuid, packet: &Clientbound) -> io::Result<()> {
+    pub(crate) fn broadcast_to_viewers_of(
+        &self,
+        uuid: Uuid,
+        packet: &Clientbound,
+    ) -> io::Result<()> {
         let body: Arc<[u8]> = packet.encode()?.into();
         let mut registry = lock(&self.registry);
         let chunk = match registry

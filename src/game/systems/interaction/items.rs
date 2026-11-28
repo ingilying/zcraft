@@ -3,12 +3,7 @@ use super::{InteractionCtx, blocks::apply_game_effects};
 use crate::game::{Hand, ItemStack, components::EatingState, io::GameOutput};
 use uuid::Uuid;
 
-pub(super) fn handle_use_item(
-    ctx: &mut InteractionCtx,
-    uuid: Uuid,
-    hand: i32,
-    sequence: i32,
-) {
+pub(super) fn handle_use_item(ctx: &mut InteractionCtx, uuid: Uuid, hand: i32, sequence: i32) {
     let Some(entity) = ctx.player_entity(uuid) else {
         return;
     };

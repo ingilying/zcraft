@@ -286,9 +286,7 @@ pub(super) fn handle_inventory_click(
                     };
                     let updated = world.update_furnace(fpos, |furnace| {
                         let (changed, drop) = crate::game::containers::apply_furnace_click(
-                            furnace,
-                            &mut inv.0,
-                            click,
+                            furnace, &mut inv.0, click,
                         );
                         dropped = drop;
                         changed

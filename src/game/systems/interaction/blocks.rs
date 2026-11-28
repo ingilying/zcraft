@@ -53,22 +53,8 @@ fn interact_block(
         main_hand_stack,
         place_hand_stack,
     ) = {
-        let Ok((
-            net_id,
-            _,
-            profile,
-            &pos,
-            &rot,
-            &movement,
-            _,
-            _,
-            dead,
-            _,
-            mining,
-            inv,
-            _,
-            view,
-        )) = ctx.players.get(entity)
+        let Ok((net_id, _, profile, &pos, &rot, &movement, _, _, dead, _, mining, inv, _, view)) =
+            ctx.players.get(entity)
         else {
             return;
         };
@@ -422,8 +408,7 @@ fn interact_block(
                 f64::from(cpos.0[2]) + 0.5,
             ];
             for stack in broken_chest_items {
-                ctx.drops
-                    .write(SpawnDropMsg::scatter(drop_xyz, stack, 10));
+                ctx.drops.write(SpawnDropMsg::scatter(drop_xyz, stack, 10));
             }
             refresh_container_viewers(ctx, cpos, Uuid::nil());
         }
@@ -444,8 +429,7 @@ fn interact_block(
                 f64::from(drop_pos.0[1]) + 0.5,
                 f64::from(drop_pos.0[2]) + 0.5,
             ];
-            ctx.drops
-                .write(SpawnDropMsg::scatter(drop_xyz, stack, 10));
+            ctx.drops.write(SpawnDropMsg::scatter(drop_xyz, stack, 10));
         }
         if inv_changed {
             ctx.emit_equipment(uuid, entity);
@@ -521,7 +505,8 @@ pub(super) fn handle_dig(
             ctx.commands.entity(entity).remove::<EatingState>();
         }
         6 => {
-            if let Ok((_, _, _, _, _, _, _, _, _, _, _, mut inv, _, _)) = ctx.players.get_mut(entity)
+            if let Ok((_, _, _, _, _, _, _, _, _, _, _, mut inv, _, _)) =
+                ctx.players.get_mut(entity)
             {
                 inv.0.swap_hands();
             }
@@ -621,7 +606,8 @@ pub(super) fn apply_game_effects(
         }
     }
     for message in effects.player_messages {
-        ctx.out.push(GameOutput::PlayerSystemMessage { uuid, message });
+        ctx.out
+            .push(GameOutput::PlayerSystemMessage { uuid, message });
     }
 
     if let Some(screen) = effects.open_screen {

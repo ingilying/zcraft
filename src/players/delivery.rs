@@ -28,7 +28,7 @@ pub(crate) enum PlayerControl {
         food: i32,
         saturation: f32,
         missing_bed: bool,
-        inventory: crate::game::Inventory,
+        inventory: Box<crate::game::Inventory>,
     },
     RefreshCommands,
     Kick(String),

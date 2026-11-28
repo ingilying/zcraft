@@ -1005,7 +1005,11 @@ mod tests {
 
         // World mutations also route through the ECS game loop.
         let pos = world::BlockPos([2, 65, 2]);
-        assert!(service.set_block(&players, pos, crate::game::GLASS_STATE).unwrap());
+        assert!(
+            service
+                .set_block(&players, pos, crate::game::GLASS_STATE)
+                .unwrap()
+        );
         assert_eq!(service.world().block_at(pos), crate::game::GLASS_STATE);
         let time = service.set_day_time_for(&players, 6_000).unwrap();
         assert_eq!(time.time_of_day, 6_000);

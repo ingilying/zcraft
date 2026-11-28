@@ -27,6 +27,7 @@ pub(crate) fn tick_world_clock_system(world: Res<VoxelWorld>, mut out: ResMut<Ou
 }
 
 /// Advance active item eating only for living players currently carrying `EatingState`.
+#[allow(clippy::type_complexity)]
 pub(crate) fn tick_player_eating_system(
     clock: Res<TickClock>,
     mut eaters: Query<
@@ -87,6 +88,7 @@ pub(crate) fn tick_player_eating_system(
 }
 
 /// Advance vanilla `FoodData` (exhaustion, regen, starvation) for living players (20 TPS).
+#[allow(clippy::type_complexity)]
 pub(crate) fn tick_player_food_system(
     mut players: Query<
         (
@@ -126,7 +128,10 @@ pub(crate) fn tick_player_food_system(
 /// expired (5 min) or void-fallen drops.
 pub(crate) fn drop_age_and_despawn_system(
     registry: Res<EntityRegistry>,
-    mut drops: Query<(Entity, &NetworkEntityId, &Position, &mut DropLifecycle), With<ItemDropMarker>>,
+    mut drops: Query<
+        (Entity, &NetworkEntityId, &Position, &mut DropLifecycle),
+        With<ItemDropMarker>,
+    >,
     mut commands: Commands,
     mut out: ResMut<OutputQueue>,
 ) {
@@ -175,9 +180,10 @@ pub(crate) fn drop_physics_system(
                 test[2].floor() as i32,
             ]);
             let blocked = bp.valid()
-                && world.0.block_at_if_loaded(bp).map_or(true, |s| {
-                    crate::game::block_by_state(s).is_some_and(|d| d.collision)
-                });
+                && world
+                    .0
+                    .block_at_if_loaded(bp)
+                    .is_none_or(|s| crate::game::block_by_state(s).is_some_and(|d| d.collision));
             if blocked {
                 vel.0[axis] = 0.0;
             } else {
@@ -192,9 +198,10 @@ pub(crate) fn drop_physics_system(
             pos.0[2].floor() as i32,
         ]);
         let on_ground = below.valid()
-            && world.0.block_at_if_loaded(below).map_or(true, |s| {
-                crate::game::block_by_state(s).is_some_and(|d| d.collision)
-            });
+            && world
+                .0
+                .block_at_if_loaded(below)
+                .is_none_or(|s| crate::game::block_by_state(s).is_some_and(|d| d.collision));
         if on_ground {
             pos.0[1] = f64::from(below.0[1] + 1) + 0.125;
             let ground_drag = 0.6 * 0.98;
@@ -215,10 +222,17 @@ pub(crate) fn drop_physics_system(
 }
 
 /// Drop pipeline stage 3: proximity pickup into living players' inventories.
+#[allow(clippy::type_complexity)]
 pub(crate) fn drop_pickup_system(
     registry: Res<EntityRegistry>,
     mut drops: Query<
-        (Entity, &NetworkEntityId, &Position, &DropLifecycle, &mut ItemStackComp),
+        (
+            Entity,
+            &NetworkEntityId,
+            &Position,
+            &DropLifecycle,
+            &mut ItemStackComp,
+        ),
         (With<ItemDropMarker>, Without<PlayerMarker>),
     >,
     mut players: Query<
@@ -282,6 +296,7 @@ pub(crate) fn drop_pickup_system(
 }
 
 /// Drop pipeline stage 4: merge nearby identical item drop stacks.
+#[allow(clippy::type_complexity)]
 pub(crate) fn drop_merge_system(
     registry: Res<EntityRegistry>,
     mut drops: Query<

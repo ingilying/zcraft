@@ -94,10 +94,15 @@ fn ecs_handles_movement_fall_damage_death_and_item_drop_pickup_without_network()
             });
         }
         let tick_out = engine.tick();
-        if tick_out
-            .iter()
-            .any(|o| matches!(o, GameOutput::ItemDropCollected { collector_id: 2, .. }))
-        {
+        if tick_out.iter().any(|o| {
+            matches!(
+                o,
+                GameOutput::ItemDropCollected {
+                    collector_id: 2,
+                    ..
+                }
+            )
+        }) {
             collected = true;
             break;
         }

@@ -430,8 +430,12 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
             }
             Ok(ConnectionEvent::Tick) => crate::handler::play::tick(&mut session, Instant::now()),
             Ok(ConnectionEvent::Chunks) => {
-                crate::handler::play::stream_chunks_async(&mut session, &server.play, Instant::now())
-                    .await
+                crate::handler::play::stream_chunks_async(
+                    &mut session,
+                    &server.play,
+                    Instant::now(),
+                )
+                .await
             }
             Ok(ConnectionEvent::Broadcast(crate::players::Delivery::Control(control))) => {
                 crate::handler::play::apply_control(

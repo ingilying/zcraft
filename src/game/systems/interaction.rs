@@ -8,18 +8,16 @@ mod items;
 use crate::game::{
     Hand, ItemStack, Player, UseContext,
     components::{
-        Dead, EatingState, EntityUuid, Health, Hunger, MiningState, MovementState,
-        NetworkEntityId, PlayerContainer, PlayerInventory, PlayerMarker, PlayerProfile,
-        PlayerViewState, Position, Rotation, player_eye_position,
+        Dead, EatingState, EntityUuid, Health, Hunger, MiningState, MovementState, NetworkEntityId,
+        PlayerContainer, PlayerInventory, PlayerMarker, PlayerProfile, PlayerViewState, Position,
+        Rotation, player_eye_position,
     },
     events::{InteractionMsg, SpawnDropMsg},
     io::GameOutput,
     resources::{ChestViewers, EntityRegistry, OutputQueue, TickClock, VoxelWorld},
 };
 use bevy_ecs::{
-    prelude::{
-        Commands, Entity, MessageReader, MessageWriter, Query, Res, ResMut, With,
-    },
+    prelude::{Commands, Entity, MessageReader, MessageWriter, Query, Res, ResMut, With},
     system::SystemParam,
 };
 use uuid::Uuid;
@@ -78,7 +76,8 @@ impl InteractionCtx<'_, '_> {
     }
 
     pub(super) fn emit_inventory_if_can_interact(&mut self, uuid: Uuid, entity: Entity) {
-        let Ok((_, _, profile, _, _, _, _, _, _, _, _, inv, _, _)) = self.players.get(entity) else {
+        let Ok((_, _, profile, _, _, _, _, _, _, _, _, inv, _, _)) = self.players.get(entity)
+        else {
             return;
         };
         if !profile.can_interact() {
@@ -239,7 +238,9 @@ pub(crate) fn player_interaction_system(
                 hand,
                 sequence,
             } => items::handle_use_item(&mut ctx, uuid, hand, sequence),
-            InteractionMsg::SelectSlot { uuid, slot } => items::handle_select_slot(&mut ctx, uuid, slot),
+            InteractionMsg::SelectSlot { uuid, slot } => {
+                items::handle_select_slot(&mut ctx, uuid, slot)
+            }
             InteractionMsg::CreativeSlot { uuid, slot, item } => {
                 items::handle_creative_slot(&mut ctx, uuid, slot, item)
             }

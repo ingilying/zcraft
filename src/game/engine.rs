@@ -2,8 +2,8 @@
 //! with zero network IO.
 use super::{
     components::{
-        EntityUuid, ItemDropMarker, ItemStackComp, MovementState, NetworkEntityId,
-        PlayerInventory, PlayerProfile, Position, Rotation, Velocity, entity_pose,
+        EntityUuid, ItemDropMarker, ItemStackComp, MovementState, NetworkEntityId, PlayerInventory,
+        PlayerProfile, Position, Rotation, Velocity, entity_pose,
     },
     events::{init_messages, update_messages},
     io::{DropSnapshot, GameInput, GameOutput, PlayerSnapshot},

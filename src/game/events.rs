@@ -2,9 +2,7 @@
 //! `Messages`, their lifecycle helpers, and the auto-generated `ingress_inputs_system`.
 use crate::{
     config::GameMode,
-    game::{
-        Inventory, InventoryClick, Item, ItemStack, Player, resources::InputQueue,
-    },
+    game::{Inventory, InventoryClick, Item, ItemStack, Player, resources::InputQueue},
     world::{BlockPos, TimeSnapshot, WeatherEvent},
 };
 use bevy_ecs::prelude::{Message, MessageWriter, Messages, ResMut, World};

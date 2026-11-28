@@ -91,7 +91,10 @@ pub(crate) fn player_join_system(
 pub(crate) fn player_view_system(
     mut views: MessageReader<PlayerViewMsg>,
     registry: Res<EntityRegistry>,
-    mut players: Query<(&Position, &Rotation, &MovementState, &mut PlayerViewState), With<PlayerMarker>>,
+    mut players: Query<
+        (&Position, &Rotation, &MovementState, &mut PlayerViewState),
+        With<PlayerMarker>,
+    >,
     mut out: ResMut<OutputQueue>,
 ) {
     for msg in views.read() {
@@ -129,6 +132,7 @@ pub(crate) fn player_view_system(
 }
 
 /// Apply server/admin player controls (`/tp`, `/give`, `/gamemode`).
+#[allow(clippy::type_complexity)]
 pub(crate) fn player_control_system(
     mut controls: MessageReader<PlayerControlMsg>,
     registry: Res<EntityRegistry>,

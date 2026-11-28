@@ -70,7 +70,10 @@ pub(crate) async fn apply_control(
                         players,
                     )?;
                 }
-                state.blocks.prepare_chunks_async(&mut chunk_packets).await?;
+                state
+                    .blocks
+                    .prepare_chunks_async(&mut chunk_packets)
+                    .await?;
                 replies.extend(chunk_packets);
             } else {
                 let old_view = state.chunks.view();
