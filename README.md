@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <strong>Rust + Tokio</strong> · Java 1.21.1 · 协议 767 · 早期开发中 ·
+  <strong>Rust + Tokio + bevy_ecs</strong> · Java 1.21.1 · 协议 767 · 早期开发中 ·
   <a href="LICENSE">GPL-3.0-only</a>
 </p>
 
@@ -32,10 +32,9 @@ ZCraft 探索以 Rust 实现 Minecraft 服务端，将网络传输、协议编�
 通过强类型数据包与声明式注册表扩展协议功能。
 
 > [!IMPORTANT]
-> 项目处于早期开发阶段。已实现状态查询、离线/正版登录、Configuration 同步，以及
-> **平坦世界的多人 Play 流程，含观战与最小创造模式**，不再在登录后立即断开。
-> 目前仅完成独立协议客户端联调，原版 Java 1.21.1 图形客户端的注册表加载与渲染仍需验证。
-> 尚无完整玩法或世界保存，暂不适合生产部署。
+> 项目处于早期开发阶段。已实现状态查询、离线/正版登录、Configuration 同步、
+> **主世界 / 超平坦地形生成、Anvil 1.21.1 世界与玩家持久化、以及基于独立 `bevy_ecs` 游戏线程的多人生存/创造/观战玩法**。
+> 尚未实现生物 AI、红石、下界/末地维度及完整原版玩法，暂不适合生产部署。
 
 ## 功能状态
 
@@ -50,14 +49,18 @@ ZCraft 探索以 Rust 实现 Minecraft 服务端，将网络传输、协议编�
 - [x] 数据包压缩
 - [x] Configuration 状态机、11 个动态注册表、功能标志与完成确认
 - [x] Configuration Keep Alive、可选/强制资源包协商与 Play 重新配置 API
-- [x] 观战 Play 初始化、动态区块加载/卸载、光照与玩家位置确认
+- [x] Play 初始化、动态区块加载/卸载、光照、单飞区块生成去重与异步阻塞池卸载
 - [x] Play Keep Alive、传送确认与取消安全的帧读取
-- [x] 玩家容量与重复身份检查、实时在线人数、有界广播队列
-- [ ] 自定义数据包、资源包动态增删及完整玩法语义
-- [x] 玩家列表、观战玩家的实体生成/移除、位置和朝向同步
-- [x] 服务端权威背包、数据驱动物品/方块、放置与破坏、多人方块同步
-- [x] 系统消息聊天、私聊与基础命令
-- [ ] 世界磁盘持久化
+- [x] 玩家容量与重复身份检查、实时在线人数、有界广播队列与有界 FIFO 入站队列
+- [x] 独立 OS 线程 `bevy_ecs` 20 TPS 权威游戏循环（与网络 IO 解耦）
+- [x] 玩家列表、实体生成/移除、位置/朝向/动作/装备同步
+- [x] 生存、创造与观战模式：生命/饥饿/进食、摔落与虚空伤害、死亡掉落与拾取、床重生、工具挖掘与耐久
+- [x] 数据驱动物品/方块/配方/官方战利品表、2×2 与工作台合成、箱子与熔炉容器及 20 TPS 烧炼
+- [x] 交互式方块（门、活板门、栅栏门、床）与流体/重力方块物理、桶装取水
+- [x] 系统消息聊天、私聊、OP 权限管理、控制台与基础命令（含补全与 `/save-all`）
+- [x] Anvil 1.21.1 世界持久化（`level.dat`、`region/r.<rx>.<rz>.mca`、`playerdata/<uuid>.dat`、定时与背压自动刷盘）
+- [x] 可插拔地形生成器（`overworld` 主世界、`flat` 超平坦及自定义 `GeneratorSpec` / `GeneratorRegistry`）
+- [ ] 生物/怪物 AI、红石、多维度及自定义数据包完整语义
 
 尚未实现多版本协议映射。
 
@@ -106,12 +109,14 @@ bind = "0.0.0.0:25565"
 motd = "ZCraft — Rust Minecraft Server"
 server_icon = "server-icon.png"
 max_players = 20
-max_view_distance = 2
-game_mode = "spectator"
+max_view_distance = 10
+game_mode = "survival"
 offline_mode = false
 max_connections = 1024
 compression_threshold = 256
 io_timeout_seconds = 10
+world_dir = "world"
+world_type = "overworld"
 ```
 
 | 配置项 | 说明 |
@@ -120,12 +125,17 @@ io_timeout_seconds = 10
 | `motd` | 服务器列表描述 |
 | `server_icon` | PNG 图标路径；空字符串表示禁用 |
 | `max_players` | 已认证连接的容量（含正在配置的玩家）；`0` 禁止登录，不影响状态查询 |
-| `max_view_distance` | 服务端视距上限（区块半径），默认 `2`，范围 `2..=16`。使用客户端请求与此上限中的较小值 |
-| `game_mode` | 全服模式，默认 `"spectator"`。设为 `"creative"` 并重启后可编辑方块 |
+| `max_view_distance` | 服务端视距上限（区块半径），默认 `10`，范围 `2..=16`。使用客户端请求与此上限中的较小值 |
+| `game_mode` | 默认游戏模式，默认 `"survival"`，可选 `"survival"` / `"creative"` / `"spectator"` |
 | `offline_mode` | 是否启用离线登录，默认 `false`，即要求正版会话认证 |
 | `max_connections` | 最大并发连接数，必须大于 0 且不超过 Tokio 信号量上限 |
 | `compression_threshold` | zlib 压缩阈值（包体字节数），默认 `256`；`-1` 禁用，`0` 压缩全部；最大 `2097151` |
 | `io_timeout_seconds` | 完整响应批次写入及部分帧读取的时限，整数秒，范围 1–86400 |
+| `world_dir` | Anvil 存档目录，默认 `"world"`；省略或置空则纯内存运行 |
+| `world_type` | 地形生成器类型，默认 `"overworld"`，可选 `"overworld"` 或 `"flat"`（已存在的 `level.dat` 优先） |
+| `seed` | 可选世界种子（64 位整数，新建主世界时生效） |
+| `ops` | 可选管理员用户名或 UUID 列表（授予权限等级 `4`） |
+| `[flat]` | 可选超平坦预设（`base_y`、`biome`、`layers`） |
 
 缺少字段使用默认值；未知字段、错误类型和无效值会阻止启动。
 已有配置及注释不会被重写。修改后需重启，暂不支持热加载。
@@ -260,10 +270,11 @@ URL 必须为 HTTP(S)，SHA-1 必须为 40 位十六进制字符串。支持接�
 | `/fill <from> <to> <block>` | 2 | 填充区域方块（单次上限 4,096 格） |
 | `/tp ...` | 2 | 传送自身或指定玩家到坐标或目标玩家 |
 | `/give <targets> <item> [count]` | 2 | 向目标玩家背包发放物品 |
-| `/gamemode <creative\|spectator> [targets]` | 2 | 动态切换玩家游戏模式 |
+| `/gamemode <survival\|creative\|spectator> [targets]` | 2 | 动态切换玩家游戏模式 |
 | `/op <玩家>` / `/deop <玩家>` | 3 | 运行时授予或撤销管理员权限并刷新命令树 |
 | `/kick <targets> [原因]` | 3 | 踢出指定玩家 |
-| `/stop` | 4 | 优雅停止服务端 |
+| `/save-all` | 4 | 将脏区块与 `level.dat` 立即刷新到磁盘 |
+| `/stop` | 4 | 优雅停止服务端并保存所有玩家与世界 |
 
 服务端终端标准输入支持直接执行控制台命令（权限等级 `4`，无需前导 `/`）；也可在 `zcraft.toml` 中配置 `ops = ["用户名"]` 为指定玩家授予管理员权限。
 
@@ -282,8 +293,8 @@ URL 必须为 HTTP(S)，SHA-1 必须为 40 位十六进制字符串。支持接�
 `ServerContext::execute_command` 接受可信的玩家、控制台或未来命令方块来源，
 返回成功状态、数值结果和反馈，不依赖 Session 或网络。`run_command` 进一步支持来源栈变换、
 静默输出、结果回调及有界执行帧；新任务共享成本/分叉/队列预算，不递归启动新命令链。
-玩家命令绑定当前会话，断线重连或重新配置使旧链失效。网络玩家权限固定为 0；
-在线补全支持异步建议、独立限频和超时取消。尚不支持 OP 管理、命令方块执行循环及 Minecraft 专用参数。
+玩家命令绑定当前会话，断线重连或重新配置使旧链失效。普通网络玩家权限为 0，配置在 `ops` 或经 `/op` 授予的管理员权限为 4；
+在线补全支持异步建议、独立限频和超时取消。尚不支持命令方块执行循环。
 服务端便利入口限制 4096 字节，玩家聊天包限制 256 个 UTF-16 码元。
 注册示例及调用契约见 [命令系统](docs/commands.md) 和 [执行运行时](docs/command-runtime.md)。
 
@@ -339,56 +350,63 @@ python3 tools/generate_icon.py
 
 ```text
 TCP → 完整帧 → 状态与包 ID 解析 → Dispatcher → 类型化处理器
-                                                   ↓
-TCP ← 帧编码 ← Clientbound ←─────────────────────── 回复
+                                                   │  GameInput (有界 FIFO 队列)
+                                                   ▼
+                                     专用 OS 线程 bevy_ecs GameEngine (20 TPS)
+                                                   │  GameOutput 事件
+                                                   ▼
+TCP ← 帧编码 ← Clientbound ← Players 空间索引/广播 ← sync 桥接层
 ```
 
 ```text
 src/
-├── main.rs               # 启动流程、日志与退出信号
-├── config.rs             # 配置加载、默认生成及校验
+├── main.rs               # 启动流程、控制台输入、日志与退出信号
+├── config.rs             # TOML 配置加载、默认生成及校验
 ├── eula.rs               # EULA 启动检查
-├── network.rs            # TCP 与连接生命周期
-├── transport.rs          # 可切换的明文 / AES-CFB8 传输
+├── network.rs            # TCP 接入、连接事件循环、自动存档观察者与停机编排
+├── transport.rs          # 可切换的明文 / AES-CFB8 / zlib 传输
 ├── identity.rs           # 跨模块共享的玩家身份与属性
-├── auth/
-│   ├── mod.rs            # AuthService 认证入口与服务编排
-│   ├── offline.rs        # 离线 UUID 与用户名校验
-│   ├── mojang.rs         # 会话验证接口、HTTP 查询与响应校验
-│   └── crypto.rs         # RSA、挑战值与 Minecraft 登录哈希
-├── context.rs            # 会话及共享服务上下文
-├── registry_data.rs      # 编译期生成的 Configuration 注册表数据入口
-├── world.rs              # 静态地形、区块、高度图及光照
+├── auth/                 # 离线 UUID、Mojang 会话认证、RSA 与登录哈希
+├── context.rs            # ServerContext 与共享服务装配
+├── registry_data.rs      # 编译期生成的 Configuration 注册表与标签入口
 ├── protocol/
 │   ├── codec.rs          # 基础类型编解码
 │   ├── frame.rs          # 帧长度与完整帧读写
-│   ├── registry.rs       # 声明式收发包注册表
+│   ├── registry.rs       # 纯协议 767 声明式收发包注册表（编译期 ID 查重）
 │   └── packets/          # 按协议阶段组织的数据包
-└── handler/              # 无状态分发器与各阶段状态机，包括 configuration/play
+├── handler/              # 无状态 Dispatcher 与各阶段协议适配器（含 configuration/play）
+├── engine/               # 独立于网络的 bevy_ecs 权威游戏引擎（组件、资源与 20 TPS 系统）
+│   └── systems/          # lifecycle、movement、drops、world_tick、interaction/{blocks,containers,items}
+├── game/                 # 数据驱动玩法领域（物品/方块定义、行为、配方、战利品表、容器、放置）
+├── world/                # 区块 LRU 缓存（单飞去重）、光照、物理、时钟天气、地形生成器与 Anvil 持久化
+│   └── anvil/            # level.dat、region/*.mca、chunk NBT 编解码与 playerdata/*.dat
+├── players/              # 玩家名额、ChunkIndex 空间索引、有界广播与聊天投递
+└── command/              # Brigadier 命令树、参数解析、有界执行运行时与内置命令
 ```
 
 构建脚本 `build.rs` 和 `build_support/` 负责官方 JAR 获取、校验、选择性提取及 JSON → NBT → Rust 代码生成，生成物保存在构建缓存与 Cargo `OUT_DIR`。
 
 `Dispatcher` 只负责路由和协议状态校验，不构建具体业务响应。
-状态模板及图标由 `src/handler/status.rs` 管理，`src/players.rs` 管理玩家名额、在线状态和广播队列。
-处理器通过上下文访问服务，不直接操作 socket。
-`identity` 只定义共享身份模型；认证由 `auth` 内部模块协作完成，登录状态机留在
-`handler/login.rs`。RSA 登录密钥交换与 `transport.rs` 的 AES 流加密分离。
+Play 阶段的权威仿真逻辑由专用 OS 线程 `zcraft-game-loop` 独占 `GameEngine` 执行，通过有界 FIFO 队列接收 `GameInput` 并产出协议无关的 `GameOutput`；磁盘存档与区块生成/光照计算均卸载至 Tokio 阻塞池，并结合按区块坐标的单飞（singleflight）去重，确保异步网络工作线程不被阻塞。
 
 ### 扩展数据包
 
 1. 在 `src/protocol/packets/` 定义包结构，入站实现 `Decode`，出站实现 `Encode`。
-2. 在 `src/handler/` 编写异步类型化处理器：`async fn handle_x(ctx: &mut Context<'_>, packet: X) -> io::Result<Outcome>`。
-3. 在 `src/protocol/registry.rs` 对应阶段注册类型与处理器。
+2. 在 `src/protocol/registry.rs` 对应阶段注册包 ID 与强类型变体。
+3. 在 `src/handler/` 编写异步类型化处理器，并在 `src/handler/mod.rs` 的 `Dispatcher::dispatch` 中添加路由分支。
 
 以下为已有 Ping/Pong 的注册方式：
 
 ```rust
+// src/protocol/registry.rs
 // serverbound_packets! 的 Status 块
-0x01 => Ping(Ping) => crate::handler::status::handle_ping,
+0x01 => Ping(Ping),
 
 // clientbound_packets! 的 Status 块
 0x01 => Pong(Pong),
+
+// src/handler/mod.rs (Dispatcher::dispatch)
+Serverbound::Ping(p) => status::handle_ping(ctx, p).await?,
 ```
 
 处理器返回的 `Outcome.replies` 支持有序多包回复；关闭连接和启用加密仍通过 Outcome 通知网络层执行。
