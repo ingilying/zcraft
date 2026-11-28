@@ -18,32 +18,29 @@ use crate::game::{
 };
 use bevy_ecs::{
     prelude::{Commands, Entity, MessageReader, MessageWriter, Query, Res, ResMut, With},
+    query::QueryData,
     system::SystemParam,
 };
 use uuid::Uuid;
 
-#[allow(clippy::type_complexity)]
-pub(super) type InteractionPlayerQuery<'w, 's> = Query<
-    'w,
-    's,
-    (
-        &'static NetworkEntityId,
-        &'static EntityUuid,
-        &'static mut PlayerProfile,
-        &'static mut Position,
-        &'static mut Rotation,
-        &'static mut MovementState,
-        &'static mut Health,
-        &'static mut Hunger,
-        Option<&'static Dead>,
-        Option<&'static EatingState>,
-        Option<&'static MiningState>,
-        &'static mut PlayerInventory,
-        &'static mut PlayerContainer,
-        &'static PlayerViewState,
-    ),
-    With<PlayerMarker>,
->;
+#[derive(QueryData)]
+#[query_data(mutable)]
+pub(crate) struct InteractingPlayer {
+    pub(super) net_id: &'static NetworkEntityId,
+    pub(super) uuid: &'static EntityUuid,
+    pub(super) profile: &'static mut PlayerProfile,
+    pub(super) pos: &'static mut Position,
+    pub(super) rot: &'static mut Rotation,
+    pub(super) movement: &'static mut MovementState,
+    pub(super) health: &'static mut Health,
+    pub(super) hunger: &'static mut Hunger,
+    pub(super) dead: Option<&'static Dead>,
+    pub(super) eating: Option<&'static EatingState>,
+    pub(super) mining: Option<&'static MiningState>,
+    pub(super) inv: &'static mut PlayerInventory,
+    pub(super) container: &'static mut PlayerContainer,
+    pub(super) view: &'static PlayerViewState,
+}
 
 /// Bundled declarative ECS parameters shared across all player interaction handlers.
 #[derive(SystemParam)]
@@ -52,7 +49,7 @@ pub(crate) struct InteractionCtx<'w, 's> {
     pub(super) world: Res<'w, VoxelWorld>,
     pub(super) registry: Res<'w, EntityRegistry>,
     pub(super) viewers: ResMut<'w, ChestViewers>,
-    pub(super) players: InteractionPlayerQuery<'w, 's>,
+    pub(super) players: Query<'w, 's, InteractingPlayer, With<PlayerMarker>>,
     pub(super) commands: Commands<'w, 's>,
     pub(super) drops: MessageWriter<'w, SpawnDropMsg>,
     pub(super) out: ResMut<'w, OutputQueue>,
@@ -64,38 +61,37 @@ impl InteractionCtx<'_, '_> {
     }
 
     pub(super) fn emit_equipment(&mut self, uuid: Uuid, entity: Entity) {
-        let Ok((net_id, _, _, _, _, _, _, _, _, _, _, inv, _, _)) = self.players.get(entity) else {
+        let Ok(p) = self.players.get(entity) else {
             return;
         };
         self.out.push(GameOutput::PlayerEquipmentChanged {
             uuid,
-            entity_id: net_id.0,
-            main_hand: inv.0.hand(Hand::Main),
-            off_hand: inv.0.hand(Hand::Off),
+            entity_id: p.net_id.0,
+            main_hand: p.inv.0.hand(Hand::Main),
+            off_hand: p.inv.0.hand(Hand::Off),
         });
     }
 
     pub(super) fn emit_inventory_if_can_interact(&mut self, uuid: Uuid, entity: Entity) {
-        let Ok((_, _, profile, _, _, _, _, _, _, _, _, inv, _, _)) = self.players.get(entity)
-        else {
+        let Ok(p) = self.players.get(entity) else {
             return;
         };
-        if !profile.can_interact() {
+        if !p.profile.can_interact() {
             return;
         }
         self.out.push(GameOutput::PlayerInventorySynced {
             uuid,
-            inventory: inv.0.clone(),
+            inventory: p.inv.0.clone(),
         });
     }
 
     pub(super) fn throw_from_player(&mut self, entity: Entity, stack: ItemStack) {
-        let Ok((_, _, _, &pos, &rot, ..)) = self.players.get(entity) else {
+        let Ok(p) = self.players.get(entity) else {
             return;
         };
-        let eye = player_eye_position(pos);
-        let yaw_rad = f64::from(rot.yaw).to_radians();
-        let pitch_rad = f64::from(rot.pitch).to_radians();
+        let eye = player_eye_position(*p.pos);
+        let yaw_rad = f64::from(p.rot.yaw).to_radians();
+        let pitch_rad = f64::from(p.rot.pitch).to_radians();
         let vx = -yaw_rad.sin() * pitch_rad.cos() * 0.3;
         let vy = -pitch_rad.sin() * 0.3 + 0.1;
         let vz = yaw_rad.cos() * pitch_rad.cos() * 0.3;
@@ -104,10 +100,9 @@ impl InteractionCtx<'_, '_> {
     }
 
     pub(super) fn allocate_window_id(&mut self, entity: Entity) -> u8 {
-        let (_, _, _, _, _, _, _, _, _, _, _, _, mut container, _) =
-            self.players.get_mut(entity).expect("player entity");
-        let id = container.next_window_id;
-        container.next_window_id = if id >= 100 { 1 } else { id + 1 };
+        let mut p = self.players.get_mut(entity).expect("player entity");
+        let id = p.container.next_window_id;
+        p.container.next_window_id = if id >= 100 { 1 } else { id + 1 };
         id
     }
 
@@ -120,78 +115,64 @@ impl InteractionCtx<'_, '_> {
     ) -> Option<R> {
         let world = self.world.0.clone();
         let tick = self.clock.tick;
-        let Ok((
-            net_id,
-            entity_uuid,
-            mut profile,
-            mut pos,
-            mut rot,
-            mut movement,
-            mut health,
-            mut hunger,
-            dead,
-            eating,
-            _,
-            mut inv,
-            _,
-            _,
-        )) = self.players.get_mut(entity)
-        else {
+        let Ok(mut p) = self.players.get_mut(entity) else {
             return None;
         };
 
         let mut player = Player {
-            entity_id: net_id.0,
-            uuid: entity_uuid.0,
-            name: profile.name.clone(),
-            game_mode: profile.game_mode,
-            position: pos.0,
-            yaw: rot.yaw,
-            pitch: rot.pitch,
-            on_ground: movement.on_ground,
-            sneaking: movement.sneaking,
-            sprinting: movement.sprinting,
-            health: health.current,
-            food: hunger.food,
-            saturation: hunger.saturation,
-            exhaustion: hunger.exhaustion,
-            food_tick_timer: hunger.tick_timer,
-            eating: eating.map(|e| (e.hand, e.item, e.start_tick, e.required_ticks)),
-            fall_distance: movement.fall_distance,
-            dead: dead.is_some(),
-            last_hurt_tick: health.last_hurt_tick,
-            respawn_point: profile.respawn_point,
+            entity_id: p.net_id.0,
+            uuid: p.uuid.0,
+            name: p.profile.name.clone(),
+            game_mode: p.profile.game_mode,
+            position: p.pos.0,
+            yaw: p.rot.yaw,
+            pitch: p.rot.pitch,
+            on_ground: p.movement.on_ground,
+            sneaking: p.movement.sneaking,
+            sprinting: p.movement.sprinting,
+            health: p.health.current,
+            food: p.hunger.food,
+            saturation: p.hunger.saturation,
+            exhaustion: p.hunger.exhaustion,
+            food_tick_timer: p.hunger.tick_timer,
+            eating: p
+                .eating
+                .map(|e| (e.hand, e.item, e.start_tick, e.required_ticks)),
+            fall_distance: p.movement.fall_distance,
+            dead: p.dead.is_some(),
+            last_hurt_tick: p.health.last_hurt_tick,
+            respawn_point: p.profile.respawn_point,
         };
 
         let result = {
             let mut use_ctx = UseContext {
                 world: &world,
                 player: &mut player,
-                inventory: &mut inv.0,
+                inventory: &mut p.inv.0,
                 tick,
             };
             f(&mut use_ctx)
         };
 
-        pos.0 = player.position;
-        rot.yaw = player.yaw;
-        rot.pitch = player.pitch;
-        movement.on_ground = player.on_ground;
-        movement.sneaking = player.sneaking;
-        movement.sprinting = player.sprinting;
-        movement.fall_distance = player.fall_distance;
-        profile.game_mode = player.game_mode;
-        profile.respawn_point = player.respawn_point;
-        health.current = player.health;
-        health.last_hurt_tick = player.last_hurt_tick;
-        hunger.food = player.food;
-        hunger.saturation = player.saturation;
-        hunger.exhaustion = player.exhaustion;
-        hunger.tick_timer = player.food_tick_timer;
+        p.pos.0 = player.position;
+        p.rot.yaw = player.yaw;
+        p.rot.pitch = player.pitch;
+        p.movement.on_ground = player.on_ground;
+        p.movement.sneaking = player.sneaking;
+        p.movement.sprinting = player.sprinting;
+        p.movement.fall_distance = player.fall_distance;
+        p.profile.game_mode = player.game_mode;
+        p.profile.respawn_point = player.respawn_point;
+        p.health.current = player.health;
+        p.health.last_hurt_tick = player.last_hurt_tick;
+        p.hunger.food = player.food;
+        p.hunger.saturation = player.saturation;
+        p.hunger.exhaustion = player.exhaustion;
+        p.hunger.tick_timer = player.food_tick_timer;
 
         if player.dead {
             self.commands.entity(entity).insert(Dead);
-        } else if dead.is_some() {
+        } else if p.dead.is_some() {
             self.commands.entity(entity).remove::<Dead>();
         }
         if let Some((hand, item, start_tick, required_ticks)) = player.eating {
@@ -201,7 +182,7 @@ impl InteractionCtx<'_, '_> {
                 start_tick,
                 required_ticks,
             });
-        } else if eating.is_some() {
+        } else if p.eating.is_some() {
             self.commands.entity(entity).remove::<EatingState>();
         }
 

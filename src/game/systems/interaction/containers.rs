@@ -22,33 +22,31 @@ pub(super) fn refresh_container_viewers(ctx: &mut InteractionCtx, pos: BlockPos,
         let Some(entity) = ctx.player_entity(viewer_uuid) else {
             continue;
         };
-        let Ok((_, _, _, _, _, _, _, _, _, _, _, inv, mut container, _)) =
-            ctx.players.get_mut(entity)
-        else {
+        let Ok(mut p) = ctx.players.get_mut(entity) else {
             continue;
         };
-        let Some(open) = container.open.clone() else {
+        let Some(open) = p.container.open.clone() else {
             continue;
         };
         match open.kind {
             ContainerKind::Chest(cpos) if cpos == pos => {
                 if let Some(items) = &chest_items {
                     let next_state_id = open.state_id.wrapping_add(1);
-                    container.open = Some(OpenContainer {
+                    p.container.open = Some(OpenContainer {
                         state_id: next_state_id,
                         ..open
                     });
-                    let slots = crate::game::containers::container_slots(items, &inv.0);
+                    let slots = crate::game::containers::container_slots(items, &p.inv.0);
                     ctx.out.push(GameOutput::ContainerSynced {
                         uuid: viewer_uuid,
                         window_id: open.window_id,
                         state_id: next_state_id,
                         slots,
-                        carried: inv.0.carried(),
+                        carried: p.inv.0.carried(),
                         furnace_props: None,
                     });
                 } else {
-                    container.open = None;
+                    p.container.open = None;
                     ctx.out.push(GameOutput::ContainerClosed {
                         uuid: viewer_uuid,
                         window_id: open.window_id,
@@ -58,11 +56,11 @@ pub(super) fn refresh_container_viewers(ctx: &mut InteractionCtx, pos: BlockPos,
             ContainerKind::Furnace(fpos) if fpos == pos => {
                 if let Some(furnace) = &furnace_data {
                     let next_state_id = open.state_id.wrapping_add(1);
-                    container.open = Some(OpenContainer {
+                    p.container.open = Some(OpenContainer {
                         state_id: next_state_id,
                         ..open
                     });
-                    let slots = crate::game::containers::furnace_slots(furnace, &inv.0);
+                    let slots = crate::game::containers::furnace_slots(furnace, &p.inv.0);
                     let props = [
                         furnace.burn_time as i16,
                         furnace.burn_total as i16,
@@ -74,11 +72,11 @@ pub(super) fn refresh_container_viewers(ctx: &mut InteractionCtx, pos: BlockPos,
                         window_id: open.window_id,
                         state_id: next_state_id,
                         slots,
-                        carried: inv.0.carried(),
+                        carried: p.inv.0.carried(),
                         furnace_props: Some(props),
                     });
                 } else {
-                    container.open = None;
+                    p.container.open = None;
                     ctx.out.push(GameOutput::ContainerClosed {
                         uuid: viewer_uuid,
                         window_id: open.window_id,
@@ -95,26 +93,24 @@ pub(super) fn handle_close_window(ctx: &mut InteractionCtx, uuid: Uuid, window_i
         return;
     };
     let (pos, closed, mut returned) = {
-        let Ok((_, _, _, pos, _, _, _, _, _, _, _, mut inv, mut container, _)) =
-            ctx.players.get_mut(entity)
-        else {
+        let Ok(mut p) = ctx.players.get_mut(entity) else {
             return;
         };
-        let closed = if let Some(open) = &container.open
+        let closed = if let Some(open) = &p.container.open
             && (window_id == 0 || open.window_id == window_id)
         {
-            container.open.take()
+            p.container.open.take()
         } else {
             None
         };
         let mut returned = Vec::new();
         if window_id == 0 {
-            returned.extend(inv.0.drain_crafting_grid());
+            returned.extend(p.inv.0.drain_crafting_grid());
         }
-        if let Some(carried) = inv.0.take_carried() {
+        if let Some(carried) = p.inv.0.take_carried() {
             returned.push(carried);
         }
-        (pos.0, closed, returned)
+        (p.pos.0, closed, returned)
     };
 
     if let Some(open) = closed {
@@ -137,9 +133,9 @@ pub(super) fn handle_close_window(ctx: &mut InteractionCtx, uuid: Uuid, window_i
 
     if !returned.is_empty() {
         let mut overflow = Vec::new();
-        if let Ok((_, _, _, _, _, _, _, _, _, _, _, mut inv, _, _)) = ctx.players.get_mut(entity) {
+        if let Ok(mut p) = ctx.players.get_mut(entity) {
             for mut stack in returned {
-                let added = inv.0.give_stack(stack);
+                let added = p.inv.0.give_stack(stack);
                 if added < stack.count {
                     stack.count -= added;
                     overflow.push(stack);
@@ -169,11 +165,10 @@ pub(super) fn handle_inventory_click(
         return;
     };
     let (can_interact, open) = {
-        let Ok((_, _, profile, _, _, _, _, _, _, _, _, _, container, _)) = ctx.players.get(entity)
-        else {
+        let Ok(p) = ctx.players.get(entity) else {
             return;
         };
-        (profile.can_interact(), container.open.clone())
+        (p.profile.can_interact(), p.container.open.clone())
     };
     if !can_interact {
         return;
@@ -192,32 +187,30 @@ pub(super) fn handle_inventory_click(
             ContainerKind::Chest(cpos) => {
                 let mut dropped: Option<ItemStack> = None;
                 let (updated, slots, carried) = {
-                    let Ok((_, _, _, _, _, _, _, _, _, _, _, mut inv, mut container, _)) =
-                        ctx.players.get_mut(entity)
-                    else {
+                    let Ok(mut p) = ctx.players.get_mut(entity) else {
                         return;
                     };
                     let updated = world.update_chest(cpos, |chest| {
                         let (changed, drop) =
-                            crate::game::containers::apply_chest_click(chest, &mut inv.0, click);
+                            crate::game::containers::apply_chest_click(chest, &mut p.inv.0, click);
                         dropped = drop;
                         changed
                     });
                     let Some(chest_items) = updated else {
-                        container.open = None;
+                        p.container.open = None;
                         ctx.out.push(GameOutput::ContainerClosed {
                             uuid,
                             window_id: open.window_id,
                         });
                         return;
                     };
-                    container.open = Some(OpenContainer {
+                    p.container.open = Some(OpenContainer {
                         window_id: open.window_id,
                         kind: ContainerKind::Chest(cpos),
                         state_id: next_state_id,
                     });
-                    let slots = crate::game::containers::container_slots(&chest_items, &inv.0);
-                    (true, slots, inv.0.carried())
+                    let slots = crate::game::containers::container_slots(&chest_items, &p.inv.0);
+                    (true, slots, p.inv.0.carried())
                 };
                 if !updated {
                     return;
@@ -242,25 +235,23 @@ pub(super) fn handle_inventory_click(
                 mut output,
             } => {
                 let (dropped, slots, carried) = {
-                    let Ok((_, _, _, _, _, _, _, _, _, _, _, mut inv, mut container, _)) =
-                        ctx.players.get_mut(entity)
-                    else {
+                    let Ok(mut p) = ctx.players.get_mut(entity) else {
                         return;
                     };
                     let dropped = crate::game::containers::apply_crafting_table_click(
                         &mut grid,
                         &mut output,
-                        &mut inv.0,
+                        &mut p.inv.0,
                         click,
                     );
-                    container.open = Some(OpenContainer {
+                    p.container.open = Some(OpenContainer {
                         window_id: open.window_id,
                         kind: ContainerKind::CraftingTable { grid, output },
                         state_id: next_state_id,
                     });
                     let slots =
-                        crate::game::containers::crafting_table_slots(output, &grid, &inv.0);
-                    (dropped, slots, inv.0.carried())
+                        crate::game::containers::crafting_table_slots(output, &grid, &p.inv.0);
+                    (dropped, slots, p.inv.0.carried())
                 };
                 if let Some(stack) = dropped {
                     ctx.throw_from_player(entity, stack);
@@ -279,39 +270,39 @@ pub(super) fn handle_inventory_click(
             ContainerKind::Furnace(fpos) => {
                 let mut dropped: Option<ItemStack> = None;
                 let (slots, carried, props) = {
-                    let Ok((_, _, _, _, _, _, _, _, _, _, _, mut inv, mut container, _)) =
-                        ctx.players.get_mut(entity)
-                    else {
+                    let Ok(mut p) = ctx.players.get_mut(entity) else {
                         return;
                     };
                     let updated = world.update_furnace(fpos, |furnace| {
                         let (changed, drop) = crate::game::containers::apply_furnace_click(
-                            furnace, &mut inv.0, click,
+                            furnace,
+                            &mut p.inv.0,
+                            click,
                         );
                         dropped = drop;
                         changed
                     });
                     let Some(furnace) = updated else {
-                        container.open = None;
+                        p.container.open = None;
                         ctx.out.push(GameOutput::ContainerClosed {
                             uuid,
                             window_id: open.window_id,
                         });
                         return;
                     };
-                    container.open = Some(OpenContainer {
+                    p.container.open = Some(OpenContainer {
                         window_id: open.window_id,
                         kind: ContainerKind::Furnace(fpos),
                         state_id: next_state_id,
                     });
-                    let slots = crate::game::containers::furnace_slots(&furnace, &inv.0);
+                    let slots = crate::game::containers::furnace_slots(&furnace, &p.inv.0);
                     let props = [
                         furnace.burn_time as i16,
                         furnace.burn_total as i16,
                         furnace.cook_time as i16,
                         furnace.cook_total as i16,
                     ];
-                    (slots, inv.0.carried(), props)
+                    (slots, p.inv.0.carried(), props)
                 };
                 if let Some(stack) = dropped {
                     ctx.throw_from_player(entity, stack);
@@ -333,12 +324,12 @@ pub(super) fn handle_inventory_click(
 
     let mut dropped = None;
     let mut changed = false;
-    if let Ok((_, _, _, _, _, _, _, _, _, _, _, mut inv, _, _)) = ctx.players.get_mut(entity)
+    if let Ok(mut p) = ctx.players.get_mut(entity)
         && window == 0
-        && state_id == inv.0.state_id()
+        && state_id == p.inv.0.state_id()
     {
-        let preview = crate::game::containers::preview_player_drop(&inv.0, click);
-        if inv.0.click(click) == crate::game::ClickResult::Changed {
+        let preview = crate::game::containers::preview_player_drop(&p.inv.0, click);
+        if p.inv.0.click(click) == crate::game::ClickResult::Changed {
             dropped = preview;
             changed = true;
         }

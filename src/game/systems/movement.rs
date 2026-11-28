@@ -14,31 +14,35 @@ use crate::{
     },
     world::{self, BlockPos},
 };
-use bevy_ecs::prelude::{Commands, MessageReader, MessageWriter, Query, Res, ResMut, With};
+use bevy_ecs::{
+    prelude::{Commands, MessageReader, MessageWriter, Query, Res, ResMut, With},
+    query::QueryData,
+};
+
+#[derive(QueryData)]
+#[query_data(mutable)]
+pub(crate) struct MovingPlayer {
+    net_id: &'static NetworkEntityId,
+    profile: &'static mut PlayerProfile,
+    pos: &'static mut Position,
+    rot: &'static mut Rotation,
+    movement: &'static mut MovementState,
+    health: &'static mut Health,
+    hunger: &'static mut Hunger,
+    dead: Option<&'static Dead>,
+    inv: &'static mut PlayerInventory,
+    container: &'static mut PlayerContainer,
+    view: &'static mut PlayerViewState,
+}
 
 /// Process player movement, posture flags, arm animation, and respawn requests.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn player_movement_system(
     mut messages: MessageReader<MovementMsg>,
     clock: Res<TickClock>,
     world: Res<VoxelWorld>,
     registry: Res<EntityRegistry>,
-    mut players: Query<
-        (
-            &NetworkEntityId,
-            &mut PlayerProfile,
-            &mut Position,
-            &mut Rotation,
-            &mut MovementState,
-            &mut Health,
-            &mut Hunger,
-            Option<&Dead>,
-            &mut PlayerInventory,
-            &mut PlayerContainer,
-            &mut PlayerViewState,
-        ),
-        With<PlayerMarker>,
-    >,
+    mut players: Query<MovingPlayer, With<PlayerMarker>>,
     mut commands: Commands,
     mut drops: MessageWriter<SpawnDropMsg>,
     mut out: ResMut<OutputQueue>,
@@ -55,23 +59,10 @@ pub(crate) fn player_movement_system(
                 let Some(&entity) = registry.players.get(&uuid) else {
                     continue;
                 };
-                let Ok((
-                    net_id,
-                    profile,
-                    mut pos,
-                    mut rot,
-                    mut movement,
-                    mut health,
-                    mut hunger,
-                    dead,
-                    mut inv,
-                    _,
-                    mut view,
-                )) = players.get_mut(entity)
-                else {
+                let Ok(mut p) = players.get_mut(entity) else {
                     continue;
                 };
-                if view.pending_teleport {
+                if p.view.pending_teleport {
                     continue;
                 }
 
@@ -79,11 +70,11 @@ pub(crate) fn player_movement_system(
                     && !Player::position_in_bounds(target_pos)
                 {
                     let spawn = world.0.spawn_position();
-                    pos.0 = spawn;
-                    *rot = Rotation::default();
-                    movement.on_ground = false;
-                    movement.fall_distance = 0.0;
-                    view.pending_teleport = true;
+                    p.pos.0 = spawn;
+                    *p.rot = Rotation::default();
+                    p.movement.on_ground = false;
+                    p.movement.fall_distance = 0.0;
+                    p.view.pending_teleport = true;
                     out.push(GameOutput::PlayerTeleported {
                         uuid,
                         position: spawn,
@@ -93,41 +84,41 @@ pub(crate) fn player_movement_system(
                     continue;
                 }
 
-                let old_pos = pos.0;
-                let was_on_ground = movement.on_ground;
-                if let Some(p) = position {
-                    pos.0 = p;
+                let old_pos = p.pos.0;
+                let was_on_ground = p.movement.on_ground;
+                if let Some(pos) = position {
+                    p.pos.0 = pos;
                 }
                 if let Some([yaw, pitch]) = rotation {
-                    rot.yaw = yaw;
-                    rot.pitch = pitch;
+                    p.rot.yaw = yaw;
+                    p.rot.pitch = pitch;
                 }
-                movement.on_ground = on_ground;
+                p.movement.on_ground = on_ground;
 
-                let is_survival = profile.is_survival();
-                let is_dead = dead.is_some() || health.current <= 0.0;
+                let is_survival = p.profile.is_survival();
+                let is_dead = p.dead.is_some() || p.health.current <= 0.0;
                 let mut death_reason: Option<&'static str> = None;
 
                 if is_survival && !is_dead {
                     let [old_x, old_y, old_z] = old_pos;
-                    let [px, py, pz] = pos.0;
+                    let [px, py, pz] = p.pos.0;
                     let horiz = ((px - old_x).powi(2) + (pz - old_z).powi(2)).sqrt();
-                    if movement.sprinting && horiz > 0.0 && horiz < 10.0 {
-                        add_exhaustion(&mut hunger, true, false, 0.1 * horiz as f32);
+                    if p.movement.sprinting && horiz > 0.0 && horiz < 10.0 {
+                        add_exhaustion(&mut p.hunger, true, false, 0.1 * horiz as f32);
                     }
                     if was_on_ground && !on_ground && py > old_y {
                         add_exhaustion(
-                            &mut hunger,
+                            &mut p.hunger,
                             true,
                             false,
-                            if movement.sprinting { 0.2 } else { 0.05 },
+                            if p.movement.sprinting { 0.2 } else { 0.05 },
                         );
                     }
 
                     if py < f64::from(world::MIN_Y) - 64.0 {
                         let (damaged, died) = apply_damage_at_tick(
-                            &mut health,
-                            &mut movement,
+                            &mut p.health,
+                            &mut p.movement,
                             true,
                             false,
                             4.0,
@@ -136,13 +127,13 @@ pub(crate) fn player_movement_system(
                         if damaged {
                             out.push(GameOutput::PlayerHurt {
                                 uuid,
-                                entity_id: net_id.0,
+                                entity_id: p.net_id.0,
                             });
                             out.push(GameOutput::PlayerVitalsUpdated {
                                 uuid,
-                                health: health.current,
-                                food: hunger.food,
-                                saturation: hunger.saturation,
+                                health: p.health.current,
+                                food: p.hunger.food,
+                                saturation: p.hunger.saturation,
                             });
                             if died {
                                 death_reason = Some("fell out of the world");
@@ -157,14 +148,14 @@ pub(crate) fn player_movement_system(
                             .and_then(crate::game::block_by_state)
                             .is_some_and(|d| d.liquid);
                         if in_liquid {
-                            movement.fall_distance = 0.0;
+                            p.movement.fall_distance = 0.0;
                         } else if on_ground {
-                            let fell = std::mem::take(&mut movement.fall_distance);
+                            let fell = std::mem::take(&mut p.movement.fall_distance);
                             if fell > 3.0 {
                                 let damage = (fell - 3.0).ceil() as f32;
                                 let (damaged, died) = apply_damage_at_tick(
-                                    &mut health,
-                                    &mut movement,
+                                    &mut p.health,
+                                    &mut p.movement,
                                     true,
                                     false,
                                     damage,
@@ -173,13 +164,13 @@ pub(crate) fn player_movement_system(
                                 if damaged {
                                     out.push(GameOutput::PlayerHurt {
                                         uuid,
-                                        entity_id: net_id.0,
+                                        entity_id: p.net_id.0,
                                     });
                                     out.push(GameOutput::PlayerVitalsUpdated {
                                         uuid,
-                                        health: health.current,
-                                        food: hunger.food,
-                                        saturation: hunger.saturation,
+                                        health: p.health.current,
+                                        food: p.hunger.food,
+                                        saturation: p.hunger.saturation,
                                     });
                                     if died {
                                         death_reason = Some("fell from a high place");
@@ -187,21 +178,21 @@ pub(crate) fn player_movement_system(
                                 }
                             }
                         } else if py < old_y {
-                            movement.fall_distance += old_y - py;
+                            p.movement.fall_distance += old_y - py;
                         }
                     }
                 }
 
-                let pose = entity_pose(*pos, *rot, *movement);
+                let pose = entity_pose(*p.pos, *p.rot, *p.movement);
                 out.push(GameOutput::PlayerPoseUpdated { uuid, pose });
 
                 if let Some(reason) = death_reason {
                     commands.entity(entity).insert(Dead);
-                    let dropped = inv.0.drain_all();
-                    let snapshot = inv.0.clone();
-                    let main_hand = inv.0.hand(Hand::Main);
-                    let off_hand = inv.0.hand(Hand::Off);
-                    let drop_pos = [pos.0[0], pos.0[1] + 0.5, pos.0[2]];
+                    let dropped = p.inv.0.drain_all();
+                    let snapshot = p.inv.0.clone();
+                    let main_hand = p.inv.0.hand(Hand::Main);
+                    let off_hand = p.inv.0.hand(Hand::Off);
+                    let drop_pos = [p.pos.0[0], p.pos.0[1] + 0.5, p.pos.0[2]];
                     for stack in dropped {
                         drops.write(SpawnDropMsg::scatter(drop_pos, stack, 40));
                     }
@@ -211,13 +202,13 @@ pub(crate) fn player_movement_system(
                     });
                     out.push(GameOutput::PlayerEquipmentChanged {
                         uuid,
-                        entity_id: net_id.0,
+                        entity_id: p.net_id.0,
                         main_hand,
                         off_hand,
                     });
                     out.push(GameOutput::BroadcastSystemChat(format!(
                         "{} {reason}",
-                        profile.name
+                        p.profile.name
                     )));
                 }
             }
@@ -225,25 +216,25 @@ pub(crate) fn player_movement_system(
                 let Some(&entity) = registry.players.get(&uuid) else {
                     continue;
                 };
-                let Ok((net_id, _, _, _, mut movement, ..)) = players.get_mut(entity) else {
+                let Ok(mut p) = players.get_mut(entity) else {
                     continue;
                 };
                 let mut changed = false;
                 match action {
-                    0 if !movement.sneaking => {
-                        movement.sneaking = true;
+                    0 if !p.movement.sneaking => {
+                        p.movement.sneaking = true;
                         changed = true;
                     }
-                    1 if movement.sneaking => {
-                        movement.sneaking = false;
+                    1 if p.movement.sneaking => {
+                        p.movement.sneaking = false;
                         changed = true;
                     }
-                    3 if !movement.sprinting => {
-                        movement.sprinting = true;
+                    3 if !p.movement.sprinting => {
+                        p.movement.sprinting = true;
                         changed = true;
                     }
-                    4 if movement.sprinting => {
-                        movement.sprinting = false;
+                    4 if p.movement.sprinting => {
+                        p.movement.sprinting = false;
                         changed = true;
                     }
                     _ => {}
@@ -251,9 +242,9 @@ pub(crate) fn player_movement_system(
                 if changed {
                     out.push(GameOutput::PlayerMetadataChanged {
                         uuid,
-                        entity_id: net_id.0,
-                        sneaking: movement.sneaking,
-                        sprinting: movement.sprinting,
+                        entity_id: p.net_id.0,
+                        sneaking: p.movement.sneaking,
+                        sprinting: p.movement.sprinting,
                     });
                 }
             }
@@ -261,10 +252,10 @@ pub(crate) fn player_movement_system(
                 let Some(&entity) = registry.players.get(&uuid) else {
                     continue;
                 };
-                if let Ok((net_id, ..)) = players.get(entity) {
+                if let Ok(p) = players.get(entity) {
                     out.push(GameOutput::PlayerArmSwing {
                         uuid,
-                        entity_id: net_id.0,
+                        entity_id: p.net_id.0,
                         hand,
                     });
                 }
@@ -273,29 +264,16 @@ pub(crate) fn player_movement_system(
                 let Some(&entity) = registry.players.get(&uuid) else {
                     continue;
                 };
-                let Ok((
-                    _,
-                    mut profile,
-                    mut pos,
-                    mut rot,
-                    mut movement,
-                    mut health,
-                    mut hunger,
-                    dead,
-                    inv,
-                    mut container,
-                    mut view,
-                )) = players.get_mut(entity)
-                else {
+                let Ok(mut p) = players.get_mut(entity) else {
                     continue;
                 };
-                if dead.is_none() {
+                if p.dead.is_none() {
                     continue;
                 }
 
                 let world_spawn = world.0.spawn_position();
                 let mut missing_bed = false;
-                let spawn = if let Some(bed_pos) = profile.respawn_point {
+                let spawn = if let Some(bed_pos) = p.profile.respawn_point {
                     let is_bed = bed_pos.valid()
                         && crate::game::registry()
                             .state_by_id(world.0.block_at(bed_pos))
@@ -315,31 +293,31 @@ pub(crate) fn player_movement_system(
                 };
 
                 if missing_bed {
-                    profile.respawn_point = None;
+                    p.profile.respawn_point = None;
                 }
-                pos.0 = spawn;
-                *rot = Rotation::default();
-                *movement = MovementState::default();
-                *health = Health::default();
-                *hunger = Hunger::default();
-                container.open = None;
-                view.tracked_chunks.clear();
-                view.pending_teleport = true;
+                p.pos.0 = spawn;
+                *p.rot = Rotation::default();
+                *p.movement = MovementState::default();
+                *p.health = Health::default();
+                *p.hunger = Hunger::default();
+                p.container.open = None;
+                p.view.tracked_chunks.clear();
+                p.view.pending_teleport = true;
                 commands
                     .entity(entity)
                     .remove::<(Dead, EatingState, MiningState)>();
 
-                let pose = entity_pose(*pos, *rot, *movement);
+                let pose = entity_pose(*p.pos, *p.rot, *p.movement);
                 out.push(GameOutput::PlayerPoseUpdated { uuid, pose });
                 out.push(GameOutput::PlayerRespawned {
                     uuid,
                     spawn,
-                    game_mode: profile.game_mode,
-                    health: health.current,
-                    food: hunger.food,
-                    saturation: hunger.saturation,
+                    game_mode: p.profile.game_mode,
+                    health: p.health.current,
+                    food: p.hunger.food,
+                    saturation: p.hunger.saturation,
                     missing_bed,
-                    inventory: inv.0.clone(),
+                    inventory: p.inv.0.clone(),
                 });
             }
         }

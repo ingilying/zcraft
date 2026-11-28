@@ -53,26 +53,24 @@ fn interact_block(
         main_hand_stack,
         place_hand_stack,
     ) = {
-        let Ok((net_id, _, profile, &pos, &rot, &movement, _, _, dead, _, mining, inv, _, view)) =
-            ctx.players.get(entity)
-        else {
+        let Ok(p) = ctx.players.get(entity) else {
             return;
         };
         let place_stack = match action {
-            BlockAction::Place { hand, .. } => Hand::from_wire(hand).and_then(|h| inv.0.hand(h)),
+            BlockAction::Place { hand, .. } => Hand::from_wire(hand).and_then(|h| p.inv.0.hand(h)),
             BlockAction::Dig { .. } => None,
         };
         (
-            net_id.0,
-            profile.clone(),
-            pos,
-            rot,
-            movement,
-            dead.is_some(),
-            mining.copied(),
-            view.pending_teleport,
-            view.tracked_chunks.clone(),
-            inv.0.hand(Hand::Main),
+            p.net_id.0,
+            p.profile.clone(),
+            *p.pos,
+            *p.rot,
+            *p.movement,
+            p.dead.is_some(),
+            p.mining.copied(),
+            p.view.pending_teleport,
+            p.view.tracked_chunks.clone(),
+            p.inv.0.hand(Hand::Main),
             place_stack,
         )
     };
@@ -223,10 +221,8 @@ fn interact_block(
                 None
             };
             if edit.is_some() {
-                if is_survival
-                    && let Ok((_, _, _, _, _, _, _, mut hunger, ..)) = ctx.players.get_mut(entity)
-                {
-                    add_exhaustion(&mut hunger, true, false, 0.005);
+                if is_survival && let Ok(mut p) = ctx.players.get_mut(entity) {
+                    add_exhaustion(&mut p.hunger, true, false, 0.005);
                 }
                 let drops = crate::game::block_behavior(current).container_drops(&world, pos);
                 if !drops.is_empty()
@@ -414,13 +410,13 @@ fn interact_block(
         }
 
         let mut inv_changed = false;
-        if let Ok((_, _, _, _, _, _, _, _, _, _, _, mut inv, _, _)) = ctx.players.get_mut(entity) {
+        if let Ok(mut p) = ctx.players.get_mut(entity) {
             if survival_tool_damage > 0 {
-                inv_changed |= inv.0.damage_hand(Hand::Main, survival_tool_damage)
+                inv_changed |= p.inv.0.damage_hand(Hand::Main, survival_tool_damage)
                     == crate::game::ClickResult::Changed;
             }
             if let Some(hand) = survival_consume_hand {
-                inv_changed |= inv.0.drop_hand(hand, false) == crate::game::ClickResult::Changed;
+                inv_changed |= p.inv.0.drop_hand(hand, false) == crate::game::ClickResult::Changed;
             }
         }
         for (drop_pos, stack) in survival_dig_drops {
@@ -478,18 +474,16 @@ pub(super) fn handle_dig(
         3 | 4 => {
             let all = action == 3;
             let dropped = {
-                let Ok((_, _, _, _, _, _, _, _, _, _, _, mut inv, _, _)) =
-                    ctx.players.get_mut(entity)
-                else {
+                let Ok(mut p) = ctx.players.get_mut(entity) else {
                     return;
                 };
-                let preview = inv.0.hand(Hand::Main).map(|mut s| {
+                let preview = p.inv.0.hand(Hand::Main).map(|mut s| {
                     if !all {
                         s.count = 1;
                     }
                     s
                 });
-                if inv.0.drop_hand(Hand::Main, all) == crate::game::ClickResult::Changed {
+                if p.inv.0.drop_hand(Hand::Main, all) == crate::game::ClickResult::Changed {
                     preview
                 } else {
                     None
@@ -505,10 +499,8 @@ pub(super) fn handle_dig(
             ctx.commands.entity(entity).remove::<EatingState>();
         }
         6 => {
-            if let Ok((_, _, _, _, _, _, _, _, _, _, _, mut inv, _, _)) =
-                ctx.players.get_mut(entity)
-            {
-                inv.0.swap_hands();
+            if let Ok(mut p) = ctx.players.get_mut(entity) {
+                p.inv.0.swap_hands();
             }
             ctx.emit_equipment(uuid, entity);
             ctx.emit_inventory_if_can_interact(uuid, entity);
@@ -529,15 +521,13 @@ pub(super) fn handle_place(
     let Some(entity) = ctx.player_entity(uuid) else {
         return;
     };
-    let can_use_block = ctx.players.get(entity).is_ok_and(
-        |(_, _, profile, &ppos, _, &movement, _, _, dead, _, _, _, _, view)| {
-            profile.can_interact()
-                && dead.is_none()
-                && !movement.sneaking
-                && player_in_reach(ppos, profile, pos)
-                && !view.pending_teleport
-        },
-    );
+    let can_use_block = ctx.players.get(entity).is_ok_and(|p| {
+        p.profile.can_interact()
+            && p.dead.is_none()
+            && !p.movement.sneaking
+            && player_in_reach(*p.pos, p.profile, pos)
+            && !p.view.pending_teleport
+    });
 
     let tick = ctx.clock.tick;
     let effects = if can_use_block {
@@ -595,11 +585,11 @@ pub(super) fn apply_game_effects(
         ctx.out.push(GameOutput::BroadcastSystemChat(msg));
     }
     if !effects.player_drops.is_empty()
-        && let Ok((_, _, _, &ppos, ..)) = ctx.players.get(entity)
+        && let Ok(p) = ctx.players.get(entity)
     {
         for stack in effects.player_drops {
             ctx.drops.write(SpawnDropMsg::scatter(
-                [ppos.0[0], ppos.0[1] + 0.5, ppos.0[2]],
+                [p.pos.0[0], p.pos.0[1] + 0.5, p.pos.0[2]],
                 stack,
                 10,
             ));
@@ -614,15 +604,13 @@ pub(super) fn apply_game_effects(
         let inv = ctx
             .players
             .get(entity)
-            .map(|(_, _, _, _, _, _, _, _, _, _, _, inv, _, _)| inv.0.clone())
+            .map(|p| p.inv.0.clone())
             .expect("player inventory");
         match screen {
             crate::game::ContainerScreen::CraftingTable => {
                 let window_id = ctx.allocate_window_id(entity);
-                if let Ok((_, _, _, _, _, _, _, _, _, _, _, _, mut container, _)) =
-                    ctx.players.get_mut(entity)
-                {
-                    container.open = Some(OpenContainer {
+                if let Ok(mut p) = ctx.players.get_mut(entity) {
+                    p.container.open = Some(OpenContainer {
                         window_id,
                         kind: ContainerKind::CraftingTable {
                             grid: [None; 9],
@@ -644,10 +632,8 @@ pub(super) fn apply_game_effects(
             crate::game::ContainerScreen::Furnace(fpos) => {
                 if let Some(furnace) = world.furnace_data(fpos) {
                     let window_id = ctx.allocate_window_id(entity);
-                    if let Ok((_, _, _, _, _, _, _, _, _, _, _, _, mut container, _)) =
-                        ctx.players.get_mut(entity)
-                    {
-                        container.open = Some(OpenContainer {
+                    if let Ok(mut p) = ctx.players.get_mut(entity) {
+                        p.container.open = Some(OpenContainer {
                             window_id,
                             kind: ContainerKind::Furnace(fpos),
                             state_id: 0,
@@ -675,10 +661,8 @@ pub(super) fn apply_game_effects(
             crate::game::ContainerScreen::Chest(cpos) => {
                 if let Some(chest_items) = world.chest_items(cpos) {
                     let window_id = ctx.allocate_window_id(entity);
-                    if let Ok((_, _, _, _, _, _, _, _, _, _, _, _, mut container, _)) =
-                        ctx.players.get_mut(entity)
-                    {
-                        container.open = Some(OpenContainer {
+                    if let Ok(mut p) = ctx.players.get_mut(entity) {
+                        p.container.open = Some(OpenContainer {
                             window_id,
                             kind: ContainerKind::Chest(cpos),
                             state_id: 0,
@@ -705,10 +689,10 @@ pub(super) fn apply_game_effects(
 
     if effects.inventory_changed {
         ctx.emit_equipment(uuid, entity);
-        if let Ok((_, _, _, _, _, _, _, _, _, _, _, inv, _, _)) = ctx.players.get(entity) {
+        if let Ok(p) = ctx.players.get(entity) {
             ctx.out.push(GameOutput::PlayerInventorySynced {
                 uuid,
-                inventory: inv.0.clone(),
+                inventory: p.inv.0.clone(),
             });
         }
     }

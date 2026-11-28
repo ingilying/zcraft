@@ -8,8 +8,8 @@ pub(super) fn handle_use_item(ctx: &mut InteractionCtx, uuid: Uuid, hand: i32, s
         return;
     };
     let effects = if let Some(hand) = Hand::from_wire(hand)
-        && let Ok((_, _, _, _, _, _, _, _, _, _, _, inv, _, _)) = ctx.players.get(entity)
-        && let Some(stack) = inv.0.hand(hand)
+        && let Ok(p) = ctx.players.get(entity)
+        && let Some(stack) = p.inv.0.hand(hand)
     {
         ctx.with_use_context(entity, |use_ctx| {
             crate::game::item_behavior(stack.item).on_use(use_ctx, hand, stack)
@@ -26,8 +26,8 @@ pub(super) fn handle_select_slot(ctx: &mut InteractionCtx, uuid: Uuid, slot: u8)
         return;
     };
     ctx.commands.entity(entity).remove::<EatingState>();
-    if let Ok((_, _, _, _, _, _, _, _, _, _, _, mut inv, _, _)) = ctx.players.get_mut(entity) {
-        inv.0.select(slot);
+    if let Ok(mut p) = ctx.players.get_mut(entity) {
+        p.inv.0.select(slot);
     }
     ctx.emit_equipment(uuid, entity);
 }
@@ -41,16 +41,15 @@ pub(super) fn handle_creative_slot(
     let Some(entity) = ctx.player_entity(uuid) else {
         return;
     };
-    let Ok((_, _, profile, _, _, _, _, _, _, _, _, mut inv, _, _)) = ctx.players.get_mut(entity)
-    else {
+    let Ok(mut p) = ctx.players.get_mut(entity) else {
         return;
     };
-    if !profile.is_creative() {
+    if !p.profile.is_creative() {
         return;
     }
     let mut equipment_dirty = false;
     if let Some(supported) = item {
-        inv.0.set_creative(slot, supported);
+        p.inv.0.set_creative(slot, supported);
         equipment_dirty = true;
     }
     let Ok(slot_idx) = usize::try_from(slot) else {
@@ -59,7 +58,12 @@ pub(super) fn handle_creative_slot(
         }
         return;
     };
-    let slot_sync = inv.0.slots().get(slot_idx).map(|&s| (inv.0.state_id(), s));
+    let slot_sync = p
+        .inv
+        .0
+        .slots()
+        .get(slot_idx)
+        .map(|&s| (p.inv.0.state_id(), s));
     if equipment_dirty {
         ctx.emit_equipment(uuid, entity);
     }

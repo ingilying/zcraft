@@ -17,9 +17,42 @@ use crate::{
     },
     world::BlockPos,
 };
-use bevy_ecs::prelude::{Commands, MessageReader, MessageWriter, Query, Res, ResMut, With};
+use bevy_ecs::{
+    prelude::{Commands, MessageReader, MessageWriter, Query, Res, ResMut, With},
+    query::QueryData,
+};
 use std::collections::HashSet;
 use uuid::Uuid;
+
+#[derive(QueryData)]
+#[query_data(mutable)]
+pub(crate) struct ControlPlayer {
+    pos: &'static mut Position,
+    rot: &'static mut Rotation,
+    movement: &'static mut MovementState,
+    profile: &'static mut PlayerProfile,
+    health: &'static Health,
+    hunger: &'static Hunger,
+    inv: &'static mut PlayerInventory,
+    view: &'static mut PlayerViewState,
+}
+
+#[derive(QueryData)]
+#[query_data(mutable)]
+pub(crate) struct LeavingPlayer {
+    net_id: &'static NetworkEntityId,
+    uuid: &'static EntityUuid,
+    profile: &'static PlayerProfile,
+    pos: &'static Position,
+    rot: &'static Rotation,
+    movement: &'static MovementState,
+    health: &'static Health,
+    hunger: &'static Hunger,
+    dead: Option<&'static Dead>,
+    eating: Option<&'static EatingState>,
+    inv: &'static PlayerInventory,
+    container: &'static mut PlayerContainer,
+}
 
 /// Spawn online player entities from `PlayerJoinMsg`.
 pub(crate) fn player_join_system(
@@ -132,23 +165,10 @@ pub(crate) fn player_view_system(
 }
 
 /// Apply server/admin player controls (`/tp`, `/give`, `/gamemode`).
-#[allow(clippy::type_complexity)]
 pub(crate) fn player_control_system(
     mut controls: MessageReader<PlayerControlMsg>,
     registry: Res<EntityRegistry>,
-    mut players: Query<
-        (
-            &mut Position,
-            &mut Rotation,
-            &mut MovementState,
-            &mut PlayerProfile,
-            &Health,
-            &Hunger,
-            &mut PlayerInventory,
-            &mut PlayerViewState,
-        ),
-        With<PlayerMarker>,
-    >,
+    mut players: Query<ControlPlayer, With<PlayerMarker>>,
     mut out: ResMut<OutputQueue>,
 ) {
     for msg in controls.read() {
@@ -165,56 +185,53 @@ pub(crate) fn player_control_system(
                 let Some(&entity) = registry.players.get(&uuid) else {
                     continue;
                 };
-                let Ok((mut pos, mut rot, mut movement, _, _, _, _, mut view)) =
-                    players.get_mut(entity)
-                else {
+                let Ok(mut p) = players.get_mut(entity) else {
                     continue;
                 };
-                pos.0 = position;
+                p.pos.0 = position;
                 if let Some(y) = yaw {
-                    rot.yaw = y;
+                    p.rot.yaw = y;
                 }
                 if let Some(pi) = pitch {
-                    rot.pitch = pi;
+                    p.rot.pitch = pi;
                 }
-                movement.on_ground = false;
-                view.pending_teleport = true;
+                p.movement.on_ground = false;
+                p.view.pending_teleport = true;
                 out.push(GameOutput::PlayerTeleported {
                     uuid,
                     position,
-                    yaw: rot.yaw,
-                    pitch: rot.pitch,
+                    yaw: p.rot.yaw,
+                    pitch: p.rot.pitch,
                 });
             }
             PlayerControlMsg::Give { uuid, item, count } => {
                 let Some(&entity) = registry.players.get(&uuid) else {
                     continue;
                 };
-                let Ok((_, _, _, _, _, _, mut inv, _)) = players.get_mut(entity) else {
+                let Ok(mut p) = players.get_mut(entity) else {
                     continue;
                 };
-                inv.0.give(item, count);
+                p.inv.0.give(item, count);
                 out.push(GameOutput::PlayerInventorySynced {
                     uuid,
-                    inventory: inv.0.clone(),
+                    inventory: p.inv.0.clone(),
                 });
             }
             PlayerControlMsg::SetGameMode { uuid, mode } => {
                 let Some(&entity) = registry.players.get(&uuid) else {
                     continue;
                 };
-                let Ok((_, _, _, mut profile, health, hunger, inv, _)) = players.get_mut(entity)
-                else {
+                let Ok(mut p) = players.get_mut(entity) else {
                     continue;
                 };
-                profile.game_mode = mode;
+                p.profile.game_mode = mode;
                 out.push(GameOutput::PlayerGameModeChanged {
                     uuid,
                     mode,
-                    health: health.current,
-                    food: hunger.food,
-                    saturation: hunger.saturation,
-                    inventory: inv.0.clone(),
+                    health: p.health.current,
+                    food: p.hunger.food,
+                    saturation: p.hunger.saturation,
+                    inventory: p.inv.0.clone(),
                 });
             }
         }
@@ -401,30 +418,14 @@ pub(crate) fn world_control_system(
 
 /// Despawn departing players, return crafting/cursor items, close chest viewers,
 /// and emit `PersistPlayer` events.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn player_leave_system(
     mut leaves: MessageReader<PlayerLeaveMsg>,
     mut commands: Commands,
     world: Res<VoxelWorld>,
     mut registry: ResMut<EntityRegistry>,
     mut viewers: ResMut<ChestViewers>,
-    mut players: Query<
-        (
-            &NetworkEntityId,
-            &EntityUuid,
-            &PlayerProfile,
-            &Position,
-            &Rotation,
-            &MovementState,
-            &Health,
-            &Hunger,
-            Option<&Dead>,
-            Option<&EatingState>,
-            &PlayerInventory,
-            &mut PlayerContainer,
-        ),
-        With<PlayerMarker>,
-    >,
+    mut players: Query<LeavingPlayer, With<PlayerMarker>>,
     mut drops: MessageWriter<SpawnDropMsg>,
     mut out: ResMut<OutputQueue>,
 ) {
@@ -432,50 +433,38 @@ pub(crate) fn player_leave_system(
         let Some(entity) = registry.players.remove(&uuid) else {
             continue;
         };
-        let Ok((
-            net_id,
-            entity_uuid,
-            profile,
-            pos,
-            rot,
-            movement,
-            health,
-            hunger,
-            dead,
-            eating,
-            inv_comp,
-            mut container,
-        )) = players.get_mut(entity)
-        else {
+        let Ok(mut p) = players.get_mut(entity) else {
             continue;
         };
 
         let player = Player {
-            entity_id: net_id.0,
-            uuid: entity_uuid.0,
-            name: profile.name.clone(),
-            game_mode: profile.game_mode,
-            position: pos.0,
-            yaw: rot.yaw,
-            pitch: rot.pitch,
-            on_ground: movement.on_ground,
-            sneaking: movement.sneaking,
-            sprinting: movement.sprinting,
-            health: health.current,
-            food: hunger.food,
-            saturation: hunger.saturation,
-            exhaustion: hunger.exhaustion,
-            food_tick_timer: hunger.tick_timer,
-            eating: eating.map(|e| (e.hand, e.item, e.start_tick, e.required_ticks)),
-            fall_distance: movement.fall_distance,
-            dead: dead.is_some(),
-            last_hurt_tick: health.last_hurt_tick,
-            respawn_point: profile.respawn_point,
+            entity_id: p.net_id.0,
+            uuid: p.uuid.0,
+            name: p.profile.name.clone(),
+            game_mode: p.profile.game_mode,
+            position: p.pos.0,
+            yaw: p.rot.yaw,
+            pitch: p.rot.pitch,
+            on_ground: p.movement.on_ground,
+            sneaking: p.movement.sneaking,
+            sprinting: p.movement.sprinting,
+            health: p.health.current,
+            food: p.hunger.food,
+            saturation: p.hunger.saturation,
+            exhaustion: p.hunger.exhaustion,
+            food_tick_timer: p.hunger.tick_timer,
+            eating: p
+                .eating
+                .map(|e| (e.hand, e.item, e.start_tick, e.required_ticks)),
+            fall_distance: p.movement.fall_distance,
+            dead: p.dead.is_some(),
+            last_hurt_tick: p.health.last_hurt_tick,
+            respawn_point: p.profile.respawn_point,
         };
-        let mut inventory = inv_comp.0.clone();
-        let open_container = container.open.take();
+        let mut inventory = p.inv.0.clone();
+        let open_container = p.container.open.take();
         commands.entity(entity).despawn();
-        registry.release_entity_id(net_id.0);
+        registry.release_entity_id(p.net_id.0);
 
         let ppos = player.position;
         let mut returned = Vec::new();
