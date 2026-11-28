@@ -9,12 +9,12 @@ use crate::{
     config::GameMode,
     game::{
         CREATIVE_BLOCK_REACH, HURT_INVULNERABILITY_TICKS, Hand, Inventory, Item, ItemStack,
-        PLAYER_EYE_HEIGHT, PLAYER_HALF_WIDTH, PLAYER_HEIGHT, Player, SURVIVAL_BLOCK_REACH,
+        PLAYER_EYE_HEIGHT, PLAYER_HALF_WIDTH, PLAYER_HEIGHT, SURVIVAL_BLOCK_REACH,
     },
     protocol::packets::play_entities::EntityPose,
     world::BlockPos,
 };
-use bevy_ecs::prelude::{Component, Entity, World};
+use bevy_ecs::prelude::Component;
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -324,91 +324,4 @@ pub fn tick_hunger_and_regen(health: &mut Health, hunger: &mut Hunger) -> (bool,
 
     let changed = (health.current, hunger.food, hunger.saturation) != prev;
     (changed, starved_hurt)
-}
-
-/// Assemble a persistence/behavior `Player` DTO from a live ECS player entity's components.
-pub fn snapshot_player_dto(ecs: &World, entity: Entity) -> Option<Player> {
-    let entity_id = ecs.get::<NetworkEntityId>(entity)?.0;
-    let uuid = ecs.get::<EntityUuid>(entity)?.0;
-    let profile = ecs.get::<PlayerProfile>(entity)?;
-    let pos = ecs.get::<Position>(entity)?.0;
-    let rot = *ecs.get::<Rotation>(entity)?;
-    let movement = *ecs.get::<MovementState>(entity)?;
-    let health = *ecs.get::<Health>(entity)?;
-    let hunger = *ecs.get::<Hunger>(entity)?;
-    let dead = ecs.get::<Dead>(entity).is_some();
-    let eating = ecs
-        .get::<EatingState>(entity)
-        .map(|e| (e.hand, e.item, e.start_tick, e.required_ticks));
-    Some(Player {
-        entity_id,
-        uuid,
-        name: profile.name.clone(),
-        game_mode: profile.game_mode,
-        position: pos,
-        yaw: rot.yaw,
-        pitch: rot.pitch,
-        on_ground: movement.on_ground,
-        sneaking: movement.sneaking,
-        sprinting: movement.sprinting,
-        health: health.current,
-        food: hunger.food,
-        saturation: hunger.saturation,
-        exhaustion: hunger.exhaustion,
-        food_tick_timer: hunger.tick_timer,
-        eating,
-        fall_distance: movement.fall_distance,
-        dead,
-        last_hurt_tick: health.last_hurt_tick,
-        respawn_point: profile.respawn_point,
-    })
-}
-
-/// Write back mutable fields modified by `BlockBehavior`/`ItemBehavior` (`UseContext`)
-/// onto a live ECS player entity's granular components.
-pub fn apply_player_dto(ecs: &mut World, entity: Entity, player: &Player) {
-    if let Some(mut pos) = ecs.get_mut::<Position>(entity) {
-        pos.0 = player.position;
-    }
-    if let Some(mut rot) = ecs.get_mut::<Rotation>(entity) {
-        rot.yaw = player.yaw;
-        rot.pitch = player.pitch;
-    }
-    if let Some(mut movement) = ecs.get_mut::<MovementState>(entity) {
-        movement.on_ground = player.on_ground;
-        movement.sneaking = player.sneaking;
-        movement.sprinting = player.sprinting;
-        movement.fall_distance = player.fall_distance;
-    }
-    if let Some(mut profile) = ecs.get_mut::<PlayerProfile>(entity) {
-        profile.game_mode = player.game_mode;
-        profile.respawn_point = player.respawn_point;
-    }
-    if let Some(mut health) = ecs.get_mut::<Health>(entity) {
-        health.current = player.health;
-        health.last_hurt_tick = player.last_hurt_tick;
-    }
-    if let Some(mut hunger) = ecs.get_mut::<Hunger>(entity) {
-        hunger.food = player.food;
-        hunger.saturation = player.saturation;
-        hunger.exhaustion = player.exhaustion;
-        hunger.tick_timer = player.food_tick_timer;
-    }
-    if let Ok(mut e) = ecs.get_entity_mut(entity) {
-        if player.dead {
-            e.insert(Dead);
-        } else {
-            e.remove::<Dead>();
-        }
-        if let Some((hand, item, start_tick, required_ticks)) = player.eating {
-            e.insert(EatingState {
-                hand,
-                item,
-                start_tick,
-                required_ticks,
-            });
-        } else {
-            e.remove::<EatingState>();
-        }
-    }
 }

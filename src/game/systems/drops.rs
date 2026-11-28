@@ -1,6 +1,5 @@
 //! Declarative ECS system for spawning dropped item entities from `SpawnDropMsg`.
 use crate::game::{
-    ItemStack,
     components::{
         DropLifecycle, DropSyncState, EntityUuid, ItemDropMarker, ItemStackComp, NetworkEntityId,
         Position, Velocity,
@@ -9,37 +8,9 @@ use crate::game::{
     io::GameOutput,
     resources::{EntityRegistry, MAX_ITEM_DROPS, OutputQueue},
 };
-use bevy_ecs::prelude::{Commands, MessageReader, Messages, Query, ResMut, World};
+use bevy_ecs::prelude::{Commands, MessageReader, Query, ResMut};
 use rand::Rng;
 use uuid::Uuid;
-
-/// Queue a dropped item spawn request with vanilla random horizontal scatter.
-pub(crate) fn queue_drop_scatter(
-    ecs: &mut World,
-    position: [f64; 3],
-    stack: ItemStack,
-    pickup_delay: u16,
-) {
-    ecs.resource_mut::<Messages<SpawnDropMsg>>()
-        .write(SpawnDropMsg::scatter(position, stack, pickup_delay));
-}
-
-/// Queue a dropped item spawn request with explicit initial velocity.
-pub(crate) fn queue_drop(
-    ecs: &mut World,
-    position: [f64; 3],
-    velocity: [f64; 3],
-    stack: ItemStack,
-    pickup_delay: u16,
-) {
-    ecs.resource_mut::<Messages<SpawnDropMsg>>()
-        .write(SpawnDropMsg::with_velocity(
-            position,
-            velocity,
-            stack,
-            pickup_delay,
-        ));
-}
 
 /// Spawn dropped item entities requested via `SpawnDropMsg`, enforcing `MAX_ITEM_DROPS`.
 pub(crate) fn spawn_item_drops_system(
