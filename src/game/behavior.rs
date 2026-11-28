@@ -20,6 +20,7 @@ pub struct UseContext<'a> {
     pub world: &'a World,
     pub player: &'a mut Player,
     pub inventory: &'a mut Inventory,
+    pub tick: u64,
 }
 
 /// Unified domain side-effects returned by `BlockBehavior::on_use` and `ItemBehavior::on_use`.
@@ -268,12 +269,7 @@ impl ItemBehavior for FoodItem {
             return GameEffects::pass();
         };
         if props.always_edible || ctx.player.food < 20 {
-            ctx.player.eating = Some((
-                hand,
-                stack.item,
-                tokio::time::Instant::now(),
-                props.eat_ticks,
-            ));
+            ctx.player.eating = Some((hand, stack.item, ctx.tick, props.eat_ticks));
             GameEffects::consumed()
         } else {
             GameEffects::pass()
@@ -580,6 +576,7 @@ mod tests {
             world: &world,
             player: &mut player,
             inventory: &mut inv,
+            tick: 0,
         };
         let effects = item_behavior(steak).on_use(&mut ctx, Hand::Main, stack);
         assert!(effects.handled);
@@ -617,6 +614,7 @@ mod tests {
                 world: &world,
                 player: &mut player,
                 inventory: &mut inv,
+                tick: 0,
             };
             let fx = block_behavior(table).on_use(&mut ctx, pos, table);
             assert_eq!(fx.open_screen, Some(ContainerScreen::CraftingTable));
@@ -629,6 +627,7 @@ mod tests {
                 world: &world,
                 player: &mut player,
                 inventory: &mut inv,
+                tick: 0,
             };
             let fx = block_behavior(furnace).on_use(&mut ctx, pos, furnace);
             assert_eq!(fx.open_screen, Some(ContainerScreen::Furnace(pos)));
@@ -655,6 +654,7 @@ mod tests {
                 world: &world,
                 player: &mut player,
                 inventory: &mut inv,
+                tick: 0,
             };
             block_behavior(lower).on_use(&mut ctx, pos, lower)
         };
@@ -681,6 +681,7 @@ mod tests {
                 world: &world,
                 player: &mut player,
                 inventory: &mut inv,
+                tick: 0,
             };
             assert!(
                 !block_behavior(iron_door)
@@ -697,6 +698,7 @@ mod tests {
                 world: &world,
                 player: &mut player,
                 inventory: &mut inv,
+                tick: 0,
             };
             block_behavior(red_bed).on_use(&mut ctx, pos, red_bed)
         };
@@ -730,6 +732,7 @@ mod tests {
                 world: &world,
                 player: &mut player,
                 inventory: &mut inv,
+                tick: 0,
             };
             item_behavior(water_bucket).on_use(
                 &mut ctx,
@@ -752,6 +755,7 @@ mod tests {
                 world: &world,
                 player: &mut player,
                 inventory: &mut inv,
+                tick: 0,
             };
             item_behavior(bucket).on_use(&mut ctx, Hand::Main, ItemStack::new(bucket, 1).unwrap())
         };

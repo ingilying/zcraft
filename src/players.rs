@@ -24,6 +24,7 @@ use uuid::Uuid;
 /// Queued messages per connection, in addition to at most one in-flight write.
 pub const BROADCAST_QUEUE_CAPACITY: usize = 32;
 
+#[derive(Clone)]
 pub struct Players {
     max: u32,
     registry: Arc<Mutex<Registry>>,
@@ -402,6 +403,124 @@ impl Players {
         slot.enqueue(Delivery::Control(control))
     }
 
+    /// Enqueue a player-targeted Play packet into that player's outbound delivery queue.
+    pub(crate) fn send_packet(&self, uuid: Uuid, packet: &Clientbound) -> io::Result<bool> {
+        let body: Arc<[u8]> = packet.encode()?.into();
+        let mut registry = lock(&self.registry);
+        let Some(slot) = registry.players.get_mut(&uuid) else {
+            return Ok(false);
+        };
+        if !slot.receiving || slot.lagged {
+            return Ok(false);
+        }
+        if !slot.enqueue(Delivery::Packet(body)) {
+            registry.deactivate(uuid);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Update a ready player's authoritative pose in the spatial index by UUID.
+    pub(crate) fn update_pose_for(&self, uuid: Uuid, to: EntityPose) {
+        let mut registry = lock(&self.registry);
+        let Some(peer) = registry
+            .players
+            .get_mut(&uuid)
+            .filter(|slot| !slot.lagged)
+            .and_then(|slot| slot.visible.as_mut())
+        else {
+            return;
+        };
+        if peer.pose != to {
+            let from = std::mem::replace(&mut peer.pose, to);
+            registry.move_entity(uuid, pose_chunk(from), pose_chunk(to));
+        }
+    }
+
+    /// Update a ready player's cached game mode in the peer roster by UUID.
+    pub(crate) fn update_game_mode_for(&self, uuid: Uuid, mode: crate::config::GameMode) {
+        let mut registry = lock(&self.registry);
+        if let Some(slot) = registry.players.get_mut(&uuid)
+            && let Some(peer) = slot.visible.as_mut()
+        {
+            peer.game_mode = mode;
+        }
+    }
+
+    /// Broadcast an entity-scoped packet to all other ready players watching `uuid`'s chunk.
+    pub(crate) fn broadcast_to_viewers_of(&self, uuid: Uuid, packet: &Clientbound) -> io::Result<()> {
+        let body: Arc<[u8]> = packet.encode()?.into();
+        let mut registry = lock(&self.registry);
+        let chunk = match registry
+            .players
+            .get(&uuid)
+            .filter(|slot| !slot.lagged)
+            .and_then(|slot| slot.visible.as_ref())
+        {
+            Some(peer) => pose_chunk(peer.pose),
+            None => return Ok(()),
+        };
+        let viewers: Vec<Uuid> = registry
+            .watchers
+            .at(chunk)
+            .filter(|&viewer| viewer != uuid)
+            .collect();
+        for viewer in viewers {
+            if let Some(slot) = registry.players.get_mut(&viewer)
+                && !slot.lagged
+                && !slot.enqueue(Delivery::Packet(body.clone()))
+            {
+                registry.deactivate(viewer);
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish block updates with an ordered sequence acknowledgement for `actor`.
+    pub(crate) fn publish_blocks_for(
+        &self,
+        actor: Uuid,
+        chunk: Chunk,
+        updates: Arc<[Arc<[u8]>]>,
+        ack: Arc<[u8]>,
+    ) {
+        let mut registry = lock(&self.registry);
+        let viewers: Vec<_> = registry.block_watchers.at(chunk).collect();
+        for viewer in viewers {
+            let ack = (viewer == actor).then(|| ack.clone());
+            registry.enqueue_terrain(viewer, chunk, updates.clone(), ack);
+        }
+    }
+
+    /// Publish a single chunk light update to all block watchers of `chunk`.
+    pub(crate) fn publish_light_chunk(&self, chunk: Chunk, light: Arc<[u8]>) {
+        let mut registry = lock(&self.registry);
+        let viewers: Vec<_> = registry.block_watchers.at(chunk).collect();
+        let updates: Arc<[Arc<[u8]>]> = Arc::from([light]);
+        for viewer in viewers {
+            registry.enqueue_terrain(viewer, chunk, updates.clone(), None);
+        }
+    }
+
+    /// Enqueue block corrections and a sequence acknowledgement for `uuid`.
+    pub(crate) fn correct_blocks_for(
+        &self,
+        uuid: Uuid,
+        corrections: Vec<(Chunk, Arc<[u8]>)>,
+        ack: Arc<[u8]>,
+    ) {
+        let mut registry = lock(&self.registry);
+        for (chunk, body) in corrections {
+            registry.enqueue_terrain(uuid, chunk, Arc::from([body]), None);
+        }
+        if let Some(slot) = registry.players.get_mut(&uuid)
+            && !slot.lagged
+            && !slot.enqueue(Delivery::Packet(ack))
+        {
+            registry.deactivate(uuid);
+        }
+    }
+
     /// Publish world block/light updates to all subscribers of `chunk`.
     pub(crate) fn publish_world_updates(&self, chunk: Chunk, updates: Arc<[Arc<[u8]>]>) {
         if updates.is_empty() {
@@ -500,6 +619,7 @@ impl Reservation {
         slot.signals.ready.notify_one();
     }
 
+    #[cfg(test)]
     pub(crate) fn update_game_mode(&self, mode: crate::config::GameMode) {
         let mut registry = lock(&self.0.registry);
         if let Some(slot) = self.0.slot(&mut registry)
@@ -509,6 +629,7 @@ impl Reservation {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn update_pose(&self, to: EntityPose) {
         let mut registry = lock(&self.0.registry);
         let Some(peer) = self
@@ -523,37 +644,6 @@ impl Reservation {
             let from = std::mem::replace(&mut peer.pose, to);
             registry.move_entity(self.0.uuid, pose_chunk(from), pose_chunk(to));
         }
-    }
-
-    /// Broadcast an entity-scoped packet (animation, metadata, equipment) to
-    /// all other ready players currently watching this player's chunk.
-    pub(crate) fn broadcast_to_viewers(&self, packet: &Clientbound) -> io::Result<()> {
-        let body: Arc<[u8]> = packet.encode()?.into();
-        let mut registry = lock(&self.0.registry);
-        let chunk = match self
-            .0
-            .slot(&mut registry)
-            .filter(|slot| !slot.lagged)
-            .and_then(|slot| slot.visible.as_ref())
-        {
-            Some(peer) => pose_chunk(peer.pose),
-            None => return Ok(()),
-        };
-        let uuid = self.0.uuid;
-        let viewers: Vec<Uuid> = registry
-            .watchers
-            .at(chunk)
-            .filter(|&viewer| viewer != uuid)
-            .collect();
-        for viewer in viewers {
-            if let Some(slot) = registry.players.get_mut(&viewer)
-                && !slot.lagged
-                && !slot.enqueue(Delivery::Packet(body.clone()))
-            {
-                registry.deactivate(viewer);
-            }
-        }
-        Ok(())
     }
 
     pub(crate) fn set_view(&self, center: [i32; 2], radius: i32) {
@@ -636,35 +726,13 @@ impl Reservation {
     }
 
     /// The world lock orders edits, snapshot reconciliation and queued updates.
+    #[cfg(test)]
     pub(crate) fn publish_blocks(&self, chunk: Chunk, updates: Arc<[Arc<[u8]>]>, ack: Arc<[u8]>) {
         let mut registry = lock(&self.0.registry);
         let viewers: Vec<_> = registry.block_watchers.at(chunk).collect();
         for viewer in viewers {
             let ack = (viewer == self.0.uuid).then(|| ack.clone());
             registry.enqueue_terrain(viewer, chunk, updates.clone(), ack);
-        }
-    }
-
-    pub(crate) fn publish_light(&self, chunk: Chunk, light: Arc<[u8]>) {
-        let mut registry = lock(&self.0.registry);
-        let viewers: Vec<_> = registry.block_watchers.at(chunk).collect();
-        let updates: Arc<[Arc<[u8]>]> = Arc::from([light]);
-        for viewer in viewers {
-            registry.enqueue_terrain(viewer, chunk, updates.clone(), None);
-        }
-    }
-
-    pub(crate) fn correct_blocks(&self, corrections: Vec<(Chunk, Arc<[u8]>)>, ack: Arc<[u8]>) {
-        let mut registry = lock(&self.0.registry);
-        let uuid = self.0.uuid;
-        for (chunk, body) in corrections {
-            registry.enqueue_terrain(uuid, chunk, Arc::from([body]), None);
-        }
-        if let Some(slot) = self.0.slot(&mut registry)
-            && !slot.lagged
-            && !slot.enqueue(Delivery::Packet(ack))
-        {
-            registry.deactivate(uuid);
         }
     }
 

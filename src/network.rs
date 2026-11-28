@@ -73,57 +73,78 @@ async fn serve_validated(
     let compression_threshold = usize::try_from(config.compression_threshold).ok();
     let slots = Arc::new(Semaphore::new(config.max_connections));
     let mut tasks = JoinSet::new();
-    let mut world_tick = tokio::time::interval_at(
-        Instant::now() + crate::world::TICK_INTERVAL,
-        crate::world::TICK_INTERVAL,
-    );
-    world_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    const AUTOSAVE_TICKS: u64 = 6_000; // 5 minutes at 20 TPS.
-    let mut ticks_since_save = 0u64;
-    let mut autosave: Option<tokio::task::JoinHandle<io::Result<crate::world::SaveSummary>>> = None;
+
+    // Start the dedicated OS game-loop thread (exclusive GameEngine owner + bounded FIFO queue).
+    let (autosave_tick_tx, mut autosave_tick_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let game_loop = server
+        .play
+        .start_game_loop(server.players().clone(), Some(autosave_tick_tx))?;
+
+    // Lightweight async watcher for periodic autosave & dirty-chunk writeback;
+    // actual disk I/O runs on Tokio's blocking pool so neither IO workers nor the
+    // dedicated game-loop thread ever stall on Anvil writes.
+    let autosave_server = server.clone();
+    let autosave_task = tokio::spawn(async move {
+        const AUTOSAVE_TICKS: u64 = 6_000; // 5 minutes at 20 TPS.
+        let mut ticks_since_save = 0u64;
+        let mut autosave: Option<tokio::task::JoinHandle<io::Result<crate::world::SaveSummary>>> =
+            None;
+        loop {
+            tokio::select! {
+                res = async { autosave.as_mut().unwrap().await }, if autosave.is_some() => {
+                    autosave = None;
+                    match res {
+                        Ok(Ok(summary)) => {
+                            tracing::info!(chunks = summary.chunks_saved, "autosaved world");
+                        }
+                        Ok(Err(error)) => {
+                            tracing::error!(%error, "world autosave failed");
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "world autosave task panicked");
+                        }
+                    }
+                }
+                tick = autosave_tick_rx.recv() => {
+                    if tick.is_none() {
+                        break;
+                    }
+                    ticks_since_save += 1;
+                    if autosave_server.play.world().has_storage() && autosave.is_none() {
+                        if ticks_since_save >= AUTOSAVE_TICKS {
+                            ticks_since_save = 0;
+                            let save_server = autosave_server.clone();
+                            autosave = Some(tokio::task::spawn_blocking(move || {
+                                save_server.play.save_world()
+                            }));
+                        } else if autosave_server.play.world().needs_dirty_flush() {
+                            let save_server = autosave_server.clone();
+                            autosave = Some(tokio::task::spawn_blocking(move || {
+                                let chunks_saved = save_server
+                                    .play
+                                    .world()
+                                    .flush_dirty_batch(crate::world::DIRTY_FLUSH_BATCH_SIZE)?;
+                                Ok(crate::world::SaveSummary {
+                                    persisted: true,
+                                    chunks_saved,
+                                })
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(handle) = autosave
+            && let Err(error) = handle.await
+        {
+            tracing::error!(%error, "in-flight autosave task failed during shutdown");
+        }
+    });
+
     tokio::pin!(shutdown);
     let result = loop {
         tokio::select! {
             _ = &mut shutdown => break Ok(()),
-            res = async { autosave.as_mut().unwrap().await }, if autosave.is_some() => {
-                autosave = None;
-                match res {
-                    Ok(Ok(summary)) => {
-                        tracing::info!(chunks = summary.chunks_saved, "autosaved world");
-                    }
-                    Ok(Err(error)) => {
-                        tracing::error!(%error, "world autosave failed");
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "world autosave task panicked");
-                    }
-                }
-            }
-            _ = world_tick.tick() => {
-                server.tick();
-                ticks_since_save += 1;
-                if server.play.world().has_storage() && autosave.is_none() {
-                    if ticks_since_save >= AUTOSAVE_TICKS {
-                        ticks_since_save = 0;
-                        let save_server = server.clone();
-                        autosave = Some(tokio::task::spawn_blocking(move || {
-                            save_server.play.save_world()
-                        }));
-                    } else if server.play.world().needs_dirty_flush() {
-                        let save_server = server.clone();
-                        autosave = Some(tokio::task::spawn_blocking(move || {
-                            let chunks_saved = save_server
-                                .play
-                                .world()
-                                .flush_dirty_batch(crate::world::DIRTY_FLUSH_BATCH_SIZE)?;
-                            Ok(crate::world::SaveSummary {
-                                persisted: true,
-                                chunks_saved,
-                            })
-                        }));
-                    }
-                }
-            }
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 if let Err(error) = result { tracing::warn!(%error, "connection task failed"); }
             }
@@ -147,16 +168,20 @@ async fn serve_validated(
             }
         }
     };
-    // Wait for any in-flight autosave, cancel connection tasks (whose drop
-    // guards persist online players), then perform a final blocking world save.
+    // Shutdown order preserves strict FIFO causality:
+    // 1. Cancel connection tasks while the game loop is still running so each
+    //    ConnectionSession drop enqueues PlayerLeave behind any in-flight inputs.
+    // 2. Stop and join the dedicated game-loop thread (draining all remaining commands).
+    // 3. Wait for any in-flight background autosave, then perform the final world save.
     tracing::info!("Stopping the server");
-    if let Some(handle) = autosave
-        && let Err(error) = handle.await
-    {
-        tracing::error!(%error, "in-flight autosave task failed during shutdown");
-    }
     tracing::info!("Saving players");
     tasks.shutdown().await;
+    if let Err(error) = tokio::task::spawn_blocking(move || game_loop.shutdown()).await {
+        tracing::error!(%error, "game loop shutdown task panicked");
+    }
+    if let Err(error) = autosave_task.await {
+        tracing::error!(%error, "autosave watcher task panicked during shutdown");
+    }
     let save_result = if server.play.world().has_storage() {
         tracing::info!("Saving worlds");
         let save_server = server.clone();
@@ -304,7 +329,7 @@ impl Drop for ConnectionSession<'_> {
 
 async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
     mut transport: Transport<S>,
-    server: &ServerContext,
+    server: &Arc<ServerContext>,
     deadline: Duration,
     compression_threshold: Option<usize>,
 ) -> io::Result<()> {
@@ -405,7 +430,8 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
             }
             Ok(ConnectionEvent::Tick) => crate::handler::play::tick(&mut session, Instant::now()),
             Ok(ConnectionEvent::Chunks) => {
-                crate::handler::play::stream_chunks(&mut session, &server.play, Instant::now())
+                crate::handler::play::stream_chunks_async(&mut session, &server.play, Instant::now())
+                    .await
             }
             Ok(ConnectionEvent::Broadcast(crate::players::Delivery::Control(control))) => {
                 crate::handler::play::apply_control(
@@ -414,6 +440,7 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
                     server.players(),
                     control,
                 )
+                .await
             }
             Ok(ConnectionEvent::Broadcast(delivery)) => {
                 let writing_until = Instant::now() + deadline;
@@ -422,7 +449,10 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 continue;
             }
-            Ok(ConnectionEvent::Eof) => return Ok(()),
+            Ok(ConnectionEvent::Eof) => {
+                crate::handler::play::save_session_async(&mut session, server).await;
+                return Ok(());
+            }
             Err(error) => Err(error),
         };
         let outcome = match result {
@@ -447,6 +477,7 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
                         .await;
                     }
                 }
+                crate::handler::play::save_session_async(&mut session, server).await;
                 return Err(error);
             }
         };
@@ -476,13 +507,20 @@ async fn run_connection<S: AsyncRead + AsyncWrite + Unpin>(
             let body = reply.encode()?;
             write_until(&mut transport, &body, writing_until, inbox.as_ref()).await?;
             let sent = Instant::now();
-            crate::handler::play::packet_sent(&mut session, &reply, sent)?;
+            crate::handler::play::packet_sent(
+                &mut session,
+                &server.play,
+                server.players(),
+                &reply,
+                sent,
+            )?;
             crate::handler::configuration::packet_sent(&mut session, &reply, sent);
         }
         if received_frame {
             frame_deadline = Instant::now() + deadline;
         }
         if outcome.close {
+            crate::handler::play::save_session_async(&mut session, server).await;
             return Ok(());
         }
         if state_before == State::Configuration && session.state == State::Play {

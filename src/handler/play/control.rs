@@ -1,22 +1,28 @@
-//! Server-initiated Play control actions (teleport, give, gamemode, OP refresh, kick).
-use super::{Outcome, PlayService, Session, closed};
+//! Protocol-level connection control actions (teleport ID/chunk-stream sync,
+//! respawn chunk-stream reset, command tree refresh, kick).
+//! All gameplay mutations happen in the ECS engine; this module only synchronizes
+//! transport/session protocol state.
+use super::{Outcome, PlayService, Session, blocks, chunks::ChunkStream, closed};
 use crate::{
     config::GameMode,
-    game::Player,
     players::PlayerControl,
     protocol::{
         invalid,
         packets::{
-            play::{GameEvent, PlayerAbilities, PlayerPosition, UpdateHealth},
+            play::{
+                CenterChunk, ChangeDifficulty, DefaultSpawnPosition, GameEvent, PlayerAbilities,
+                PlayerPosition, Respawn, UpdateHealth,
+            },
             play_blocks::{InventoryContent, SelectedSlot},
             play_chat::DeclareCommands,
         },
     },
+    world,
 };
 use std::io;
 use tokio::time::Instant;
 
-pub(crate) fn apply_control(
+pub(crate) async fn apply_control(
     session: &mut Session,
     service: &PlayService,
     players: &crate::players::Players,
@@ -28,173 +34,110 @@ pub(crate) fn apply_control(
         .as_mut()
         .ok_or_else(|| invalid("Play session not initialized"))?;
     match control {
-        PlayerControl::Teleport {
+        PlayerControl::SyncTeleport {
             position,
             yaw,
             pitch,
         } => {
-            if !Player::position_in_bounds(position) {
-                return Ok(Outcome::empty());
-            }
+            let now = Instant::now();
             let id = state.next_teleport;
             state.next_teleport = id
                 .checked_add(1)
                 .ok_or_else(|| invalid("teleport ID exhausted"))?;
-            state.pending_teleport = Some((id, Instant::now()));
-            state.player.position = position;
-            if let Some(y) = yaw {
-                state.player.yaw = y;
-            }
-            if let Some(p) = pitch {
-                state.player.pitch = p;
-            }
-            state.player.on_ground = false;
-            let old_view = state.chunks.view();
-            state.chunks.follow(position[0], position[2]);
-            let yaw = state.player.yaw;
-            let pitch = state.player.pitch;
-            if let Some(slot) = slot
-                && old_view != state.chunks.view()
-            {
-                state.update_view(slot);
-            }
-            Ok(Outcome {
-                replies: vec![PlayerPosition::at(position, yaw, pitch, id).into()],
-                close: false,
-                encryption: None,
-            })
-        }
-        PlayerControl::Give { item, count } => {
-            session.inventory.give(item, count);
-            Ok(Outcome {
-                replies: vec![InventoryContent::player(&session.inventory).into()],
-                close: false,
-                encryption: None,
-            })
-        }
-        PlayerControl::TryPickup(drop_id) => {
-            if state.player.dead || !state.player.can_interact() {
-                return Ok(Outcome::empty());
-            }
-            let player_id = state.player.entity_id;
-            if service.try_pickup_drop(players, drop_id, player_id, &mut session.inventory) {
-                Ok(Outcome {
-                    replies: vec![InventoryContent::player(&session.inventory).into()],
-                    close: false,
-                    encryption: None,
-                })
+            state.pending_teleport = Some((id, now));
+            let dest_chunk = world::chunk_at(position[0], position[2]);
+            let mut replies = Vec::new();
+            if !state.chunks.is_loaded(dest_chunk) {
+                let world = service.world().clone();
+                let (unloaded, mut chunk_packets) =
+                    state
+                        .chunks
+                        .prepare_teleport(dest_chunk, world.terrain(), now);
+                let (center, radius) = state.chunks.view();
+                if let Some(slot) = slot {
+                    slot.set_view(center, radius);
+                    if !unloaded.is_empty() {
+                        slot.retire_blocks(&unloaded);
+                        replies.extend(slot.before_unload(&unloaded));
+                    }
+                }
+                if !unloaded.is_empty() {
+                    service.dispatch_input(
+                        crate::engine::GameInput::PlayerChunksUntracked {
+                            uuid: state.uuid,
+                            chunks: unloaded,
+                        },
+                        players,
+                    )?;
+                }
+                state.blocks.prepare_chunks_async(&mut chunk_packets).await?;
+                replies.extend(chunk_packets);
             } else {
-                Ok(Outcome::empty())
-            }
-        }
-        PlayerControl::RefreshContainer(pos) => {
-            let Some(open) = state.open_container.clone() else {
-                return Ok(Outcome::empty());
-            };
-            match open.kind {
-                super::blocks::ContainerKind::Chest(cpos) if cpos == pos => {
-                    let Some(chest_items) = service.world().chest_items(pos) else {
-                        state.open_container = None;
-                        return Ok(Outcome {
-                            replies: vec![
-                                crate::protocol::packets::play_blocks::CloseContainer(
-                                    open.window_id,
-                                )
-                                .into(),
-                            ],
-                            close: false,
-                            encryption: None,
-                        });
-                    };
-                    let next_state_id = open.state_id.wrapping_add(1);
-                    state.open_container = Some(super::blocks::OpenContainer {
-                        state_id: next_state_id,
-                        ..open
-                    });
-                    let mut slots = Vec::with_capacity(crate::world::CHEST_SLOTS + 36);
-                    slots.extend_from_slice(&chest_items);
-                    slots.extend_from_slice(&session.inventory.slots()[9..45]);
-                    Ok(Outcome {
-                        replies: vec![
-                            InventoryContent::container(
-                                open.window_id,
-                                next_state_id,
-                                slots,
-                                session.inventory.carried(),
-                            )
-                            .into(),
-                        ],
-                        close: false,
-                        encryption: None,
-                    })
+                let old_view = state.chunks.view();
+                state.chunks.follow(position[0], position[2]);
+                if let Some(slot) = slot
+                    && old_view != state.chunks.view()
+                {
+                    state.update_view(slot, service, players)?;
                 }
-                super::blocks::ContainerKind::Furnace(fpos) if fpos == pos => {
-                    let Some(furnace) = service.world().furnace_data(pos) else {
-                        state.open_container = None;
-                        return Ok(Outcome {
-                            replies: vec![
-                                crate::protocol::packets::play_blocks::CloseContainer(
-                                    open.window_id,
-                                )
-                                .into(),
-                            ],
-                            close: false,
-                            encryption: None,
-                        });
-                    };
-                    let next_state_id = open.state_id.wrapping_add(1);
-                    state.open_container = Some(super::blocks::OpenContainer {
-                        state_id: next_state_id,
-                        ..open
-                    });
-                    let mut slots = Vec::with_capacity(39);
-                    slots.extend_from_slice(&furnace.slots());
-                    slots.extend_from_slice(&session.inventory.slots()[9..45]);
-                    let mut replies = vec![
-                        InventoryContent::container(
-                            open.window_id,
-                            next_state_id,
-                            slots,
-                            session.inventory.carried(),
-                        )
-                        .into(),
-                    ];
-                    replies.extend(super::blocks::furnace_property_packets(
-                        open.window_id,
-                        &furnace,
-                    ));
-                    Ok(Outcome {
-                        replies,
-                        close: false,
-                        encryption: None,
-                    })
-                }
-                _ => Ok(Outcome::empty()),
             }
+            replies.push(PlayerPosition::at(position, yaw, pitch, id).into());
+            Ok(Outcome {
+                replies,
+                close: false,
+                encryption: None,
+            })
         }
-        PlayerControl::SetGameMode(mode) => {
-            state.player.game_mode = mode;
+        PlayerControl::SyncRespawn {
+            spawn,
+            game_mode,
+            health,
+            food,
+            saturation,
+            missing_bed,
+            inventory,
+        } => {
+            let world = service.world().clone();
+            let world_spawn = world.spawn_position();
+            let is_flat = world.is_flat();
+            let view_distance = service.view_distance(session.client_information.as_ref());
+            let now = Instant::now();
+
+            let tp_id = state.next_teleport;
+            state.next_teleport = tp_id
+                .checked_add(1)
+                .ok_or_else(|| invalid("teleport ID exhausted"))?;
+            state.pending_teleport = Some((tp_id, now));
+
+            let spawn_chunk = world::chunk_at(spawn[0], spawn[2]);
+            state.chunks = ChunkStream::at(spawn_chunk, view_distance, now);
+            state.blocks = blocks::CreativeSession::new(world.clone());
+            let mut first_batch = state.chunks.pump(world.terrain(), now);
+            state.blocks.prepare_chunks_async(&mut first_batch).await?;
+
             if let Some(slot) = slot {
-                slot.update_game_mode(mode);
+                slot.set_view(spawn_chunk, view_distance);
             }
-            let mut replies = vec![
-                GameEvent::change_game_mode(mode).into(),
-                PlayerAbilities(mode).into(),
-            ];
-            if mode == GameMode::Survival {
-                replies.push(
-                    UpdateHealth::new(
-                        state.player.health,
-                        state.player.food,
-                        state.player.saturation,
-                    )
-                    .into(),
-                );
+            let mut replies = Vec::new();
+            if missing_bed {
+                replies.push(GameEvent::no_respawn_block_available().into());
             }
-            if mode != GameMode::Spectator {
-                replies.push(InventoryContent::player(&session.inventory).into());
-                replies.push(SelectedSlot(session.inventory.selected()).into());
+            replies.extend([
+                Respawn { game_mode, is_flat }.into(),
+                DefaultSpawnPosition::from_spawn(world_spawn).into(),
+                ChangeDifficulty::normal().into(),
+                PlayerAbilities(game_mode).into(),
+                UpdateHealth::new(health, food, saturation).into(),
+                CenterChunk(spawn_chunk).into(),
+                GameEvent::level_chunks_load_start().into(),
+            ]);
+            if game_mode != GameMode::Spectator {
+                replies.push(InventoryContent::player(&inventory).into());
+                replies.push(SelectedSlot(inventory.selected()).into());
             }
+            replies.extend(first_batch);
+            replies.extend(service.existing_drop_packets_async().await);
+            replies.push(PlayerPosition::at(spawn, 0.0, 0.0, tp_id).into());
             Ok(Outcome {
                 replies,
                 close: false,
@@ -202,9 +145,13 @@ pub(crate) fn apply_control(
             })
         }
         PlayerControl::RefreshCommands => {
+            let profile = session
+                .profile
+                .as_ref()
+                .ok_or_else(|| invalid("missing authenticated identity"))?;
             let source = crate::command::CommandSource {
-                permission: service.permission_for(state.player.uuid, &state.player.name),
-                ..crate::command::CommandSource::player(state.player.uuid)
+                permission: service.permission_for(profile.uuid, &profile.name),
+                ..crate::command::CommandSource::player(profile.uuid)
             };
             Ok(Outcome {
                 replies: vec![DeclareCommands::new(service.commands(), &source).into()],

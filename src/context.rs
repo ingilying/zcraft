@@ -17,12 +17,16 @@ impl ServerContext {
             configuration = configuration.with_resource_pack(pack.clone())?;
         }
         let world = if let Some(dir) = &config.world_dir {
-            std::sync::Arc::new(crate::world::World::open_with(
-                dir,
-                config.world_type,
-                config.seed,
-                config.flat.clone(),
-            )?)
+            let dir = dir.clone();
+            let world_type = config.world_type;
+            let seed = config.seed;
+            let flat = config.flat.clone();
+            let opened = tokio::task::spawn_blocking(move || {
+                crate::world::World::open_with(&dir, world_type, seed, flat)
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            std::sync::Arc::new(opened)
         } else {
             match config.world_type {
                 crate::config::WorldType::Overworld => {
@@ -57,16 +61,12 @@ impl ServerContext {
         })
     }
 
-    /// Advance all server-side gameplay systems by one 20 TPS tick (world clock,
-    /// weather, item drops, furnaces, block/fluid physics).
+    /// Advance all server-side gameplay systems by one 20 TPS tick via the ECS engine
+    /// (world clock, weather, player vitals/eating, item drops, furnaces, block/fluid physics).
     pub fn tick(&self) {
-        let players = self.players();
-        for packet in self.play.tick_world() {
-            let _ = players.broadcast(&packet);
+        if let Err(error) = self.play.tick_engine(self.players()) {
+            tracing::warn!(%error, "failed to sync ECS game tick outputs");
         }
-        self.play.tick_drops(players);
-        self.play.tick_furnaces(players);
-        self.play.tick_physics(players);
     }
 
     /// Execute a trusted server command without a player connection. Permission
@@ -193,14 +193,19 @@ impl<H: crate::command::CommandHost> crate::command::AdminCommandHost for Server
         yaw: Option<f32>,
         pitch: Option<f32>,
     ) -> std::io::Result<bool> {
-        Ok(self.server.players().send_control(
-            uuid,
-            crate::players::PlayerControl::Teleport {
+        if self.server.play.player_snapshot(uuid).is_none() {
+            return Ok(false);
+        }
+        self.server.play.dispatch_input(
+            crate::engine::GameInput::ControlTeleport {
+                uuid,
                 position,
                 yaw,
                 pitch,
             },
-        ))
+            self.server.players(),
+        )?;
+        Ok(true)
     }
     fn give_item(
         &mut self,
@@ -208,20 +213,28 @@ impl<H: crate::command::CommandHost> crate::command::AdminCommandHost for Server
         item: crate::game::Item,
         count: u32,
     ) -> std::io::Result<bool> {
-        Ok(self
-            .server
-            .players()
-            .send_control(uuid, crate::players::PlayerControl::Give { item, count }))
+        if self.server.play.player_snapshot(uuid).is_none() {
+            return Ok(false);
+        }
+        self.server.play.dispatch_input(
+            crate::engine::GameInput::ControlGive { uuid, item, count },
+            self.server.players(),
+        )?;
+        Ok(true)
     }
     fn set_game_mode(
         &mut self,
         uuid: uuid::Uuid,
         mode: crate::config::GameMode,
     ) -> std::io::Result<bool> {
-        Ok(self
-            .server
-            .players()
-            .send_control(uuid, crate::players::PlayerControl::SetGameMode(mode)))
+        if self.server.play.player_snapshot(uuid).is_none() {
+            return Ok(false);
+        }
+        self.server.play.dispatch_input(
+            crate::engine::GameInput::ControlSetGameMode { uuid, mode },
+            self.server.players(),
+        )?;
+        Ok(true)
     }
     fn set_op(&mut self, target: &str, op: bool) -> std::io::Result<crate::command::CommandResult> {
         let online = self.server.players().find_player_by_name(target);

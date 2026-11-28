@@ -79,17 +79,76 @@ impl ChunkStream {
         (self.center, self.radius)
     }
 
+    pub(super) fn is_loaded(&self, chunk: Chunk) -> bool {
+        self.loaded.contains(&chunk) && !self.retiring.contains(&chunk)
+    }
+
+    /// Immediately shift the chunk stream to a distant teleport destination:
+    /// emits `ForgetChunk` for chunks outside the new view, updates `CenterChunk`,
+    /// and pumps the nearest destination chunk batch so the client and server
+    /// cache both have terrain ready before `PlayerPosition` arrives.
+    pub(super) fn prepare_teleport(
+        &mut self,
+        dest: Chunk,
+        terrain: &Arc<[u8]>,
+        now: Instant,
+    ) -> (std::collections::HashSet<Chunk>, Vec<Clientbound>) {
+        self.center = dest;
+        self.advertised_center = dest;
+        let [cx, cz] = dest;
+        let limit = self.stream_radius();
+        let unloaded: std::collections::HashSet<Chunk> = self
+            .loaded
+            .iter()
+            .copied()
+            .filter(|&[x, z]| (x - cx).abs().max((z - cz).abs()) > limit)
+            .collect();
+        self.retiring.clear();
+        self.unload_remaining = false;
+        self.next = now + STREAM_INTERVAL;
+
+        let mut packets = Vec::new();
+        for &c in &unloaded {
+            packets.push(ForgetChunk(c).into());
+        }
+        packets.push(CenterChunk(dest).into());
+
+        let mut missing = Vec::new();
+        for x in cx - limit..=cx + limit {
+            for z in cz - limit..=cz + limit {
+                if !self.loaded.contains(&[x, z]) || unloaded.contains(&[x, z]) {
+                    missing.push([x, z]);
+                }
+            }
+        }
+        if !missing.is_empty() && self.can_send_batch() {
+            missing.sort_unstable_by_key(|&[x, z]| {
+                let (dx, dz) = ((x - cx).abs(), (z - cz).abs());
+                (dx.max(dz), dx * dx + dz * dz, x, z)
+            });
+            let count = missing.len().min(self.batch_size.max(INITIAL_BATCH));
+            self.writing = true;
+            packets.push(ChunkBatchStart.into());
+            packets.extend(
+                missing
+                    .into_iter()
+                    .take(count)
+                    .map(|c| ChunkData(c, terrain.clone()).into()),
+            );
+            packets.push(
+                ChunkBatchFinished {
+                    count: count as i32,
+                }
+                .into(),
+            );
+        }
+        (unloaded, packets)
+    }
+
     /// Vanilla clients require a 1-chunk neighbor border around `view_distance`
     /// before meshing and rendering the outermost visible chunks.
     fn stream_radius(&self) -> i32 {
         self.radius + 1
-    }
-
-    pub(super) fn tracks(&self, [x, z]: Chunk) -> bool {
-        let [cx, cz] = self.center;
-        (x - cx).abs().max((z - cz).abs()) <= self.stream_radius()
-            && self.loaded.contains(&[x, z])
-            && !self.retiring.contains(&[x, z])
     }
 
     pub(super) fn retire_outside(&mut self) -> std::collections::HashSet<Chunk> {

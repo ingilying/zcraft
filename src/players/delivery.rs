@@ -14,20 +14,22 @@ pub(crate) struct Peer {
     pub info: Arc<[u8]>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) enum PlayerControl {
-    Teleport {
+    SyncTeleport {
         position: [f64; 3],
-        yaw: Option<f32>,
-        pitch: Option<f32>,
+        yaw: f32,
+        pitch: f32,
     },
-    Give {
-        item: crate::game::Item,
-        count: u32,
+    SyncRespawn {
+        spawn: [f64; 3],
+        game_mode: crate::config::GameMode,
+        health: f32,
+        food: i32,
+        saturation: f32,
+        missing_bed: bool,
+        inventory: crate::game::Inventory,
     },
-    TryPickup(i32),
-    RefreshContainer(crate::world::BlockPos),
-    SetGameMode(crate::config::GameMode),
     RefreshCommands,
     Kick(String),
 }

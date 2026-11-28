@@ -14,7 +14,7 @@ pub const PLAYER_HEIGHT: f64 = 1.8;
 pub const SURVIVAL_BLOCK_REACH: f64 = 5.5;
 pub const CREATIVE_BLOCK_REACH: f64 = 6.0;
 /// Vanilla `LivingEntity.invulnerableDuration / 2` = 10 ticks (500 ms at 20 TPS).
-pub const HURT_INVULNERABILITY: std::time::Duration = std::time::Duration::from_millis(500);
+pub const HURT_INVULNERABILITY_TICKS: u64 = 10;
 
 #[derive(Debug, Clone)]
 pub struct Player {
@@ -33,10 +33,11 @@ pub struct Player {
     pub saturation: f32,
     pub exhaustion: f32,
     pub food_tick_timer: u16,
-    pub eating: Option<(super::Hand, super::Item, tokio::time::Instant, u16)>,
+    /// Active eating state: `(hand, item, start_tick, required_eat_ticks)`.
+    pub eating: Option<(super::Hand, super::Item, u64, u16)>,
     pub fall_distance: f64,
     pub dead: bool,
-    pub last_hurt_at: Option<tokio::time::Instant>,
+    pub last_hurt_tick: Option<u64>,
     pub respawn_point: Option<BlockPos>,
 }
 
@@ -61,7 +62,7 @@ impl Player {
             eating: None,
             fall_distance: 0.0,
             dead: false,
-            last_hurt_at: None,
+            last_hurt_tick: None,
             respawn_point: None,
         }
     }
@@ -86,16 +87,16 @@ impl Player {
         }
     }
 
-    /// Apply damage in Survival mode respecting the 10-tick (500ms) hurt invulnerability
-    /// window. Returns `true` if health decreased.
-    pub fn apply_damage_at(&mut self, amount: f32, now: tokio::time::Instant) -> bool {
-        if let Some(last) = self.last_hurt_at
-            && now.duration_since(last) < HURT_INVULNERABILITY
+    /// Apply damage in Survival mode respecting the 10-tick (500ms at 20 TPS)
+    /// hurt invulnerability window. Returns `true` if health decreased.
+    pub fn apply_damage_at_tick(&mut self, amount: f32, tick: u64) -> bool {
+        if let Some(last) = self.last_hurt_tick
+            && tick.saturating_sub(last) < HURT_INVULNERABILITY_TICKS
         {
             return false;
         }
         if self.apply_damage(amount) {
-            self.last_hurt_at = Some(now);
+            self.last_hurt_tick = Some(tick);
             true
         } else {
             false
@@ -130,7 +131,7 @@ impl Player {
         self.eating = None;
         self.fall_distance = 0.0;
         self.dead = false;
-        self.last_hurt_at = None;
+        self.last_hurt_tick = None;
     }
 
     /// Accumulate vanilla `FoodData` exhaustion (clamped at 40.0).

@@ -134,7 +134,22 @@ pub async fn handle_reconfiguration_acknowledged(
     {
         return Err(invalid("unsolicited reconfiguration acknowledgement"));
     }
-    ctx.session.play = None;
+    if let Some(play) = ctx.session.play.take() {
+        if let Some(inv) = ctx.server.play.player_inventory_async(play.uuid).await {
+            ctx.session.inventory = inv;
+        }
+        let _ = ctx
+            .server
+            .play
+            .submit_input_async(
+                crate::engine::GameInput::PlayerLeave {
+                    uuid: play.uuid,
+                    persist: false,
+                },
+                ctx.server.players(),
+            )
+            .await;
+    }
     ctx.session.state = State::Configuration;
     ctx.session.configuration = ConfigurationPhase::NotStarted;
     begin(ctx)
@@ -376,5 +391,5 @@ pub async fn handle_finish(
     ctx.session.configuration = ConfigurationPhase::Finished;
     ctx.session.configuration_runtime = None;
     ctx.session.state = State::Play;
-    super::play::begin(ctx)
+    super::play::begin_async(ctx).await
 }

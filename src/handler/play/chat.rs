@@ -136,12 +136,10 @@ pub(crate) async fn handle_signed_command(
 
 fn player_stack(ctx: &Context<'_>) -> Option<SourceStack> {
     let play = ctx.session.play.as_ref()?;
+    let snap = ctx.server.play.player_snapshot(play.uuid)?;
     let source = CommandSource {
-        permission: ctx
-            .server
-            .play
-            .permission_for(play.player.uuid, &play.player.name),
-        ..CommandSource::player(play.player.uuid)
+        permission: ctx.server.play.permission_for(snap.uuid, &snap.name),
+        ..CommandSource::player(snap.uuid)
     };
     SourceStack::new(source)
         .positioned(
@@ -149,13 +147,13 @@ fn player_stack(ctx: &Context<'_>) -> Option<SourceStack> {
                 id: "minecraft:overworld".into(),
                 coordinate_scale: 1.0,
             },
-            play.player.position,
+            snap.position,
         )
         .ok()?
-        .with_rotation([play.player.yaw, play.player.pitch])
+        .with_rotation([snap.yaw, snap.pitch])
         .ok()?
         .with_entity(Some(ExecutingEntity {
-            uuid: play.player.uuid,
+            uuid: snap.uuid,
             eye_height: crate::game::PLAYER_EYE_HEIGHT,
         }))
         .ok()

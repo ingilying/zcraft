@@ -1,9 +1,12 @@
-//! Minimal flat world with spectator and server-authoritative creative modes.
+//! Play-phase protocol IO adapter: manages connection-scoped protocol concerns
+//! (keep-alive, teleport ID tracking, chunk streaming) and forwards all gameplay
+//! actions to the decoupled `bevy_ecs` `GameEngine`.
 pub(crate) mod blocks;
 pub(crate) mod chat;
 mod chunks;
 mod control;
 mod service;
+pub(crate) mod sync;
 
 use self::chunks::ChunkStream;
 pub(crate) use self::control::apply_control;
@@ -11,6 +14,7 @@ pub use self::service::PlayService;
 use super::{Context, Outcome, Session};
 use crate::{
     config::GameMode,
+    engine::GameInput,
     players::Peer,
     protocol::{
         Clientbound, invalid,
@@ -25,23 +29,56 @@ use crate::{
 };
 use std::{io, sync::Arc, time::Duration};
 use tokio::time::Instant;
+use uuid::Uuid;
 
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 const TELEPORT_TIMEOUT: Duration = Duration::from_secs(15);
+const GAMEPLAY_RATE_BURST: f64 = 128.0;
+const GAMEPLAY_RATE_PER_SEC: f64 = 100.0;
 
+/// Per-connection token bucket preventing a single noisy/malicious client from
+/// saturating the shared `GAME_INPUT_QUEUE_CAPACITY` channel and impacting other players.
+#[derive(Debug)]
+struct GameplayRate {
+    tokens: f64,
+    last: Instant,
+}
+
+impl GameplayRate {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: GAMEPLAY_RATE_BURST,
+            last: now,
+        }
+    }
+
+    fn allow(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * GAMEPLAY_RATE_PER_SEC).min(GAMEPLAY_RATE_BURST);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Protocol/transport-only Play session state. Authoritative gameplay state
+/// (player physics, vitals, inventory, containers, mining) lives in `crate::engine`.
 #[derive(Debug)]
 pub struct PlaySession {
-    pub player: crate::game::Player,
+    pub uuid: Uuid,
+    pub entity_id: i32,
     pending_teleport: Option<(i32, Instant)>,
     next_teleport: i32,
     pending_keep_alive: Option<(i64, Instant)>,
     next_keep_alive: Instant,
-    last_food_tick: Instant,
     chunks: ChunkStream,
     blocks: blocks::CreativeSession,
-    open_container: Option<blocks::OpenContainer>,
-    next_window_id: u8,
+    gameplay_rate: GameplayRate,
 }
 
 pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
@@ -50,6 +87,105 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         .profile
         .clone()
         .ok_or_else(|| invalid("missing authenticated identity"))?;
+    // Fail-closed on corrupt/unreadable playerdata so we never overwrite a
+    // player's existing save with default spawn/inventory state on disconnect.
+    let saved = ctx.server.play.load_player(profile.uuid).map_err(|error| {
+        tracing::error!(uuid = %profile.uuid, %error, "failed to load playerdata; rejecting login to prevent overwrite");
+        error
+    })?;
+    let now = Instant::now();
+    let world = ctx.server.play.world().clone();
+    let view_distance = ctx
+        .server
+        .play
+        .view_distance(ctx.session.client_information.as_ref());
+    let position = saved
+        .as_ref()
+        .map_or_else(|| world.spawn_position(), |s| s.position);
+    let spawn_chunk = world::chunk_at(position[0], position[2]);
+    let mut chunks = ChunkStream::at(spawn_chunk, view_distance, now);
+    let mut first_batch = chunks.pump(world.terrain(), now);
+    let mut blocks = blocks::CreativeSession::new(world);
+    blocks.prepare_chunks(&mut first_batch);
+    let (join_input, reply_ctx) =
+        prepare_begin(ctx, profile, saved, now, view_distance, chunks, blocks)?;
+    ctx.server
+        .play
+        .submit_input_sync(join_input, ctx.server.players())?;
+    let drops = ctx.server.play.existing_drop_packets();
+    Ok(build_begin_outcome(ctx, reply_ctx, first_batch, drops))
+}
+
+/// Async Play entry used by the network runtime: offloads playerdata disk reads
+/// and initial chunk generation/lighting/encoding onto Tokio's blocking pool, and
+/// uses non-blocking `oneshot` barriers/queries against the dedicated game loop.
+pub(crate) async fn begin_async(ctx: &mut Context<'_>) -> io::Result<Outcome> {
+    let profile = ctx
+        .session
+        .profile
+        .clone()
+        .ok_or_else(|| invalid("missing authenticated identity"))?;
+    // Ensure any recent PlayerLeave persistence for a rapid reconnect is flushed first.
+    ctx.server.play.flush_player_saves_async().await;
+    let world = ctx.server.play.world().clone();
+    let uuid = profile.uuid;
+    let load_world = world.clone();
+    let saved = tokio::task::spawn_blocking(move || load_world.load_player(uuid))
+        .await
+        .map_err(io::Error::other)?
+        .map_err(|error| {
+            tracing::error!(%uuid, %error, "failed to load playerdata; rejecting login to prevent overwrite");
+            error
+        })?;
+    let now = Instant::now();
+    let view_distance = ctx
+        .server
+        .play
+        .view_distance(ctx.session.client_information.as_ref());
+    let position = saved
+        .as_ref()
+        .map_or_else(|| world.spawn_position(), |s| s.position);
+    let spawn_chunk = world::chunk_at(position[0], position[2]);
+    let mut chunks = ChunkStream::at(spawn_chunk, view_distance, now);
+    let mut first_batch = chunks.pump(world.terrain(), now);
+    let mut blocks = blocks::CreativeSession::new(world);
+    blocks.prepare_chunks_async(&mut first_batch).await?;
+    let (join_input, reply_ctx) =
+        prepare_begin(ctx, profile, saved, now, view_distance, chunks, blocks)?;
+    ctx.server
+        .play
+        .submit_input_async(join_input, ctx.server.players())
+        .await?;
+    let drops = ctx.server.play.existing_drop_packets_async().await;
+    Ok(build_begin_outcome(ctx, reply_ctx, first_batch, drops))
+}
+
+struct BeginReplyContext {
+    profile: crate::identity::Profile,
+    entity_id: i32,
+    view_distance: i32,
+    position: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    game_mode: GameMode,
+    health: f32,
+    food: i32,
+    saturation: f32,
+    spawn_chunk: [i32; 2],
+    command_source: crate::command::CommandSource,
+    inventory_snapshot: crate::game::Inventory,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_begin(
+    ctx: &mut Context<'_>,
+    profile: crate::identity::Profile,
+    saved: Option<world::SavedPlayer>,
+    now: Instant,
+    view_distance: i32,
+    chunks: ChunkStream,
+    blocks: blocks::CreativeSession,
+) -> io::Result<(GameInput, BeginReplyContext)> {
     let entity_id = if let Some(id) = ctx.session.entity_id {
         id
     } else {
@@ -57,18 +193,7 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         ctx.session.entity_id = Some(id);
         id
     };
-    let now = Instant::now();
-    let view_distance = ctx
-        .server
-        .play
-        .view_distance(ctx.session.client_information.as_ref());
     let world = ctx.server.play.world();
-    // Fail-closed on corrupt/unreadable playerdata so we never overwrite a
-    // player's existing save with default spawn/inventory state on disconnect.
-    let saved = ctx.server.play.load_player(profile.uuid).map_err(|error| {
-        tracing::error!(uuid = %profile.uuid, %error, "failed to load playerdata; rejecting login to prevent overwrite");
-        error
-    })?;
     let (position, yaw, pitch, on_ground, game_mode, health, food, saturation, respawn_point) =
         if let Some(saved) = saved {
             ctx.session.inventory = saved.inventory;
@@ -97,13 +222,9 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
             )
         };
     let spawn_chunk = world::chunk_at(position[0], position[2]);
-    let mut chunks = ChunkStream::at(spawn_chunk, view_distance, now);
     if let Some(slot) = &ctx.session.reservation {
         slot.set_view(spawn_chunk, view_distance);
     }
-    let mut first_batch = chunks.pump(world.terrain(), now);
-    let mut blocks = blocks::CreativeSession::new(world.clone());
-    blocks.prepare_chunks(&mut first_batch);
     let command_source = crate::command::CommandSource {
         permission: ctx.server.play.permission_for(profile.uuid, &profile.name),
         ..crate::command::CommandSource::player(profile.uuid)
@@ -119,17 +240,23 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
     player.saturation = saturation;
     player.respawn_point = respawn_point;
     player.dead = health <= 0.0;
+
+    let inventory_snapshot = ctx.session.inventory.clone();
+    let join_input = GameInput::PlayerJoin {
+        player: Box::new(player),
+        inventory: Box::new(inventory_snapshot.clone()),
+    };
+
     ctx.session.play = Some(PlaySession {
-        player,
+        uuid: profile.uuid,
+        entity_id,
         pending_teleport: Some((0, now)),
         next_teleport: 1,
         pending_keep_alive: None,
         next_keep_alive: now + KEEP_ALIVE_INTERVAL,
-        last_food_tick: now,
         chunks,
         blocks,
-        open_container: None,
-        next_window_id: 1,
+        gameplay_rate: GameplayRate::new(now),
     });
     tracing::info!(
         player = %profile.name,
@@ -137,98 +264,120 @@ pub fn begin(ctx: &mut Context<'_>) -> io::Result<Outcome> {
         game_mode = ?game_mode,
         "joined the game"
     );
+    Ok((
+        join_input,
+        BeginReplyContext {
+            profile,
+            entity_id,
+            view_distance,
+            position,
+            yaw,
+            pitch,
+            game_mode,
+            health,
+            food,
+            saturation,
+            spawn_chunk,
+            command_source,
+            inventory_snapshot,
+        },
+    ))
+}
+
+fn build_begin_outcome(
+    ctx: &Context<'_>,
+    info: BeginReplyContext,
+    first_batch: Vec<Clientbound>,
+    existing_drops: Vec<Clientbound>,
+) -> Outcome {
+    let world = ctx.server.play.world();
     let is_flat = world.is_flat();
     let max_players = ctx.server.players().max_players() as i32;
     let mut replies = vec![
         JoinGame {
-            entity_id,
+            entity_id: info.entity_id,
             max_players,
-            view_distance,
-            simulation_distance: view_distance,
-            game_mode,
+            view_distance: info.view_distance,
+            simulation_distance: info.view_distance,
+            game_mode: info.game_mode,
             is_flat,
         }
         .into(),
         ChangeDifficulty::normal().into(),
-        PlayerInfo { profile, game_mode }.into(),
-        PlayerAbilities(game_mode).into(),
+        PlayerInfo {
+            profile: info.profile,
+            game_mode: info.game_mode,
+        }
+        .into(),
+        PlayerAbilities(info.game_mode).into(),
         DefaultSpawnPosition::from_spawn(world.spawn_position()).into(),
     ];
     replies.extend(ctx.server.play.initial_environment_packets());
     replies.extend([
         WorldBorder.into(),
-        CenterChunk(spawn_chunk).into(),
+        CenterChunk(info.spawn_chunk).into(),
         GameEvent::level_chunks_load_start().into(),
-        DeclareCommands::new(ctx.server.play.commands(), &command_source).into(),
+        DeclareCommands::new(ctx.server.play.commands(), &info.command_source).into(),
     ]);
-    if game_mode == GameMode::Survival {
-        replies.push(UpdateHealth::new(health, food, saturation).into());
+    if info.game_mode == GameMode::Survival {
+        replies.push(UpdateHealth::new(info.health, info.food, info.saturation).into());
     }
-    if game_mode != GameMode::Spectator {
+    if info.game_mode != GameMode::Spectator {
         replies.extend([
-            Clientbound::from(InventoryContent::player(&ctx.session.inventory)),
-            SelectedSlot(ctx.session.inventory.selected()).into(),
+            Clientbound::from(InventoryContent::player(&info.inventory_snapshot)),
+            SelectedSlot(info.inventory_snapshot.selected()).into(),
         ]);
     }
     replies.extend(first_batch);
-    replies.extend(ctx.server.play.existing_drop_packets());
+    replies.extend(existing_drops);
     // The nearest chunks (including spawn) precede the initial teleport.
     // The rest of the view streams independently of teleport confirmation.
-    replies.push(PlayerPosition::at(position, yaw, pitch, 0).into());
-    Ok(Outcome {
+    replies.push(PlayerPosition::at(info.position, info.yaw, info.pitch, 0).into());
+    Outcome {
         replies,
         close: false,
         encryption: None,
-    })
+    }
 }
 
-/// Best-effort persistence of a player's state and inventory when leaving Play,
-/// returning any carried cursor or crafting grid items and updating container viewers.
+/// Persist and despawn a player's ECS entity when leaving Play.
 pub(crate) fn save_session(
     session: &mut Session,
     play: &PlayService,
     players: &crate::players::Players,
 ) {
-    let Some(play_session) = &mut session.play else {
+    let Some(play_session) = session.play.take() else {
         return;
     };
-    let uuid = play_session.player.uuid;
-    let pos = play_session.player.position;
-    let mut returned = Vec::new();
-    if let Some(carried) = session.inventory.take_carried() {
-        returned.push(carried);
-    }
-    returned.extend(session.inventory.drain_crafting_grid());
-    if let Some(open) = play_session.open_container.take()
-        && let blocks::ContainerKind::CraftingTable { grid, .. } = open.kind
-    {
-        returned.extend(grid.into_iter().flatten());
-    }
-    for mut stack in returned {
-        let added = session.inventory.give_stack(stack);
-        if added < stack.count {
-            stack.count -= added;
-            let _ = play.spawn_item_drop_scatter(players, pos, stack, 40);
-        }
-    }
-    // Remove player from any open chest/furnace viewer sets and broadcast updated lid counts.
-    for (container_pos, count) in play.remove_player_from_chests(uuid) {
-        if play.world().chest_items(container_pos).is_some() {
-            let _ = blocks::broadcast_chest_lid_count(players, container_pos, count);
-        }
-    }
-    tracing::info!(
-        player = %play_session.player.name,
-        uuid = %uuid,
-        "left the game"
+    let _ = play.submit_input_sync(
+        GameInput::PlayerLeave {
+            uuid: play_session.uuid,
+            persist: true,
+        },
+        players,
     );
-    if let Err(error) = play.save_player(&play_session.player, &session.inventory) {
-        tracing::warn!(
-            uuid = %uuid,
-            %error,
-            "failed to save playerdata"
-        );
-    }
+}
+
+/// Async counterpart of `save_session` for normal connection teardown: uses the
+/// non-blocking `oneshot` FIFO barrier while persistence runs on the dedicated
+/// player-save worker. Idempotent with `Drop::drop`.
+pub(crate) async fn save_session_async(
+    session: &mut Session,
+    server: &Arc<crate::context::ServerContext>,
+) {
+    let Some(play_session) = session.play.take() else {
+        return;
+    };
+    let _ = server
+        .play
+        .submit_input_async(
+            GameInput::PlayerLeave {
+                uuid: play_session.uuid,
+                persist: true,
+            },
+            server.players(),
+        )
+        .await;
 }
 
 fn play(session: &mut Session) -> io::Result<&mut PlaySession> {
@@ -238,27 +387,48 @@ fn play(session: &mut Session) -> io::Result<&mut PlaySession> {
         .ok_or_else(|| invalid("Play session not initialized"))
 }
 
+pub(super) fn check_gameplay_rate(session: &mut Session) -> io::Result<Uuid> {
+    let state = play(session)?;
+    if !state.gameplay_rate.allow(Instant::now()) {
+        return Err(invalid("gameplay packet rate limit exceeded"));
+    }
+    Ok(state.uuid)
+}
+
 /// The network reports completed writes; response deadlines start when the
 /// request actually leaves the output batch, not when that batch was built.
-pub fn packet_sent(session: &mut Session, packet: &Clientbound, now: Instant) -> io::Result<()> {
+pub fn packet_sent(
+    session: &mut Session,
+    play_service: &PlayService,
+    players: &crate::players::Players,
+    packet: &Clientbound,
+    now: Instant,
+) -> io::Result<()> {
     let Some(state) = session.play.as_mut() else {
         return Ok(());
     };
     state.chunks.packet_sent(packet, now);
-    if let Clientbound::ChunkData(chunk) = packet
-        && let Some(slot) = &session.reservation
-    {
-        slot.chunk_sent(chunk.0);
-        state.blocks.chunk_sent(slot, chunk.0)?;
+    if let Clientbound::ChunkData(chunk) = packet {
+        if let Some(slot) = &session.reservation {
+            slot.chunk_sent(chunk.0);
+            state.blocks.chunk_sent(slot, chunk.0)?;
+        }
+        let _ = play_service.dispatch_input(
+            GameInput::PlayerChunkTracked {
+                uuid: state.uuid,
+                chunk: chunk.0,
+            },
+            players,
+        );
     }
     match packet {
-        crate::protocol::Clientbound::PlayerPosition(packet) => {
+        Clientbound::PlayerPosition(packet) => {
             if state.pending_teleport.map(|(id, _)| id) == Some(packet.teleport_id) {
                 state.pending_teleport = Some((packet.teleport_id, now));
                 state.next_keep_alive = now + KEEP_ALIVE_INTERVAL;
             }
         }
-        crate::protocol::Clientbound::KeepAlive(packet)
+        Clientbound::KeepAlive(packet)
             if state.pending_keep_alive.map(|(id, _)| id) == Some(packet.id) =>
         {
             state.pending_keep_alive = Some((packet.id, now));
@@ -281,8 +451,8 @@ fn closed(reason: &str) -> Outcome {
     }
 }
 
-/// Called by the connection timer, not by a packet handler. An idle Play connection
-/// is kept alive without imposing the old 30-second login lifetime on the world.
+/// Connection protocol heartbeat & timeout check (KeepAlive, teleport deadline,
+/// chunk-batch feedback deadline). All gameplay ticking runs in the ECS Game Loop.
 pub fn tick(session: &mut Session, now: Instant) -> io::Result<Outcome> {
     let state = session
         .play
@@ -309,57 +479,6 @@ pub fn tick(session: &mut Session, now: Instant) -> io::Result<Outcome> {
         state.pending_keep_alive = Some((id, now));
         replies.push(KeepAlive { id }.into());
     }
-
-    // Complete continuous item use via unified `ItemBehavior::on_finish_use`.
-    let mut inv_changed = false;
-    let mut health_changed = false;
-    if let Some((hand, item_id, started, eat_ticks)) = state.player.eating {
-        let required = Duration::from_millis(u64::from(eat_ticks) * 50);
-        if now.duration_since(started) >= required {
-            state.player.eating = None;
-            if let Some(stack) = session.inventory.hand(hand)
-                && stack.item == item_id
-                && crate::game::item_behavior(item_id).on_finish_use(&mut state.player, stack)
-            {
-                let _ = session.inventory.drop_hand(hand, false);
-                if let Some(remainder) = crate::game::container_remainder(item_id) {
-                    session.inventory.give_stack(remainder);
-                }
-                inv_changed = true;
-                health_changed = true;
-            }
-        }
-    }
-
-    // Advance vanilla FoodData (exhaustion, natural regeneration, starvation) at 20 TPS.
-    let elapsed_ms = now.duration_since(state.last_food_tick).as_millis() as u64;
-    let elapsed_ticks = (elapsed_ms / 50).min(100) as u16;
-    if elapsed_ticks > 0 {
-        state.last_food_tick += Duration::from_millis(u64::from(elapsed_ticks) * 50);
-        let (changed, starved) = state.player.tick_food(elapsed_ticks);
-        health_changed |= changed;
-        if starved {
-            let hurt = Clientbound::from(HurtAnimation::new(state.player.entity_id, 0.0));
-            if let Some(slot) = &session.reservation {
-                let _ = slot.broadcast_to_viewers(&hurt);
-            }
-            replies.push(hurt);
-        }
-    }
-
-    if health_changed {
-        replies.push(
-            UpdateHealth::new(
-                state.player.health,
-                state.player.food,
-                state.player.saturation,
-            )
-            .into(),
-        );
-    }
-    if inv_changed {
-        replies.push(InventoryContent::player(&session.inventory).into());
-    }
     Ok(Outcome {
         replies,
         close: false,
@@ -376,9 +495,18 @@ pub async fn handle_teleport(
         return Err(invalid("unexpected teleport confirmation"));
     }
     state.pending_teleport = None;
-    let entity_id = state.player.entity_id;
-    let game_mode = state.player.game_mode;
-    let pose = state.player.pose();
+    let uuid = state.uuid;
+    let entity_id = state.entity_id;
+
+    // Notify ECS that teleport is confirmed so movement & block interactions unlock.
+    ctx.server
+        .play
+        .submit_input_async(
+            GameInput::PlayerTeleportConfirmed { uuid },
+            ctx.server.players(),
+        )
+        .await?;
+
     // ID 0 is reserved for initial world entry; subsequent teleports start at 1.
     if packet.id == 0 {
         let profile = ctx
@@ -386,6 +514,12 @@ pub async fn handle_teleport(
             .profile
             .as_ref()
             .ok_or_else(|| invalid("missing authenticated identity"))?;
+        let snap = ctx
+            .server
+            .play
+            .player_snapshot_async(uuid)
+            .await
+            .ok_or_else(|| invalid("player entity missing"))?;
         tracing::info!(
             player = %profile.name,
             uuid = %profile.uuid,
@@ -405,21 +539,20 @@ pub async fn handle_teleport(
                 uuid: profile.uuid,
                 name: Arc::from(profile.name.as_str()),
                 id: entity_id,
-                game_mode,
-                pose,
+                game_mode: snap.game_mode,
+                pose: snap.pose,
                 info: Clientbound::from(PlayerInfo {
                     profile: profile.clone(),
-                    game_mode,
+                    game_mode: snap.game_mode,
                 })
                 .encode()?
                 .into(),
             });
         }
-    } else if let Some(slot) = &ctx.session.reservation {
-        slot.update_pose(pose);
     }
     Ok(Outcome::empty())
 }
+
 pub async fn handle_keep_alive(
     ctx: &mut Context<'_>,
     packet: KeepAliveResponse,
@@ -432,11 +565,28 @@ pub async fn handle_keep_alive(
     state.next_keep_alive = Instant::now() + KEEP_ALIVE_INTERVAL;
     Ok(Outcome::empty())
 }
+
 impl PlaySession {
-    fn update_view(&mut self, slot: &crate::players::Reservation) {
+    fn update_view(
+        &mut self,
+        slot: &crate::players::Reservation,
+        service: &PlayService,
+        players: &crate::players::Players,
+    ) -> io::Result<()> {
         let (center, radius) = self.chunks.view();
         slot.set_view(center, radius);
-        slot.retire_blocks(&self.chunks.retire_outside());
+        let retired = self.chunks.retire_outside();
+        if !retired.is_empty() {
+            slot.retire_blocks(&retired);
+            service.dispatch_input(
+                GameInput::PlayerChunksUntracked {
+                    uuid: self.uuid,
+                    chunks: retired,
+                },
+                players,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -452,151 +602,36 @@ fn movement(
         .play
         .as_mut()
         .ok_or_else(|| invalid("Play session not initialized"))?;
-    let old_view = state.chunks.view();
+    if !state.gameplay_rate.allow(Instant::now()) {
+        return Err(invalid("gameplay packet rate limit exceeded"));
+    }
     if state.pending_teleport.is_some() {
         return Ok(Outcome::empty());
     }
-    let [old_x, old_y, old_z] = state.player.position;
-    let was_on_ground = state.player.on_ground;
-    if let Some([x, y, z]) = position {
-        if !crate::game::Player::position_in_bounds([x, y, z]) {
-            let spawn = ctx.server.play.world().spawn_position();
-            let id = state.next_teleport;
-            state.next_teleport = id
-                .checked_add(1)
-                .ok_or_else(|| invalid("teleport ID exhausted"))?;
-            state.pending_teleport = Some((id, Instant::now()));
-            state.player.position = spawn;
-            state.player.yaw = 0.0;
-            state.player.pitch = 0.0;
-            state.player.on_ground = false;
-            state.player.fall_distance = 0.0;
-            state.chunks.follow(spawn[0], spawn[2]);
-            if let Some(slot) = slot
-                && old_view != state.chunks.view()
-            {
-                state.update_view(slot);
-            }
-            return Ok(Outcome {
-                replies: vec![PlayerPosition::at(spawn, 0.0, 0.0, id).into()],
-                close: false,
-                encryption: None,
-            });
-        }
-        state.player.position = [x, y, z];
+    let uuid = state.uuid;
+    if let Some([x, y, z]) = position
+        && crate::game::Player::position_in_bounds([x, y, z])
+    {
+        let old_view = state.chunks.view();
         state.chunks.follow(x, z);
-    }
-    if let Some([yaw, pitch]) = rotation {
-        state.player.yaw = yaw;
-        state.player.pitch = pitch;
-    }
-    state.player.on_ground = on_ground;
-    let mut replies = Vec::new();
-    let mut death_reason: Option<&'static str> = None;
-    let now = Instant::now();
-    if state.player.is_survival() && !state.player.dead {
-        let [px, py, pz] = state.player.position;
-        // Vanilla movement exhaustion: sprinting 0.1/m, jumping 0.05 (0.2 when sprinting).
-        let horiz = ((px - old_x).powi(2) + (pz - old_z).powi(2)).sqrt();
-        if state.player.sprinting && horiz > 0.0 && horiz < 10.0 {
-            state.player.add_exhaustion(0.1 * horiz as f32);
-        }
-        if was_on_ground && !on_ground && py > old_y {
-            state
-                .player
-                .add_exhaustion(if state.player.sprinting { 0.2 } else { 0.05 });
-        }
-        if py < f64::from(world::MIN_Y) - 64.0 {
-            // Vanilla `Entity.checkBelowWorld`: void damage below `minBuildHeight - 64` (-128)
-            // with 10-tick hurt invulnerability.
-            if state.player.apply_damage_at(4.0, now) {
-                let hurt = Clientbound::from(HurtAnimation::new(state.player.entity_id, 0.0));
-                if let Some(slot) = slot {
-                    let _ = slot.broadcast_to_viewers(&hurt);
-                }
-                replies.push(hurt);
-                replies.push(
-                    UpdateHealth::new(
-                        state.player.health,
-                        state.player.food,
-                        state.player.saturation,
-                    )
-                    .into(),
-                );
-                if state.player.dead {
-                    death_reason = Some("fell out of the world");
-                }
-            }
-        } else {
-            let feet_pos =
-                world::BlockPos([px.floor() as i32, py.floor() as i32, pz.floor() as i32]);
-            let feet_state = ctx.server.play.world().block_at(feet_pos);
-            let in_liquid = crate::game::block_by_state(feet_state).is_some_and(|d| d.liquid);
-            if in_liquid {
-                state.player.fall_distance = 0.0;
-            } else if on_ground {
-                let fall = std::mem::take(&mut state.player.fall_distance);
-                if fall > 3.0 {
-                    // Vanilla `LivingEntity.calculateFallDamage`: Mth.ceil(fall - 3.0).
-                    let damage = (fall - 3.0).ceil() as f32;
-                    if state.player.apply_damage_at(damage, now) {
-                        let hurt =
-                            Clientbound::from(HurtAnimation::new(state.player.entity_id, 0.0));
-                        if let Some(slot) = slot {
-                            let _ = slot.broadcast_to_viewers(&hurt);
-                        }
-                        replies.push(hurt);
-                        replies.push(
-                            UpdateHealth::new(
-                                state.player.health,
-                                state.player.food,
-                                state.player.saturation,
-                            )
-                            .into(),
-                        );
-                        if state.player.dead {
-                            death_reason = Some("fell from a high place");
-                        }
-                    }
-                }
-            } else if py < old_y {
-                state.player.fall_distance += old_y - py;
-            }
+        if let Some(slot) = slot
+            && old_view != state.chunks.view()
+        {
+            state.update_view(slot, &ctx.server.play, ctx.server.players())?;
         }
     }
-    let pose = state.player.pose();
-    let death_info =
-        death_reason.map(|reason| (state.player.name.clone(), state.player.position, reason));
-    if let Some(slot) = slot {
-        if old_view != state.chunks.view() {
-            state.update_view(slot);
-        }
-        slot.update_pose(pose);
-    }
-    if let Some((player_name, death_pos, reason)) = death_info {
-        // Vanilla `Player.dropEquipment()` (`keepInventory = false`): drop all items on death.
-        let dropped = ctx.session.inventory.drain_all();
-        for stack in dropped {
-            let _ = ctx.server.play.spawn_item_drop_scatter(
-                ctx.server.players(),
-                [death_pos[0], death_pos[1] + 0.5, death_pos[2]],
-                stack,
-                40,
-            );
-        }
-        replies.push(InventoryContent::player(&ctx.session.inventory).into());
-        let _ = blocks::sync_equipment_public(ctx);
-        let _ = ctx
-            .server
-            .players()
-            .broadcast_system_chat(&format!("{player_name} {reason}"));
-    }
-    Ok(Outcome {
-        replies,
-        close: false,
-        encryption: None,
-    })
+    ctx.server.play.dispatch_input(
+        GameInput::PlayerMove {
+            uuid,
+            position,
+            rotation,
+            on_ground,
+        },
+        ctx.server.players(),
+    )?;
+    Ok(Outcome::empty())
 }
+
 pub async fn handle_position(ctx: &mut Context<'_>, p: Position) -> io::Result<Outcome> {
     movement(ctx, Some([p.x, p.y, p.z]), None, p.on_ground)
 }
@@ -634,6 +669,24 @@ pub fn stream_chunks(
     let state = play(session)?;
     let mut packets = state.chunks.pump(service.world().terrain(), now);
     state.blocks.prepare_chunks(&mut packets);
+    finish_stream_chunks(session, packets)
+}
+
+/// Async chunk streaming used by the network loop: offloads chunk loading,
+/// generation, lighting, encoding, and dirty-cache writeback onto Tokio's
+/// blocking pool.
+pub(crate) async fn stream_chunks_async(
+    session: &mut Session,
+    service: &PlayService,
+    now: Instant,
+) -> io::Result<Outcome> {
+    let state = play(session)?;
+    let mut packets = state.chunks.pump(service.world().terrain(), now);
+    state.blocks.prepare_chunks_async(&mut packets).await?;
+    finish_stream_chunks(session, packets)
+}
+
+fn finish_stream_chunks(session: &Session, packets: Vec<Clientbound>) -> io::Result<Outcome> {
     let mut replies = Vec::new();
     if let Some(slot) = &session.reservation {
         let unloaded: std::collections::HashSet<_> = packets
@@ -657,6 +710,7 @@ pub fn stream_chunks(
         encryption: None,
     })
 }
+
 pub async fn handle_information(
     ctx: &mut Context<'_>,
     packet: PlayClientInformation,
@@ -670,7 +724,7 @@ pub async fn handle_information(
     if state.chunks.view().1 != distance {
         state.chunks.set_radius(distance);
         if let Some(slot) = &ctx.session.reservation {
-            state.update_view(slot);
+            state.update_view(slot, &ctx.server.play, ctx.server.players())?;
         }
     }
     if let Some(slot) = &ctx.session.reservation {
@@ -679,46 +733,23 @@ pub async fn handle_information(
     ctx.session.client_information = Some(packet.0);
     Ok(Outcome::empty())
 }
+
 pub async fn handle_action(ctx: &mut Context<'_>, packet: EntityAction) -> io::Result<Outcome> {
     let state = play(ctx.session)?;
-    if state.player.entity_id != packet.entity_id {
+    if state.entity_id != packet.entity_id {
         return Err(invalid("entity action refers to another player"));
     }
-    let mut changed = false;
-    match packet.action {
-        0 if !state.player.sneaking => {
-            state.player.sneaking = true;
-            changed = true;
-        }
-        1 if state.player.sneaking => {
-            state.player.sneaking = false;
-            changed = true;
-        }
-        3 if !state.player.sprinting => {
-            state.player.sprinting = true;
-            changed = true;
-        }
-        4 if state.player.sprinting => {
-            state.player.sprinting = false;
-            changed = true;
-        }
-        _ => {}
+    if !state.gameplay_rate.allow(Instant::now()) {
+        return Err(invalid("gameplay packet rate limit exceeded"));
     }
-    let (entity_id, sneaking, sprinting) = (
-        state.player.entity_id,
-        state.player.sneaking,
-        state.player.sprinting,
-    );
-    if changed && let Some(slot) = &ctx.session.reservation {
-        let packet = Clientbound::from(
-            crate::protocol::packets::play_entities::EntityMetadata::Player {
-                id: entity_id,
-                sneaking,
-                sprinting,
-            },
-        );
-        slot.broadcast_to_viewers(&packet)?;
-    }
+    let uuid = state.uuid;
+    ctx.server.play.dispatch_input(
+        GameInput::PlayerEntityAction {
+            uuid,
+            action: packet.action,
+        },
+        ctx.server.players(),
+    )?;
     Ok(Outcome::empty())
 }
 
@@ -729,104 +760,42 @@ pub async fn handle_client_command(
     if packet.action != 0 {
         return Ok(Outcome::empty());
     }
-    let world = ctx.server.play.world().clone();
-    let world_spawn = world.spawn_position();
-    let is_flat = world.is_flat();
-    let view_distance = ctx
+    let uuid = check_gameplay_rate(ctx.session)?;
+    // Preload the player's bed respawn chunk on Tokio's blocking pool so the
+    // dedicated game-loop thread never blocks on disk I/O during `handle_respawn`.
+    if let Some(bed_pos) = ctx
         .server
         .play
-        .view_distance(ctx.session.client_information.as_ref());
-    let now = Instant::now();
-    let state = play(ctx.session)?;
-    if !state.player.dead {
-        return Ok(Outcome::empty());
+        .player_snapshot_async(uuid)
+        .await
+        .and_then(|snap| snap.respawn_point)
+        && bed_pos.valid()
+    {
+        let world = ctx.server.play.world().clone();
+        let chunk = bed_pos.chunk();
+        let _ = tokio::task::spawn_blocking(move || world.ensure_chunk_loaded(chunk)).await;
     }
-    let mut missing_bed = false;
-    let spawn = if let Some(bed_pos) = state.player.respawn_point {
-        let is_bed = bed_pos.valid()
-            && crate::game::registry()
-                .state_by_id(world.block_at(bed_pos))
-                .is_some_and(|(_, def, _)| def.name.ends_with("_bed"));
-        if is_bed {
-            [
-                f64::from(bed_pos.0[0]) + 0.5,
-                f64::from(bed_pos.0[1]) + 0.6,
-                f64::from(bed_pos.0[2]) + 0.5,
-            ]
-        } else {
-            state.player.respawn_point = None;
-            missing_bed = true;
-            world_spawn
-        }
-    } else {
-        world_spawn
-    };
-    let tp_id = state.next_teleport;
-    state.next_teleport = tp_id
-        .checked_add(1)
-        .ok_or_else(|| invalid("teleport ID exhausted"))?;
-    state.pending_teleport = Some((tp_id, now));
-    state.player.respawn_at(spawn);
-
-    // Respawn (0x47) clears the client's chunk cache, so reset ChunkStream and
-    // re-stream the initial spawn batch before teleporting the player.
-    let spawn_chunk = world::chunk_at(spawn[0], spawn[2]);
-    state.chunks = ChunkStream::at(spawn_chunk, view_distance, now);
-    state.blocks = blocks::CreativeSession::new(world.clone());
-    let mut first_batch = state.chunks.pump(world.terrain(), now);
-    state.blocks.prepare_chunks(&mut first_batch);
-
-    let game_mode = state.player.game_mode;
-    let health = state.player.health;
-    let food = state.player.food;
-    let saturation = state.player.saturation;
-    let pose = state.player.pose();
-    if let Some(slot) = &ctx.session.reservation {
-        slot.set_view(spawn_chunk, view_distance);
-        slot.update_pose(pose);
-    }
-    let mut replies = Vec::new();
-    if missing_bed {
-        replies.push(GameEvent::no_respawn_block_available().into());
-    }
-    replies.extend([
-        Respawn { game_mode, is_flat }.into(),
-        DefaultSpawnPosition::from_spawn(world_spawn).into(),
-        ChangeDifficulty::normal().into(),
-        PlayerAbilities(game_mode).into(),
-        UpdateHealth::new(health, food, saturation).into(),
-        CenterChunk(spawn_chunk).into(),
-        GameEvent::level_chunks_load_start().into(),
-    ]);
-    if game_mode != GameMode::Spectator {
-        replies.push(InventoryContent::player(&ctx.session.inventory).into());
-        replies.push(SelectedSlot(ctx.session.inventory.selected()).into());
-    }
-    replies.extend(first_batch);
-    replies.extend(ctx.server.play.existing_drop_packets());
-    replies.push(PlayerPosition::at(spawn, 0.0, 0.0, tp_id).into());
-    Ok(Outcome {
-        replies,
-        close: false,
-        encryption: None,
-    })
+    ctx.server
+        .play
+        .dispatch_input(GameInput::PlayerRespawn { uuid }, ctx.server.players())?;
+    Ok(Outcome::empty())
 }
 
 pub async fn handle_arm_animation(
     ctx: &mut Context<'_>,
     packet: ArmAnimation,
 ) -> io::Result<Outcome> {
-    let entity_id = play(ctx.session)?.player.entity_id;
-    let animation = if packet.hand == 0 { 0 } else { 3 };
-    if let Some(slot) = &ctx.session.reservation {
-        let out = Clientbound::from(crate::protocol::packets::play_entities::EntityAnimation {
-            id: entity_id,
-            animation,
-        });
-        slot.broadcast_to_viewers(&out)?;
-    }
+    let uuid = check_gameplay_rate(ctx.session)?;
+    ctx.server.play.dispatch_input(
+        GameInput::PlayerArmAnimation {
+            uuid,
+            hand: packet.hand,
+        },
+        ctx.server.players(),
+    )?;
     Ok(Outcome::empty())
 }
+
 /// These packets have no effect in this read-only prototype. In particular a
 /// chat-session certificate is never treated as an identity/authentication proof.
 pub async fn ignore<T>(_ctx: &mut Context<'_>, _packet: T) -> io::Result<Outcome> {
@@ -837,6 +806,7 @@ pub async fn ignore<T>(_ctx: &mut Context<'_>, _packet: T) -> io::Result<Outcome
 mod tests {
     use super::*;
     use crate::protocol::Clientbound;
+
     #[test]
     fn client_view_distance_is_capped_by_the_service_limit() {
         use crate::protocol::{Decode, Reader, packets::common::ClientInformation};
@@ -855,21 +825,15 @@ mod tests {
         let now = Instant::now();
         let mut session = Session {
             play: Some(PlaySession {
-                player: crate::game::Player::at_spawn(
-                    1,
-                    uuid::Uuid::nil(),
-                    "Test".into(),
-                    GameMode::Spectator,
-                ),
+                uuid: Uuid::nil(),
+                entity_id: 1,
                 pending_teleport: None,
                 next_teleport: 1,
                 pending_keep_alive: None,
                 next_keep_alive: now,
-                last_food_tick: now,
                 chunks: ChunkStream::new(2, now),
                 blocks: blocks::CreativeSession::new(Arc::default()),
-                open_container: None,
-                next_window_id: 1,
+                gameplay_rate: GameplayRate::new(now),
             }),
             ..Session::default()
         };
@@ -896,5 +860,21 @@ mod tests {
                 .unwrap()
                 .close
         );
+    }
+
+    #[test]
+    fn gameplay_rate_limiter_caps_burst_and_refills_over_time() {
+        let now = Instant::now();
+        let mut rate = GameplayRate::new(now);
+        for _ in 0..(GAMEPLAY_RATE_BURST as usize) {
+            assert!(rate.allow(now));
+        }
+        assert!(!rate.allow(now));
+        // After 50ms at 100 packets/sec, 5 tokens refill.
+        let later = now + Duration::from_millis(50);
+        for _ in 0..5 {
+            assert!(rate.allow(later));
+        }
+        assert!(!rate.allow(later));
     }
 }
