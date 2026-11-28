@@ -1,14 +1,12 @@
 //! Shared ECS helpers for spawning dropped item entities.
-use crate::{
-    engine::{
-        components::{
-            DropLifecycle, DropSyncState, EntityUuid, ItemDropMarker, ItemStackComp,
-            NetworkEntityId, Position, Velocity,
-        },
-        io::GameOutput,
-        resources::{EntityRegistry, MAX_ITEM_DROPS, OutputQueue},
+use crate::game::{
+    ItemStack,
+    components::{
+        DropLifecycle, DropSyncState, EntityUuid, ItemDropMarker, ItemStackComp, NetworkEntityId,
+        Position, Velocity,
     },
-    game::ItemStack,
+    io::GameOutput,
+    resources::{EntityRegistry, MAX_ITEM_DROPS, OutputQueue},
 };
 use bevy_ecs::prelude::World;
 use rand::Rng;

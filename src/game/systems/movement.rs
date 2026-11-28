@@ -1,7 +1,8 @@
 //! Player movement, survival exhaustion, void/fall damage, death, and entity actions.
 use super::drops::spawn_drop_scatter;
 use crate::{
-    engine::{
+    game::{
+        Hand, Player,
         components::{
             Dead, FallDistance, Health, Hunger, MovementFlags, NetworkEntityId, PlayerGameMode,
             PlayerInventory, PlayerName, PlayerViewState, Position, Rotation, add_exhaustion,
@@ -10,7 +11,6 @@ use crate::{
         io::GameOutput,
         resources::{EntityRegistry, OutputQueue, VoxelWorld},
     },
-    game::{Hand, Player},
     world::{self, BlockPos},
 };
 use bevy_ecs::prelude::World;

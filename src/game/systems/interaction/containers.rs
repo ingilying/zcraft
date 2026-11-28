@@ -1,13 +1,13 @@
 //! Container window lifecycle, multi-viewer sync, and inventory/container clicks.
 use super::{emit_equipment, emit_inventory_if_can_interact, throw_from_player};
 use crate::{
-    engine::{
+    game::{
+        InventoryClick, ItemStack,
         components::{PlayerContainer, PlayerGameMode, PlayerInventory, Position},
         io::{ContainerKind, GameOutput, OpenContainer},
         resources::{ChestViewers, EntityRegistry, OutputQueue, VoxelWorld},
         systems::drops::spawn_drop_scatter,
     },
-    game::{InventoryClick, ItemStack},
     world::BlockPos,
 };
 use bevy_ecs::prelude::World;

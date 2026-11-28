@@ -63,7 +63,7 @@ pub(crate) async fn apply_control(
                 }
                 if !unloaded.is_empty() {
                     service.dispatch_input(
-                        crate::engine::GameInput::PlayerChunksUntracked {
+                        crate::game::GameInput::PlayerChunksUntracked {
                             uuid: state.uuid,
                             chunks: unloaded,
                         },

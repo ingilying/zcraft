@@ -12,16 +12,14 @@ pub(crate) use containers::{
 pub(crate) use items::{handle_creative_slot, handle_select_slot, handle_use_item};
 
 use super::drops::spawn_drop;
-use crate::{
-    engine::{
-        components::{
-            NetworkEntityId, PlayerContainer, PlayerGameMode, PlayerInventory, Position, Rotation,
-            player_eye_position,
-        },
-        io::GameOutput,
-        resources::OutputQueue,
+use crate::game::{
+    Hand, ItemStack,
+    components::{
+        NetworkEntityId, PlayerContainer, PlayerGameMode, PlayerInventory, Position, Rotation,
+        player_eye_position,
     },
-    game::{Hand, ItemStack},
+    io::GameOutput,
+    resources::OutputQueue,
 };
 use bevy_ecs::prelude::{Entity, World};
 use uuid::Uuid;

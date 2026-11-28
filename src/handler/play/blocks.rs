@@ -1,12 +1,12 @@
 //! Thin protocol IO adapter for block & inventory packets plus chunk-write
-//! reconciliation. All authoritative gameplay logic lives in `crate::engine`.
+//! reconciliation. All authoritative gameplay logic lives in `crate::game`.
 #[cfg(test)]
 #[path = "blocks_tests.rs"]
 mod tests;
 
 use super::{Context, Outcome, check_gameplay_rate};
 use crate::{
-    engine::GameInput,
+    game::GameInput,
     players::Reservation,
     protocol::{
         Clientbound,

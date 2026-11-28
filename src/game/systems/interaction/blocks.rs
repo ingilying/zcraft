@@ -5,7 +5,8 @@ use super::{
     emit_equipment, emit_inventory_if_can_interact, throw_from_player,
 };
 use crate::{
-    engine::{
+    game::{
+        Hand, ItemStack,
         components::{
             Dead, EatingState, Hunger, MiningState, MovementFlags, NetworkEntityId,
             PlayerContainer, PlayerGameMode, PlayerInventory, PlayerViewState, Position, Rotation,
@@ -16,7 +17,6 @@ use crate::{
         resources::{ChestViewers, EntityRegistry, OutputQueue, TickClock, VoxelWorld},
         systems::drops::spawn_drop_scatter,
     },
-    game::{Hand, ItemStack},
     world::BlockPos,
 };
 use bevy_ecs::prelude::{Entity, World};

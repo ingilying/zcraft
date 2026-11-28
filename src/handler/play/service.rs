@@ -3,8 +3,7 @@
 use super::sync;
 use crate::{
     config::GameMode,
-    engine::{GameEngine, GameInput, GameOutput, PlayerSnapshot},
-    game::Inventory,
+    game::{GameEngine, GameInput, GameOutput, Inventory, PlayerSnapshot},
     players::Players,
     protocol::{
         Clientbound,
@@ -90,7 +89,7 @@ pub(crate) enum EngineCommand {
         reply: Reply<Option<Inventory>>,
     },
     ExistingDrops {
-        reply: Reply<Vec<crate::engine::DropSnapshot>>,
+        reply: Reply<Vec<crate::game::DropSnapshot>>,
     },
     /// Graceful shutdown signal: drain remaining queued commands and return `GameEngine`.
     Shutdown,
@@ -902,7 +901,7 @@ fn normalize_op(entry: &str) -> String {
     }
 }
 
-fn encode_drop_packets(drops: Vec<crate::engine::DropSnapshot>) -> Vec<Clientbound> {
+fn encode_drop_packets(drops: Vec<crate::game::DropSnapshot>) -> Vec<Clientbound> {
     let mut packets = Vec::with_capacity(drops.len() * 3);
     for drop in drops {
         packets.push(SpawnEntity::item(drop.id, drop.uuid, drop.position, drop.velocity).into());

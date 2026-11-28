@@ -2,7 +2,8 @@
 use super::{drops::spawn_drop_scatter, interaction::refresh_container_viewers};
 use crate::{
     config::GameMode,
-    engine::{
+    game::{
+        Inventory, Item, Player,
         components::{
             Dead, EatingState, EntityUuid, FallDistance, Health, Hunger, MiningState,
             MovementFlags, NetworkEntityId, PlayerContainer, PlayerGameMode, PlayerInventory,
@@ -12,7 +13,6 @@ use crate::{
         io::{ContainerKind, GameOutput},
         resources::{ChestViewers, EntityRegistry, OutputQueue, VoxelWorld},
     },
-    game::{Inventory, Item, Player},
     world::{BlockPos, TimeSnapshot, WeatherEvent},
 };
 use bevy_ecs::prelude::World;

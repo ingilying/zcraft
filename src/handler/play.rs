@@ -14,7 +14,7 @@ pub use self::service::PlayService;
 use super::{Context, Outcome, Session};
 use crate::{
     config::GameMode,
-    engine::GameInput,
+    game::GameInput,
     players::Peer,
     protocol::{
         Clientbound, invalid,
@@ -67,7 +67,7 @@ impl GameplayRate {
 }
 
 /// Protocol/transport-only Play session state. Authoritative gameplay state
-/// (player physics, vitals, inventory, containers, mining) lives in `crate::engine`.
+/// (player physics, vitals, inventory, containers, mining) lives in `crate::game`.
 #[derive(Debug)]
 pub struct PlaySession {
     pub uuid: Uuid,

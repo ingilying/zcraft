@@ -1,7 +1,7 @@
 //! 20 TPS `bevy_ecs` simulation systems: world clock/weather, player eating &
 //! food/vitals, item drop physics/merging/pickup, furnaces, and block/fluid physics.
 use crate::{
-    engine::{
+    game::{
         components::{
             Dead, DropLifecycle, DropSyncState, EatingState, EntityUuid, Health, Hunger,
             ItemDropMarker, ItemStackComp, NetworkEntityId, PlayerContainer, PlayerGameMode,

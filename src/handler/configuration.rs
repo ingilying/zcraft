@@ -142,7 +142,7 @@ pub async fn handle_reconfiguration_acknowledged(
             .server
             .play
             .submit_input_async(
-                crate::engine::GameInput::PlayerLeave {
+                crate::game::GameInput::PlayerLeave {
                     uuid: play.uuid,
                     persist: false,
                 },

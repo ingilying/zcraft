@@ -1,14 +1,12 @@
 //! Item usage, hotbar slot selection, and creative inventory slot updates.
 use super::{blocks::apply_game_effects, emit_equipment};
-use crate::{
-    engine::{
-        components::{
-            EatingState, PlayerGameMode, PlayerInventory, apply_player_dto, snapshot_player_dto,
-        },
-        io::GameOutput,
-        resources::{EntityRegistry, OutputQueue, VoxelWorld},
+use crate::game::{
+    Hand, ItemStack,
+    components::{
+        EatingState, PlayerGameMode, PlayerInventory, apply_player_dto, snapshot_player_dto,
     },
-    game::{Hand, ItemStack},
+    io::GameOutput,
+    resources::{EntityRegistry, OutputQueue, TickClock, VoxelWorld},
 };
 use bevy_ecs::prelude::World;
 use uuid::Uuid;
@@ -18,7 +16,7 @@ pub(crate) fn handle_use_item(ecs: &mut World, uuid: Uuid, hand: i32, sequence: 
         return;
     };
     let world = ecs.resource::<VoxelWorld>().0.clone();
-    let tick = ecs.resource::<crate::engine::resources::TickClock>().tick;
+    let tick = ecs.resource::<TickClock>().tick;
     let effects = if let Some(hand) = Hand::from_wire(hand)
         && let Some(stack) = ecs
             .get::<PlayerInventory>(entity)

@@ -3,7 +3,7 @@
 //! packets and routes them through `Players`.
 use crate::{
     config::GameMode,
-    engine::{ContainerOpenSync, GameOutput},
+    game::{ContainerOpenSync, GameOutput},
     players::{PlayerControl, Players},
     protocol::{
         Clientbound,

@@ -198,7 +198,7 @@ impl<H: crate::command::CommandHost> crate::command::AdminCommandHost for Server
             return Ok(false);
         }
         self.server.play.dispatch_input(
-            crate::engine::GameInput::ControlTeleport {
+            crate::game::GameInput::ControlTeleport {
                 uuid,
                 position,
                 yaw,
@@ -218,7 +218,7 @@ impl<H: crate::command::CommandHost> crate::command::AdminCommandHost for Server
             return Ok(false);
         }
         self.server.play.dispatch_input(
-            crate::engine::GameInput::ControlGive { uuid, item, count },
+            crate::game::GameInput::ControlGive { uuid, item, count },
             self.server.players(),
         )?;
         Ok(true)
@@ -232,7 +232,7 @@ impl<H: crate::command::CommandHost> crate::command::AdminCommandHost for Server
             return Ok(false);
         }
         self.server.play.dispatch_input(
-            crate::engine::GameInput::ControlSetGameMode { uuid, mode },
+            crate::game::GameInput::ControlSetGameMode { uuid, mode },
             self.server.players(),
         )?;
         Ok(true)

@@ -2,7 +2,6 @@ pub mod auth;
 pub mod command;
 pub mod config;
 pub mod context;
-pub mod engine;
 pub mod eula;
 pub mod game;
 pub mod handler;
