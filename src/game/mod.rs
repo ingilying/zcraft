@@ -6,6 +6,7 @@ pub mod events;
 pub mod io;
 pub mod resources;
 pub mod rules;
+pub mod runtime;
 mod systems;
 #[cfg(test)]
 mod tests;
