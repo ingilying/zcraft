@@ -1,7 +1,10 @@
 //! Shared ECS helpers for spawning dropped item entities.
 use crate::{
     engine::{
-        components::{DropState, EntityUuid, ItemDropMarker, NetworkEntityId},
+        components::{
+            DropLifecycle, DropSyncState, EntityUuid, ItemDropMarker, ItemStackComp,
+            NetworkEntityId, Position, Velocity,
+        },
         io::GameOutput,
         resources::{EntityRegistry, MAX_ITEM_DROPS, OutputQueue},
     },
@@ -59,13 +62,15 @@ pub(crate) fn spawn_drop(
             ItemDropMarker,
             NetworkEntityId(id),
             EntityUuid(uuid),
-            DropState {
-                position,
-                last_synced_pos: position,
-                velocity,
-                stack,
-                pickup_delay,
+            Position(position),
+            Velocity(velocity),
+            ItemStackComp(stack),
+            DropLifecycle {
                 age: 0,
+                pickup_delay,
+            },
+            DropSyncState {
+                last_synced_pos: position,
                 ticks_since_sync: 0,
             },
         ))

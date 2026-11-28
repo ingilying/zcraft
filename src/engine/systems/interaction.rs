@@ -14,7 +14,10 @@ pub(crate) use items::{handle_creative_slot, handle_select_slot, handle_use_item
 use super::drops::spawn_drop;
 use crate::{
     engine::{
-        components::{PlayerContainer, PlayerData, PlayerInventory},
+        components::{
+            NetworkEntityId, PlayerContainer, PlayerGameMode, PlayerInventory, Position, Rotation,
+            player_eye_position,
+        },
         io::GameOutput,
         resources::OutputQueue,
     },
@@ -24,7 +27,7 @@ use bevy_ecs::prelude::{Entity, World};
 use uuid::Uuid;
 
 pub(super) fn emit_equipment(ecs: &mut World, uuid: Uuid, entity: Entity) {
-    let Some(entity_id) = ecs.get::<PlayerData>(entity).map(|p| p.0.entity_id) else {
+    let Some(entity_id) = ecs.get::<NetworkEntityId>(entity).map(|id| id.0) else {
         return;
     };
     let Some((main_hand, off_hand)) = ecs
@@ -44,8 +47,8 @@ pub(super) fn emit_equipment(ecs: &mut World, uuid: Uuid, entity: Entity) {
 
 pub(super) fn emit_inventory_if_can_interact(ecs: &mut World, uuid: Uuid, entity: Entity) {
     if !ecs
-        .get::<PlayerData>(entity)
-        .is_some_and(|p| p.0.can_interact())
+        .get::<PlayerGameMode>(entity)
+        .is_some_and(|gm| gm.can_interact())
     {
         return;
     }
@@ -59,14 +62,13 @@ pub(super) fn emit_inventory_if_can_interact(ecs: &mut World, uuid: Uuid, entity
 }
 
 pub(super) fn throw_from_player(ecs: &mut World, entity: Entity, stack: ItemStack) {
-    let Some((eye, yaw, pitch)) = ecs
-        .get::<PlayerData>(entity)
-        .map(|p| (p.0.eye_position(), p.0.yaw, p.0.pitch))
+    let (Some(&pos), Some(&rot)) = (ecs.get::<Position>(entity), ecs.get::<Rotation>(entity))
     else {
         return;
     };
-    let yaw_rad = f64::from(yaw).to_radians();
-    let pitch_rad = f64::from(pitch).to_radians();
+    let eye = player_eye_position(pos);
+    let yaw_rad = f64::from(rot.yaw).to_radians();
+    let pitch_rad = f64::from(rot.pitch).to_radians();
     let vx = -yaw_rad.sin() * pitch_rad.cos() * 0.3;
     let vy = -pitch_rad.sin() * 0.3 + 0.1;
     let vz = yaw_rad.cos() * pitch_rad.cos() * 0.3;

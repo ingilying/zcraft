@@ -7,7 +7,10 @@ use super::{
 use crate::{
     engine::{
         components::{
-            PlayerContainer, PlayerData, PlayerInventory, PlayerMining, PlayerViewState,
+            Dead, EatingState, Hunger, MiningState, MovementFlags, NetworkEntityId,
+            PlayerContainer, PlayerGameMode, PlayerInventory, PlayerViewState, Position, Rotation,
+            add_exhaustion, apply_player_dto, player_eye_position, player_in_reach,
+            player_intersects_block, snapshot_player_dto,
         },
         io::{ContainerKind, ContainerOpenSync, GameOutput, OpenContainer},
         resources::{ChestViewers, EntityRegistry, OutputQueue, TickClock, VoxelWorld},
@@ -44,21 +47,27 @@ fn interact_block(
     let Some(&entity) = ecs.resource::<EntityRegistry>().players.get(&uuid) else {
         return;
     };
-    let (can_interact, dead, is_survival, entity_id, pending_teleport) = {
-        let Some(p) = ecs.get::<PlayerData>(entity) else {
-            return;
-        };
-        let pending = ecs
-            .get::<PlayerViewState>(entity)
-            .is_none_or(|v| v.pending_teleport);
-        (
-            p.0.can_interact(),
-            p.0.dead,
-            p.0.is_survival(),
-            p.0.entity_id,
-            pending,
-        )
+    let Some(&mode) = ecs.get::<PlayerGameMode>(entity) else {
+        return;
     };
+    let Some(entity_id) = ecs.get::<NetworkEntityId>(entity).map(|id| id.0) else {
+        return;
+    };
+    let Some(&player_pos) = ecs.get::<Position>(entity) else {
+        return;
+    };
+    let Some(&player_rot) = ecs.get::<Rotation>(entity) else {
+        return;
+    };
+    let Some(&player_flags) = ecs.get::<MovementFlags>(entity) else {
+        return;
+    };
+    let dead = ecs.get::<Dead>(entity).is_some();
+    let pending_teleport = ecs
+        .get::<PlayerViewState>(entity)
+        .is_none_or(|v| v.pending_teleport);
+    let can_interact = mode.can_interact();
+    let is_survival = mode.is_survival();
     if !can_interact || dead {
         ecs.resource_mut::<OutputQueue>()
             .push(GameOutput::BlockAckOnly {
@@ -74,13 +83,14 @@ fn interact_block(
     if is_survival && let BlockAction::Dig { pos, face, kind } = action {
         if kind == 1 {
             let cleared = ecs
-                .get_mut::<PlayerMining>(entity)
-                .and_then(|mut m| m.0.take());
+                .get_entity_mut(entity)
+                .ok()
+                .and_then(|mut e| e.take::<MiningState>());
             let mut out = ecs.resource_mut::<OutputQueue>();
-            if let Some((mpos, _)) = cleared {
+            if let Some(mining) = cleared {
                 out.push(GameOutput::BlockDestruction {
                     entity_id,
-                    pos: mpos,
+                    pos: mining.target,
                     stage: 0xff,
                 });
             }
@@ -95,10 +105,7 @@ fn interact_block(
                 && ecs
                     .get::<PlayerViewState>(entity)
                     .is_some_and(|v| v.tracked_chunks.contains(&pos.chunk()));
-            let reachable = valid
-                && ecs
-                    .get::<PlayerData>(entity)
-                    .is_some_and(|p| p.0.in_reach(pos));
+            let reachable = valid && player_in_reach(player_pos, mode, pos);
             let current = world.block_at(pos);
             if face < 6
                 && reachable
@@ -106,8 +113,11 @@ fn interact_block(
                 && let Some(def) = crate::game::block_by_state(current)
                 && def.hardness > 0.0
             {
-                if let Some(mut m) = ecs.get_mut::<PlayerMining>(entity) {
-                    m.0 = Some((pos, tick));
+                if let Ok(mut e) = ecs.get_entity_mut(entity) {
+                    e.insert(MiningState {
+                        target: pos,
+                        start_tick: tick,
+                    });
                 }
                 let mut out = ecs.resource_mut::<OutputQueue>();
                 out.push(GameOutput::BlockDestruction {
@@ -128,9 +138,8 @@ fn interact_block(
         .get::<PlayerViewState>(entity)
         .map(|v| v.tracked_chunks.clone())
         .unwrap_or_default();
-    let player_snap = ecs.get::<PlayerData>(entity).map(|p| p.0.clone()).unwrap();
     let valid = |pos: BlockPos| pos.valid() && tracked.contains(&pos.chunk());
-    let reachable = |pos: BlockPos| valid(pos) && player_snap.in_reach(pos);
+    let reachable = |pos: BlockPos| valid(pos) && player_in_reach(player_pos, mode, pos);
 
     let mut survival_dig_drops: Vec<(BlockPos, ItemStack)> = Vec::new();
     let mut survival_tool_damage: u32 = 0;
@@ -171,10 +180,10 @@ fn interact_block(
                             } else {
                                 1.0
                             };
-                            if !player_snap.on_ground {
+                            if !player_flags.on_ground {
                                 speed /= 5.0;
                             }
-                            let eye = player_snap.eye_position();
+                            let eye = player_eye_position(player_pos);
                             let eye_pos = BlockPos([
                                 eye[0].floor() as i32,
                                 eye[1].floor() as i32,
@@ -189,12 +198,13 @@ fn interact_block(
                             let expected = f64::from(state_def.hardness)
                                 * if can_harvest { 1.5 } else { 5.0 }
                                 / f64::from(speed);
-                            ecs.get_mut::<PlayerMining>(entity)
-                                .and_then(|mut m| m.0.take())
-                                .is_some_and(|(mpos, started_tick)| {
-                                    clear_break_anim = Some((entity_id, mpos));
-                                    mpos == pos
-                                        && (tick.saturating_sub(started_tick) as f64) * 0.05
+                            ecs.get_entity_mut(entity)
+                                .ok()
+                                .and_then(|mut e| e.take::<MiningState>())
+                                .is_some_and(|mining| {
+                                    clear_break_anim = Some((entity_id, mining.target));
+                                    mining.target == pos
+                                        && (tick.saturating_sub(mining.start_tick) as f64) * 0.05
                                             >= expected * 0.7
                                 })
                         } else {
@@ -221,9 +231,9 @@ fn interact_block(
             };
             if edit.is_some() {
                 if is_survival
-                    && let Some(mut p) = ecs.get_mut::<PlayerData>(entity)
+                    && let Some(mut hunger) = ecs.get_mut::<Hunger>(entity)
                 {
-                    p.0.add_exhaustion(0.005);
+                    add_exhaustion(&mut hunger, mode, false, 0.005);
                 }
                 let drops = crate::game::block_behavior(current).container_drops(&world, pos);
                 if !drops.is_empty()
@@ -292,8 +302,8 @@ fn interact_block(
                 let placement = crate::game::resolve_placement(
                     block,
                     crate::game::PlacementContext {
-                        yaw: player_snap.yaw,
-                        pitch: player_snap.pitch,
+                        yaw: player_rot.yaw,
+                        pitch: player_rot.pitch,
                         face,
                         hit,
                         support_state,
@@ -303,7 +313,7 @@ fn interact_block(
                 let resolved = match placement {
                     crate::game::PlacementResult::MergeSupport(material) => {
                         let placed = crate::game::block_by_state(material)?;
-                        (!placed.collision || !player_snap.intersects_block(support))
+                        (!placed.collision || !player_intersects_block(player_pos, support))
                             .then_some((support, material))
                     }
                     crate::game::PlacementResult::PlaceTarget(mut material) => {
@@ -324,7 +334,7 @@ fn interact_block(
                                 .is_some_and(|(tb, _, _)| tb == block);
                         (reachable(pos)
                             && target_ok
-                            && (!placed.collision || !player_snap.intersects_block(pos)))
+                            && (!placed.collision || !player_intersects_block(player_pos, pos)))
                         .then_some((pos, material))
                     }
                     crate::game::PlacementResult::PlacePair {
@@ -340,8 +350,8 @@ fn interact_block(
                             && valid(pos2)
                             && target_block.replaceable
                             && t2.replaceable
-                            && (!p1.collision || !player_snap.intersects_block(pos))
-                            && (!p2.collision || !player_snap.intersects_block(pos2));
+                            && (!p1.collision || !player_intersects_block(player_pos, pos))
+                            && (!p2.collision || !player_intersects_block(player_pos, pos2));
                         if ok {
                             extra_edits.push((pos2, secondary));
                             Some((pos, primary))
@@ -503,8 +513,8 @@ pub(crate) fn handle_dig(
             emit_inventory_if_can_interact(ecs, uuid, entity);
         }
         5 => {
-            if let Some(mut p) = ecs.get_mut::<PlayerData>(entity) {
-                p.0.eating = None;
+            if let Ok(mut e) = ecs.get_entity_mut(entity) {
+                e.remove::<EatingState>();
             }
         }
         6 => {
@@ -531,16 +541,25 @@ pub(crate) fn handle_place(
         return;
     };
     let world = ecs.resource::<VoxelWorld>().0.clone();
-    let can_use_block = ecs.get::<PlayerData>(entity).is_some_and(|p| {
-        p.0.can_interact() && !p.0.dead && !p.0.sneaking && p.0.in_reach(pos)
-    }) && ecs
-        .get::<PlayerViewState>(entity)
-        .is_some_and(|v| !v.pending_teleport);
+    let can_use_block = ecs
+        .get::<PlayerGameMode>(entity)
+        .zip(ecs.get::<Position>(entity))
+        .zip(ecs.get::<MovementFlags>(entity))
+        .is_some_and(|((&mode, &ppos), &flags)| {
+            mode.can_interact()
+                && ecs.get::<Dead>(entity).is_none()
+                && !flags.sneaking
+                && player_in_reach(ppos, mode, pos)
+        })
+        && ecs
+            .get::<PlayerViewState>(entity)
+            .is_some_and(|v| !v.pending_teleport);
 
     let tick = ecs.resource::<TickClock>().tick;
-    let effects = if can_use_block {
+    let effects = if can_use_block
+        && let Some(mut player) = snapshot_player_dto(ecs, entity)
+    {
         let clicked_state = world.block_at(pos);
-        let mut player = ecs.get::<PlayerData>(entity).unwrap().0.clone();
         let mut inv = ecs.get::<PlayerInventory>(entity).unwrap().0.clone();
         let mut use_ctx = crate::game::UseContext {
             world: &world,
@@ -549,7 +568,7 @@ pub(crate) fn handle_place(
             tick,
         };
         let fx = crate::game::block_behavior(clicked_state).on_use(&mut use_ctx, pos, clicked_state);
-        ecs.get_mut::<PlayerData>(entity).unwrap().0 = player;
+        apply_player_dto(ecs, entity, &player);
         ecs.get_mut::<PlayerInventory>(entity).unwrap().0 = inv;
         fx
     } else {
@@ -605,7 +624,7 @@ pub(super) fn apply_game_effects(
             .push(GameOutput::BroadcastSystemChat(msg));
     }
     if !effects.player_drops.is_empty()
-        && let Some(ppos) = ecs.get::<PlayerData>(entity).map(|p| p.0.position)
+        && let Some(ppos) = ecs.get::<Position>(entity).map(|p| p.0)
     {
         for stack in effects.player_drops {
             spawn_drop_scatter(ecs, [ppos[0], ppos[1] + 0.5, ppos[2]], stack, 10);

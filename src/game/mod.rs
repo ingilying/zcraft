@@ -26,7 +26,10 @@ pub use placement::{
     PlacementContext, PlacementResult, is_solid_support, paired_block_pos, required_support_offset,
     resolve_placement, resolve_stairs_shape,
 };
-pub use player::{PLAYER_EYE_HEIGHT, Player};
+pub use player::{
+    CREATIVE_BLOCK_REACH, HURT_INVULNERABILITY_TICKS, PLAYER_EYE_HEIGHT, PLAYER_HALF_WIDTH,
+    PLAYER_HEIGHT, Player, SURVIVAL_BLOCK_REACH,
+};
 pub use recipes::{container_remainder, fuel_burn_ticks, match_crafting, match_smelting};
 
 /// Data-driven food component from `assets/protocol/767/game_data.json`.

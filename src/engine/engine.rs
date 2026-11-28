@@ -1,7 +1,8 @@
 //! `GameEngine`: self-contained `bevy_ecs` World + Schedules with zero network IO.
 use super::{
     components::{
-        DropState, EntityUuid, ItemDropMarker, NetworkEntityId, PlayerData, PlayerInventory,
+        EntityUuid, ItemDropMarker, ItemStackComp, MovementFlags, NetworkEntityId, PlayerGameMode,
+        PlayerInventory, PlayerName, Position, RespawnPoint, Rotation, Velocity, entity_pose,
     },
     io::{DropSnapshot, GameInput, GameOutput, PlayerSnapshot},
     resources::{ChestViewers, EntityRegistry, InputQueue, OutputQueue, TickClock, VoxelWorld},
@@ -9,7 +10,7 @@ use super::{
         process_inputs_system,
         world_tick::{
             tick_block_physics_system, tick_furnaces_system, tick_item_drops_system,
-            tick_player_vitals_system, tick_world_clock_system,
+            tick_player_eating_system, tick_player_food_system, tick_world_clock_system,
         },
     },
 };
@@ -43,7 +44,8 @@ impl GameEngine {
             (
                 tick_world_clock_system,
                 process_inputs_system,
-                tick_player_vitals_system,
+                tick_player_eating_system,
+                tick_player_food_system,
                 tick_item_drops_system,
                 tick_furnaces_system,
                 tick_block_physics_system,
@@ -86,17 +88,21 @@ impl GameEngine {
 
     /// Snapshot all active item drop entities (for joining/respawning players).
     pub fn existing_drops(&mut self) -> Vec<DropSnapshot> {
-        let mut query = self
-            .ecs
-            .query_filtered::<(&NetworkEntityId, &EntityUuid, &DropState), With<ItemDropMarker>>();
+        let mut query = self.ecs.query_filtered::<(
+            &NetworkEntityId,
+            &EntityUuid,
+            &Position,
+            &Velocity,
+            &ItemStackComp,
+        ), With<ItemDropMarker>>();
         query
             .iter(&self.ecs)
-            .map(|(id, uuid, drop)| DropSnapshot {
+            .map(|(id, uuid, pos, vel, stack)| DropSnapshot {
                 id: id.0,
                 uuid: uuid.0,
-                position: drop.position,
-                velocity: drop.velocity,
-                stack: drop.stack,
+                position: pos.0,
+                velocity: vel.0,
+                stack: stack.0,
             })
             .collect()
     }
@@ -104,18 +110,24 @@ impl GameEngine {
     /// Read-only snapshot of an online player entity.
     pub fn player_snapshot(&self, uuid: Uuid) -> Option<PlayerSnapshot> {
         let &entity = self.ecs.resource::<EntityRegistry>().players.get(&uuid)?;
-        let p = &self.ecs.get::<PlayerData>(entity)?.0;
+        let entity_id = self.ecs.get::<NetworkEntityId>(entity)?.0;
+        let name = self.ecs.get::<PlayerName>(entity)?.0.clone();
+        let game_mode = self.ecs.get::<PlayerGameMode>(entity)?.0;
+        let pos = *self.ecs.get::<Position>(entity)?;
+        let rot = *self.ecs.get::<Rotation>(entity)?;
+        let flags = *self.ecs.get::<MovementFlags>(entity)?;
+        let respawn_point = self.ecs.get::<RespawnPoint>(entity)?.0;
         Some(PlayerSnapshot {
-            entity_id: p.entity_id,
-            uuid: p.uuid,
-            name: p.name.clone(),
-            game_mode: p.game_mode,
-            position: p.position,
-            yaw: p.yaw,
-            pitch: p.pitch,
-            on_ground: p.on_ground,
-            pose: p.pose(),
-            respawn_point: p.respawn_point,
+            entity_id,
+            uuid,
+            name,
+            game_mode,
+            position: pos.0,
+            yaw: rot.yaw,
+            pitch: rot.pitch,
+            on_ground: flags.on_ground,
+            pose: entity_pose(pos, rot, flags),
+            respawn_point,
         })
     }
 

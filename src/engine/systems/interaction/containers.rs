@@ -2,7 +2,7 @@
 use super::{emit_equipment, emit_inventory_if_can_interact, throw_from_player};
 use crate::{
     engine::{
-        components::{PlayerContainer, PlayerData, PlayerInventory},
+        components::{PlayerContainer, PlayerGameMode, PlayerInventory, Position},
         io::{ContainerKind, GameOutput, OpenContainer},
         resources::{ChestViewers, EntityRegistry, OutputQueue, VoxelWorld},
         systems::drops::spawn_drop_scatter,
@@ -111,7 +111,7 @@ pub(crate) fn handle_close_window(ecs: &mut World, uuid: Uuid, window_id: u8) {
     let Some(&entity) = ecs.resource::<EntityRegistry>().players.get(&uuid) else {
         return;
     };
-    let pos = ecs.get::<PlayerData>(entity).unwrap().0.position;
+    let pos = ecs.get::<Position>(entity).unwrap().0;
     let closed = {
         let mut c = ecs.get_mut::<PlayerContainer>(entity).unwrap();
         if let Some(open) = &c.open
@@ -181,8 +181,8 @@ pub(crate) fn handle_inventory_click(
         return;
     };
     if !ecs
-        .get::<PlayerData>(entity)
-        .is_some_and(|p| p.0.can_interact())
+        .get::<PlayerGameMode>(entity)
+        .is_some_and(|gm| gm.can_interact())
     {
         return;
     }

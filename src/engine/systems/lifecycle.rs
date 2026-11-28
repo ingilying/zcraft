@@ -4,8 +4,10 @@ use crate::{
     config::GameMode,
     engine::{
         components::{
-            EntityUuid, NetworkEntityId, PlayerContainer, PlayerData, PlayerInventory,
-            PlayerMarker, PlayerMining, PlayerViewState,
+            Dead, EatingState, EntityUuid, FallDistance, Health, Hunger, MiningState,
+            MovementFlags, NetworkEntityId, PlayerContainer, PlayerGameMode, PlayerInventory,
+            PlayerMarker, PlayerName, PlayerViewState, Position, RespawnPoint, Rotation,
+            entity_pose, snapshot_player_dto,
         },
         io::{ContainerKind, GameOutput},
         resources::{ChestViewers, EntityRegistry, OutputQueue, VoxelWorld},
@@ -20,24 +22,58 @@ use uuid::Uuid;
 pub(crate) fn handle_join(ecs: &mut World, player: Player, inventory: Inventory) {
     let uuid = player.uuid;
     let entity_id = player.entity_id;
+    let dead = player.dead;
+    let eating = player.eating;
     if let Some(existing) = ecs.resource_mut::<EntityRegistry>().players.remove(&uuid) {
         ecs.despawn(existing);
     }
-    let entity = ecs
-        .spawn((
-            PlayerMarker,
-            NetworkEntityId(entity_id),
-            EntityUuid(uuid),
-            PlayerData(player),
-            PlayerInventory(inventory),
-            PlayerMining::default(),
-            PlayerContainer::default(),
-            PlayerViewState {
-                tracked_chunks: HashSet::new(),
-                pending_teleport: true,
-            },
-        ))
-        .id();
+    let mut entity_mut = ecs.spawn((
+        PlayerMarker,
+        NetworkEntityId(entity_id),
+        EntityUuid(uuid),
+        PlayerName(player.name),
+        PlayerGameMode(player.game_mode),
+        Position(player.position),
+        Rotation {
+            yaw: player.yaw,
+            pitch: player.pitch,
+        },
+        MovementFlags {
+            on_ground: player.on_ground,
+            sneaking: player.sneaking,
+            sprinting: player.sprinting,
+        },
+        FallDistance(player.fall_distance),
+        Health {
+            current: player.health,
+            last_hurt_tick: player.last_hurt_tick,
+        },
+        Hunger {
+            food: player.food,
+            saturation: player.saturation,
+            exhaustion: player.exhaustion,
+            tick_timer: player.food_tick_timer,
+        },
+        RespawnPoint(player.respawn_point),
+        PlayerInventory(inventory),
+        PlayerContainer::default(),
+        PlayerViewState {
+            tracked_chunks: HashSet::new(),
+            pending_teleport: true,
+        },
+    ));
+    if dead {
+        entity_mut.insert(Dead);
+    }
+    if let Some((hand, item, start_tick, required_ticks)) = eating {
+        entity_mut.insert(EatingState {
+            hand,
+            item,
+            start_tick,
+            required_ticks,
+        });
+    }
+    let entity = entity_mut.id();
     ecs.resource_mut::<EntityRegistry>()
         .players
         .insert(uuid, entity);
@@ -47,14 +83,13 @@ pub(crate) fn handle_leave(ecs: &mut World, uuid: Uuid, persist: bool) {
     let Some(entity) = ecs.resource_mut::<EntityRegistry>().players.remove(&uuid) else {
         return;
     };
-    let (player, mut inventory, open_container) = {
+    let Some(player) = snapshot_player_dto(ecs, entity) else {
+        return;
+    };
+    let (mut inventory, open_container) = {
         let Some(mut entity_mut) = ecs.get_entity_mut(entity).ok() else {
             return;
         };
-        let player = entity_mut
-            .get::<PlayerData>()
-            .map(|p| p.0.clone())
-            .expect("player data");
         let inv = entity_mut
             .get::<PlayerInventory>()
             .map(|i| i.0.clone())
@@ -62,7 +97,7 @@ pub(crate) fn handle_leave(ecs: &mut World, uuid: Uuid, persist: bool) {
         let open = entity_mut
             .get_mut::<PlayerContainer>()
             .and_then(|mut c| c.open.take());
-        (player, inv, open)
+        (inv, open)
     };
     ecs.despawn(entity);
 
@@ -140,8 +175,12 @@ pub(crate) fn handle_teleport_confirmed(ecs: &mut World, uuid: Uuid) {
     if let Some(mut view) = ecs.get_mut::<PlayerViewState>(entity) {
         view.pending_teleport = false;
     }
-    if let Some(player) = ecs.get::<PlayerData>(entity) {
-        let pose = player.0.pose();
+    if let (Some(&pos), Some(&rot), Some(&flags)) = (
+        ecs.get::<Position>(entity),
+        ecs.get::<Rotation>(entity),
+        ecs.get::<MovementFlags>(entity),
+    ) {
+        let pose = entity_pose(pos, rot, flags);
         ecs.resource_mut::<OutputQueue>()
             .push(GameOutput::PlayerPoseUpdated { uuid, pose });
     }
@@ -151,18 +190,12 @@ pub(crate) fn handle_respawn(ecs: &mut World, uuid: Uuid) {
     let Some(&entity) = ecs.resource::<EntityRegistry>().players.get(&uuid) else {
         return;
     };
-    let world = ecs.resource::<VoxelWorld>().0.clone();
-    let world_spawn = world.spawn_position();
-
-    let (dead, respawn_point) = {
-        let Some(p) = ecs.get::<PlayerData>(entity) else {
-            return;
-        };
-        (p.0.dead, p.0.respawn_point)
-    };
-    if !dead {
+    if ecs.get::<Dead>(entity).is_none() {
         return;
     }
+    let world = ecs.resource::<VoxelWorld>().0.clone();
+    let world_spawn = world.spawn_position();
+    let respawn_point = ecs.get::<RespawnPoint>(entity).and_then(|r| r.0);
 
     let mut missing_bed = false;
     let spawn = if let Some(bed_pos) = respawn_point {
@@ -184,22 +217,33 @@ pub(crate) fn handle_respawn(ecs: &mut World, uuid: Uuid) {
         world_spawn
     };
 
-    let (game_mode, health, food, saturation, pose) = {
-        let mut p = ecs.get_mut::<PlayerData>(entity).expect("player data");
-        if missing_bed {
-            p.0.respawn_point = None;
-        }
-        p.0.respawn_at(spawn);
-        (
-            p.0.game_mode,
-            p.0.health,
-            p.0.food,
-            p.0.saturation,
-            p.0.pose(),
-        )
-    };
-    if let Some(mut mining) = ecs.get_mut::<PlayerMining>(entity) {
-        mining.0 = None;
+    if missing_bed && let Some(mut rp) = ecs.get_mut::<RespawnPoint>(entity) {
+        rp.0 = None;
+    }
+    if let Some(mut pos) = ecs.get_mut::<Position>(entity) {
+        pos.0 = spawn;
+    }
+    if let Some(mut rot) = ecs.get_mut::<Rotation>(entity) {
+        *rot = Rotation::default();
+    }
+    if let Some(mut flags) = ecs.get_mut::<MovementFlags>(entity) {
+        *flags = MovementFlags::default();
+    }
+    if let Some(mut fall) = ecs.get_mut::<FallDistance>(entity) {
+        fall.0 = 0.0;
+    }
+    let health = Health::default();
+    if let Some(mut h) = ecs.get_mut::<Health>(entity) {
+        *h = health;
+    }
+    let hunger = Hunger::default();
+    if let Some(mut hu) = ecs.get_mut::<Hunger>(entity) {
+        *hu = hunger;
+    }
+    if let Ok(mut e) = ecs.get_entity_mut(entity) {
+        e.remove::<Dead>();
+        e.remove::<EatingState>();
+        e.remove::<MiningState>();
     }
     if let Some(mut container) = ecs.get_mut::<PlayerContainer>(entity) {
         container.open = None;
@@ -208,6 +252,11 @@ pub(crate) fn handle_respawn(ecs: &mut World, uuid: Uuid) {
         view.tracked_chunks.clear();
         view.pending_teleport = true;
     }
+    let game_mode = ecs
+        .get::<PlayerGameMode>(entity)
+        .expect("player game mode")
+        .0;
+    let pose = entity_pose(Position(spawn), Rotation::default(), MovementFlags::default());
     let inventory = ecs
         .get::<PlayerInventory>(entity)
         .map(|i| i.0.clone())
@@ -219,9 +268,9 @@ pub(crate) fn handle_respawn(ecs: &mut World, uuid: Uuid) {
         uuid,
         spawn,
         game_mode,
-        health,
-        food,
-        saturation,
+        health: health.current,
+        food: hunger.food,
+        saturation: hunger.saturation,
         missing_bed,
         inventory,
     });
@@ -240,20 +289,26 @@ pub(crate) fn handle_control_teleport(
     let Some(&entity) = ecs.resource::<EntityRegistry>().players.get(&uuid) else {
         return;
     };
+    if let Some(mut pos) = ecs.get_mut::<Position>(entity) {
+        pos.0 = position;
+    } else {
+        return;
+    }
     let (final_yaw, final_pitch) = {
-        let Some(mut p) = ecs.get_mut::<PlayerData>(entity) else {
+        let Some(mut rot) = ecs.get_mut::<Rotation>(entity) else {
             return;
         };
-        p.0.position = position;
         if let Some(y) = yaw {
-            p.0.yaw = y;
+            rot.yaw = y;
         }
         if let Some(pi) = pitch {
-            p.0.pitch = pi;
+            rot.pitch = pi;
         }
-        p.0.on_ground = false;
-        (p.0.yaw, p.0.pitch)
+        (rot.yaw, rot.pitch)
     };
+    if let Some(mut flags) = ecs.get_mut::<MovementFlags>(entity) {
+        flags.on_ground = false;
+    }
     if let Some(mut view) = ecs.get_mut::<PlayerViewState>(entity) {
         view.pending_teleport = true;
     }
@@ -285,13 +340,15 @@ pub(crate) fn handle_control_game_mode(ecs: &mut World, uuid: Uuid, mode: GameMo
     let Some(&entity) = ecs.resource::<EntityRegistry>().players.get(&uuid) else {
         return;
     };
-    let (health, food, saturation) = {
-        let Some(mut p) = ecs.get_mut::<PlayerData>(entity) else {
-            return;
-        };
-        p.0.game_mode = mode;
-        (p.0.health, p.0.food, p.0.saturation)
-    };
+    if let Some(mut gm) = ecs.get_mut::<PlayerGameMode>(entity) {
+        gm.0 = mode;
+    } else {
+        return;
+    }
+    let health = ecs.get::<Health>(entity).map_or(20.0, |h| h.current);
+    let (food, saturation) = ecs
+        .get::<Hunger>(entity)
+        .map_or((20, 5.0), |h| (h.food, h.saturation));
     let inventory = ecs
         .get::<PlayerInventory>(entity)
         .map(|i| i.0.clone())

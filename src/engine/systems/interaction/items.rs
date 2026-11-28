@@ -2,7 +2,9 @@
 use super::{blocks::apply_game_effects, emit_equipment};
 use crate::{
     engine::{
-        components::{PlayerData, PlayerInventory},
+        components::{
+            EatingState, PlayerGameMode, PlayerInventory, apply_player_dto, snapshot_player_dto,
+        },
         io::GameOutput,
         resources::{EntityRegistry, OutputQueue, VoxelWorld},
     },
@@ -21,8 +23,8 @@ pub(crate) fn handle_use_item(ecs: &mut World, uuid: Uuid, hand: i32, sequence: 
         && let Some(stack) = ecs
             .get::<PlayerInventory>(entity)
             .and_then(|i| i.0.hand(hand))
+        && let Some(mut player) = snapshot_player_dto(ecs, entity)
     {
-        let mut player = ecs.get::<PlayerData>(entity).unwrap().0.clone();
         let mut inv = ecs.get::<PlayerInventory>(entity).unwrap().0.clone();
         let mut use_ctx = crate::game::UseContext {
             world: &world,
@@ -31,7 +33,7 @@ pub(crate) fn handle_use_item(ecs: &mut World, uuid: Uuid, hand: i32, sequence: 
             tick,
         };
         let fx = crate::game::item_behavior(stack.item).on_use(&mut use_ctx, hand, stack);
-        ecs.get_mut::<PlayerData>(entity).unwrap().0 = player;
+        apply_player_dto(ecs, entity, &player);
         ecs.get_mut::<PlayerInventory>(entity).unwrap().0 = inv;
         fx
     } else {
@@ -44,8 +46,8 @@ pub(crate) fn handle_select_slot(ecs: &mut World, uuid: Uuid, slot: u8) {
     let Some(&entity) = ecs.resource::<EntityRegistry>().players.get(&uuid) else {
         return;
     };
-    if let Some(mut p) = ecs.get_mut::<PlayerData>(entity) {
-        p.0.eating = None;
+    if let Ok(mut e) = ecs.get_entity_mut(entity) {
+        e.remove::<EatingState>();
     }
     if let Some(mut inv) = ecs.get_mut::<PlayerInventory>(entity) {
         inv.0.select(slot);
@@ -63,8 +65,8 @@ pub(crate) fn handle_creative_slot(
         return;
     };
     if !ecs
-        .get::<PlayerData>(entity)
-        .is_some_and(|p| p.0.is_creative())
+        .get::<PlayerGameMode>(entity)
+        .is_some_and(|gm| gm.is_creative())
     {
         return;
     }
