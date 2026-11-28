@@ -7,7 +7,10 @@ use super::{
     },
     events::{init_messages, update_messages},
     io::{DropSnapshot, GameInput, GameOutput, PlayerSnapshot},
-    resources::{ChestViewers, EntityRegistry, InputQueue, OutputQueue, TickClock, VoxelWorld},
+    resources::{
+        ChestViewers, EntityIdAllocator, EntityRegistry, InputQueue, OutputQueue, TickClock,
+        VoxelWorld,
+    },
     systems::{
         GamePhase,
         drops::spawn_item_drops_system,
@@ -28,7 +31,7 @@ use super::{
 };
 use crate::{game::Inventory, world::World as VoxelTerrain};
 use bevy_ecs::prelude::{IntoScheduleConfigs, Schedule, With, World};
-use std::sync::{Arc, atomic::AtomicI32};
+use std::sync::Arc;
 use uuid::Uuid;
 
 fn add_input_phases(schedule: &mut Schedule) {
@@ -65,10 +68,10 @@ pub struct GameEngine {
 }
 
 impl GameEngine {
-    pub fn new(world: Arc<VoxelTerrain>, next_entity_id: Arc<AtomicI32>) -> Self {
+    pub fn new(world: Arc<VoxelTerrain>, entity_ids: Arc<EntityIdAllocator>) -> Self {
         let mut ecs = World::new();
         ecs.insert_resource(VoxelWorld(world));
-        ecs.insert_resource(EntityRegistry::new(next_entity_id));
+        ecs.insert_resource(EntityRegistry::new(entity_ids));
         ecs.insert_resource(ChestViewers::default());
         ecs.insert_resource(TickClock::default());
         ecs.insert_resource(InputQueue::default());

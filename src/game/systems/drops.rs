@@ -8,20 +8,30 @@ use crate::game::{
     io::GameOutput,
     resources::{EntityRegistry, MAX_ITEM_DROPS, OutputQueue},
 };
-use bevy_ecs::prelude::{Commands, MessageReader, Query, ResMut};
+use bevy_ecs::prelude::{Commands, Entity, MessageReader, Query, Res, ResMut, With};
 use rand::Rng;
 use uuid::Uuid;
 
-/// Spawn dropped item entities requested via `SpawnDropMsg`, enforcing `MAX_ITEM_DROPS`.
+/// Spawn dropped item entities requested via `SpawnDropMsg`, enforcing `MAX_ITEM_DROPS`
+/// by evicting the oldest active drops by `DropLifecycle::age` (no manual drop queue).
 pub(crate) fn spawn_item_drops_system(
     mut requests: MessageReader<SpawnDropMsg>,
     mut commands: Commands,
-    mut registry: ResMut<EntityRegistry>,
-    drop_ids: Query<&NetworkEntityId>,
+    registry: Res<EntityRegistry>,
+    existing_drops: Query<(Entity, &NetworkEntityId, &DropLifecycle), With<ItemDropMarker>>,
     mut out: ResMut<OutputQueue>,
 ) {
+    let pending: Vec<SpawnDropMsg> = requests.read().copied().collect();
+    if pending.is_empty() {
+        return;
+    }
+
+    let mut evict_candidates: Option<Vec<(Entity, i32, u16)>> = None;
+    let mut live_count = existing_drops.iter().len();
+    let mut evicted_ids = Vec::new();
     let mut rng = rand::thread_rng();
-    for req in requests.read() {
+
+    for req in pending {
         let Some(id) = registry.allocate_entity_id() else {
             continue;
         };
@@ -33,41 +43,42 @@ pub(crate) fn spawn_item_drops_system(
         });
 
         // Evict oldest active drop if at capacity.
-        let mut evicted_id = None;
-        while registry.drops.len() >= MAX_ITEM_DROPS {
-            let Some(old_entity) = registry.drops.pop_front() else {
-                break;
-            };
-            if let Ok(old_net_id) = drop_ids.get(old_entity) {
-                evicted_id = Some(old_net_id.0);
+        if live_count >= MAX_ITEM_DROPS {
+            let candidates = evict_candidates.get_or_insert_with(|| {
+                let mut list: Vec<(Entity, i32, u16)> = existing_drops
+                    .iter()
+                    .map(|(e, nid, life)| (e, nid.0, life.age))
+                    .collect();
+                // Sort ascending by age so `.pop()` evicts the oldest drop in O(1).
+                list.sort_unstable_by_key(|&(_, _, age)| age);
+                list
+            });
+            if let Some((old_entity, old_net_id, _)) = candidates.pop() {
                 commands.entity(old_entity).despawn();
-                break;
+                registry.release_entity_id(old_net_id);
+                evicted_ids.push(old_net_id);
+                live_count -= 1;
             }
         }
 
-        let entity = commands
-            .spawn((
-                ItemDropMarker,
-                NetworkEntityId(id),
-                EntityUuid(uuid),
-                Position(req.position),
-                Velocity(velocity),
-                ItemStackComp(req.stack),
-                DropLifecycle {
-                    age: 0,
-                    pickup_delay: req.pickup_delay,
-                },
-                DropSyncState {
-                    last_synced_pos: req.position,
-                    ticks_since_sync: 0,
-                },
-            ))
-            .id();
-        registry.drops.push_back(entity);
+        commands.spawn((
+            ItemDropMarker,
+            NetworkEntityId(id),
+            EntityUuid(uuid),
+            Position(req.position),
+            Velocity(velocity),
+            ItemStackComp(req.stack),
+            DropLifecycle {
+                age: 0,
+                pickup_delay: req.pickup_delay,
+            },
+            DropSyncState {
+                last_synced_pos: req.position,
+                ticks_since_sync: 0,
+            },
+        ));
+        live_count += 1;
 
-        if let Some(old_id) = evicted_id {
-            out.push(GameOutput::EntitiesRemoved(vec![old_id]));
-        }
         out.push(GameOutput::ItemDropSpawned {
             id,
             uuid,
@@ -75,5 +86,9 @@ pub(crate) fn spawn_item_drops_system(
             velocity,
             stack: req.stack,
         });
+    }
+
+    if !evicted_ids.is_empty() {
+        out.push(GameOutput::EntitiesRemoved(evicted_ids));
     }
 }

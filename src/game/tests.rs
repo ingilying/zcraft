@@ -3,15 +3,15 @@
 use super::*;
 use crate::{
     config::GameMode,
-    game::{Hand, Inventory, Item, ItemStack, Player},
+    game::{Hand, Inventory, Item, ItemStack, Player, resources::EntityIdAllocator},
     world::{BlockPos, World as VoxelWorld},
 };
-use std::sync::{Arc, atomic::AtomicI32};
+use std::sync::Arc;
 use uuid::Uuid;
 
 fn new_engine() -> (GameEngine, Arc<VoxelWorld>) {
     let world = Arc::new(VoxelWorld::new());
-    let engine = GameEngine::new(world.clone(), Arc::new(AtomicI32::new(1)));
+    let engine = GameEngine::new(world.clone(), Arc::new(EntityIdAllocator::default()));
     (engine, world)
 }
 
@@ -177,4 +177,34 @@ fn ecs_ticks_food_eating_and_block_interaction_end_to_end() {
         GameOutput::WorldMutatedWithAck { actor, sequence: 2, .. } if *actor == uuid
     )));
     assert_eq!(world.block_at(BlockPos([8, 63, 8])), crate::game::AIR_STATE);
+}
+
+#[test]
+fn entity_id_allocator_wraps_safely_and_skips_active_ids() {
+    let alloc = EntityIdAllocator::new(i32::MAX - 1);
+    let a = alloc.allocate().unwrap();
+    let b = alloc.allocate().unwrap();
+    assert_eq!(a, i32::MAX - 1);
+    assert_eq!(b, i32::MAX);
+
+    // Wraps to 1, then 2.
+    let c = alloc.allocate().unwrap();
+    let d = alloc.allocate().unwrap();
+    assert_eq!(c, 1);
+    assert_eq!(d, 2);
+
+    // Release 1, keep 2 active; a new allocator starting at 1 with 2 active skips 2.
+    alloc.release(c);
+    let alloc2 = EntityIdAllocator::new(i32::MAX);
+    assert_eq!(alloc2.allocate(), Some(i32::MAX));
+    assert_eq!(alloc2.allocate(), Some(1));
+    assert_eq!(alloc2.allocate(), Some(2));
+    // Releasing 1 allows wrap-around to reuse 1 while skipping active 2.
+    alloc2.release(1);
+    alloc2.release(i32::MAX);
+    let alloc3 = EntityIdAllocator::new(i32::MAX);
+    assert_eq!(alloc3.allocate(), Some(i32::MAX));
+    assert_eq!(alloc3.allocate(), Some(1));
+    alloc3.release(i32::MAX);
+    assert_eq!(alloc3.allocate(), Some(2));
 }

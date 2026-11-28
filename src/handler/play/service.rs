@@ -5,9 +5,8 @@ use crate::{
     config::GameMode,
     game::{
         DropSnapshot, GameEngine, GameInput, Inventory, PlayerSnapshot,
-        runtime::{
-            EngineCommand, GameRuntime, Reply, send_command_async,
-        },
+        resources::EntityIdAllocator,
+        runtime::{EngineCommand, GameRuntime, Reply, send_command_async},
     },
     players::Players,
     protocol::{
@@ -24,7 +23,7 @@ use std::{
     io,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicI32, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -96,7 +95,7 @@ pub struct PlayService {
     pub(super) game_mode: GameMode,
     commands: crate::command::CommandRegistry,
     max_view_distance: i32,
-    next_entity: Arc<AtomicI32>,
+    entity_ids: Arc<EntityIdAllocator>,
 }
 
 impl PlayService {
@@ -118,8 +117,8 @@ impl PlayService {
         world: Arc<World>,
     ) -> io::Result<Self> {
         world::validate_view_distance(max_view_distance)?;
-        let next_entity = Arc::new(AtomicI32::new(1));
-        let engine = GameEngine::new(world.clone(), next_entity.clone());
+        let entity_ids = Arc::new(EntityIdAllocator::default());
+        let engine = GameEngine::new(world.clone(), entity_ids.clone());
         Ok(Self {
             world,
             engine: Arc::new(Mutex::new(Some(engine))),
@@ -131,7 +130,7 @@ impl PlayService {
             game_mode,
             commands: crate::command::CommandRegistry::default(),
             max_view_distance,
-            next_entity,
+            entity_ids,
         })
     }
 
@@ -481,9 +480,9 @@ impl PlayService {
     }
 
     pub(super) fn allocate_entity_id(&self) -> io::Result<i32> {
-        self.next_entity
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| io::Error::other("entity ID space exhausted"))
+        self.entity_ids
+            .allocate()
+            .ok_or_else(|| io::Error::other("entity ID space exhausted"))
     }
 
     pub fn with_ops(self, ops: impl IntoIterator<Item = String>) -> Self {

@@ -471,6 +471,7 @@ pub(crate) fn player_leave_system(
         let mut inventory = inv_comp.0.clone();
         let open_container = container.open.take();
         commands.entity(entity).despawn();
+        registry.release_entity_id(net_id.0);
 
         let ppos = player.position;
         let mut returned = Vec::new();

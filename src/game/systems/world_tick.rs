@@ -125,27 +125,23 @@ pub(crate) fn tick_player_food_system(
 /// Drop pipeline stage 1: increment age, tick down pickup delay, and despawn
 /// expired (5 min) or void-fallen drops.
 pub(crate) fn drop_age_and_despawn_system(
-    mut registry: ResMut<EntityRegistry>,
+    registry: Res<EntityRegistry>,
     mut drops: Query<(Entity, &NetworkEntityId, &Position, &mut DropLifecycle), With<ItemDropMarker>>,
     mut commands: Commands,
     mut out: ResMut<OutputQueue>,
 ) {
-    let mut removed_entities = Vec::new();
     let mut removed_ids = Vec::new();
     for (entity, net_id, pos, mut life) in &mut drops {
         life.age = life.age.saturating_add(1);
         if life.age >= 6000 || pos.0[1] < f64::from(world::MIN_Y) - 64.0 {
-            removed_entities.push(entity);
+            commands.entity(entity).despawn();
+            registry.release_entity_id(net_id.0);
             removed_ids.push(net_id.0);
             continue;
         }
         life.pickup_delay = life.pickup_delay.saturating_sub(1);
     }
-    if !removed_entities.is_empty() {
-        for entity in &removed_entities {
-            commands.entity(*entity).despawn();
-        }
-        registry.drops.retain(|e| !removed_entities.contains(e));
+    if !removed_ids.is_empty() {
         out.push(GameOutput::EntitiesRemoved(removed_ids));
     }
 }
@@ -220,7 +216,7 @@ pub(crate) fn drop_physics_system(
 
 /// Drop pipeline stage 3: proximity pickup into living players' inventories.
 pub(crate) fn drop_pickup_system(
-    mut registry: ResMut<EntityRegistry>,
+    registry: Res<EntityRegistry>,
     mut drops: Query<
         (Entity, &NetworkEntityId, &Position, &DropLifecycle, &mut ItemStackComp),
         (With<ItemDropMarker>, Without<PlayerMarker>),
@@ -238,7 +234,6 @@ pub(crate) fn drop_pickup_system(
     mut commands: Commands,
     mut out: ResMut<OutputQueue>,
 ) {
-    let mut removed_entities = Vec::new();
     let mut removed_ids = Vec::new();
 
     for (entity, net_id, pos, life, mut stack) in &mut drops {
@@ -265,7 +260,8 @@ pub(crate) fn drop_pickup_system(
                         inventory: pinv.0.clone(),
                     });
                     if added >= stack.0.count {
-                        removed_entities.push(entity);
+                        commands.entity(entity).despawn();
+                        registry.release_entity_id(net_id.0);
                         removed_ids.push(net_id.0);
                     } else {
                         stack.0.count -= added;
@@ -280,18 +276,14 @@ pub(crate) fn drop_pickup_system(
         }
     }
 
-    if !removed_entities.is_empty() {
-        for entity in &removed_entities {
-            commands.entity(*entity).despawn();
-        }
-        registry.drops.retain(|e| !removed_entities.contains(e));
+    if !removed_ids.is_empty() {
         out.push(GameOutput::EntitiesRemoved(removed_ids));
     }
 }
 
 /// Drop pipeline stage 4: merge nearby identical item drop stacks.
 pub(crate) fn drop_merge_system(
-    mut registry: ResMut<EntityRegistry>,
+    registry: Res<EntityRegistry>,
     mut drops: Query<
         (
             Entity,
@@ -314,7 +306,6 @@ pub(crate) fn drop_merge_system(
         return;
     }
 
-    let mut removed_entities = Vec::new();
     let mut removed_ids = Vec::new();
     let mut merged = vec![false; active.len()];
 
@@ -371,7 +362,8 @@ pub(crate) fn drop_merge_system(
                         stack: si.0,
                     });
                     if take == sj.0.count {
-                        removed_entities.push(e_j);
+                        commands.entity(e_j).despawn();
+                        registry.release_entity_id(id_j);
                         removed_ids.push(id_j);
                         merged[j] = true;
                     } else {
@@ -386,11 +378,7 @@ pub(crate) fn drop_merge_system(
         }
     }
 
-    if !removed_entities.is_empty() {
-        for entity in &removed_entities {
-            commands.entity(*entity).despawn();
-        }
-        registry.drops.retain(|e| !removed_entities.contains(e));
+    if !removed_ids.is_empty() {
         out.push(GameOutput::EntitiesRemoved(removed_ids));
     }
 }

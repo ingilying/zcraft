@@ -3,11 +3,8 @@ use super::io::{GameInput, GameOutput};
 use crate::world::{BlockPos, World as VoxelTerrain};
 use bevy_ecs::prelude::{Entity, Resource};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    sync::{
-        Arc,
-        atomic::{AtomicI32, Ordering},
-    },
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
 };
 use uuid::Uuid;
 
@@ -17,28 +14,77 @@ pub const MAX_ITEM_DROPS: usize = 512;
 #[derive(Resource, Clone)]
 pub struct VoxelWorld(pub Arc<VoxelTerrain>);
 
-/// Fast entity lookup index + entity ID allocator.
+#[derive(Debug)]
+struct EntityIdState {
+    next: i32,
+    active: HashSet<i32>,
+}
+
+/// Thread-safe protocol entity ID allocator (`1..=i32::MAX`) that wraps safely
+/// around `i32::MAX` while skipping any currently active entity IDs.
+#[derive(Debug)]
+pub struct EntityIdAllocator {
+    state: Mutex<EntityIdState>,
+}
+
+impl Default for EntityIdAllocator {
+    fn default() -> Self {
+        Self::new(1)
+    }
+}
+
+impl EntityIdAllocator {
+    pub fn new(start: i32) -> Self {
+        Self {
+            state: Mutex::new(EntityIdState {
+                next: start.max(1),
+                active: HashSet::new(),
+            }),
+        }
+    }
+
+    pub fn allocate(&self) -> Option<i32> {
+        let mut state = self.state.lock().expect("entity id allocator poisoned");
+        if state.active.len() >= i32::MAX as usize {
+            return None;
+        }
+        loop {
+            let id = state.next;
+            state.next = if id == i32::MAX { 1 } else { id + 1 };
+            if state.active.insert(id) {
+                return Some(id);
+            }
+        }
+    }
+
+    pub fn release(&self, id: i32) {
+        if let Ok(mut state) = self.state.lock() {
+            state.active.remove(&id);
+        }
+    }
+}
+
+/// Fast player entity lookup index + wrapping protocol entity ID allocator.
 #[derive(Resource)]
 pub struct EntityRegistry {
     pub players: HashMap<Uuid, Entity>,
-    /// Ordered FIFO list of active item drop entities so oldest can be evicted at `MAX_ITEM_DROPS`.
-    pub drops: VecDeque<Entity>,
-    pub next_entity_id: Arc<AtomicI32>,
+    pub entity_ids: Arc<EntityIdAllocator>,
 }
 
 impl EntityRegistry {
-    pub fn new(next_entity_id: Arc<AtomicI32>) -> Self {
+    pub fn new(entity_ids: Arc<EntityIdAllocator>) -> Self {
         Self {
             players: HashMap::new(),
-            drops: VecDeque::new(),
-            next_entity_id,
+            entity_ids,
         }
     }
 
     pub fn allocate_entity_id(&self) -> Option<i32> {
-        self.next_entity_id
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .ok()
+        self.entity_ids.allocate()
+    }
+
+    pub fn release_entity_id(&self, id: i32) {
+        self.entity_ids.release(id);
     }
 }
 
